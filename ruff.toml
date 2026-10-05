@@ -1,0 +1,22 @@
+# Lint and format settings for build_report.py: `ruff check build_report.py`, `ruff format build_report.py`.
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "W", "F", "I", "B", "UP", "N", "D", "ANN", "ARG", "C4", "SIM", "RUF", "PTH", "FBT", "EM", "S", "PL", "RET", "PIE", "ISC"]
+ignore = [
+    "D203",     # docstring layout follows D211 (no blank line before a class docstring)
+    "D213",     # and D212 (summary on the first line)
+    "PLR2004",  # page geometry and chart coordinates are numeric by nature
+    "PLC0415",  # matplotlib and svglib load inside functions, after the preflight
+    "RUF001",   # the report text uses typographic dashes, minus signs, and multiplication signs
+    "ISC001",   # single-line implicit concatenation is the formatter's call
+]
+
+[lint.per-file-ignores]
+"build_report.py" = ["E402"]  # ReportLab loads after the early argument parse, so --help works without it
+
+[lint.pylint]
+# the table and card builders take one keyword per layout option
+max-args = 12
+max-positional-args = 8
