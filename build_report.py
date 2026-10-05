@@ -5,11 +5,11 @@
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Ryan Musante
-"""Build the print edition of the GTR9 Pro post-boot log analysis as a PDF.
+"""Analyse a cachyos-bugreport.log and a ry-verify JSONL log and build a print-edition PDF report.
 
-Sections: SETUP (command line, preflight, build state), CONTENT (report text and
-tables), FIGURES (vector charts), LAYOUT (pages), and BUILD (content checks, layout
-passes, entry point). Two raster figures ship in assets/.
+Every count, line reference, table row, figure, and finding comes from the two inputs on each run;
+the script carries only analysis rules (message patterns and what they mean), never results.
+Sections: SETUP, INPUT, RULES, ANALYSIS, FIGURES, LAYOUT, BUILD.
 Exit codes: 0 built or check passed, 1 build failed, 2 usage, 3 preflight failed, 130 interrupted.
 """
 
@@ -17,18 +17,21 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import importlib.util
+import itertools
+import json
 import os
 import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TextIO, TypedDict
+from typing import TYPE_CHECKING, Any, TextIO
 from xml.sax.saxutils import escape
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from types import ModuleType
 
     from matplotlib.axes import Axes
@@ -36,11 +39,9 @@ if TYPE_CHECKING:
     from reportlab.pdfgen.canvas import Canvas
 
 # ── SETUP ─────────────────────────────────────────────────────────────
-# Version, exit codes, paths, command line, preflight, and the shared build state.
-__version__ = "5.0.0"
+# Version, exit codes, fonts, command line, preflight, and the shared build state.
+__version__ = "6.0.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130
-HERE = Path(__file__).resolve().parent
-DEFAULT_OUT = Path("gtr9-postboot-log-analysis-2026-10-02-print.pdf")
 FONT_DIRS = (
     Path("/usr/share/fonts/TTF"),
     Path("/usr/share/fonts/truetype/ibm-plex"),
@@ -57,13 +58,8 @@ FONT_FILES = {
     "PlexM": "IBMPlexMono-Regular",
     "PlexM-SB": "IBMPlexMono-SemiBold",
 }
-ASSET_FILES = ("fig03_dmesg.png", "fig09_prevboot.png")
 # reportlab is imported at start-up; the preflight covers the modules loaded later
-MODULES = {
-    "matplotlib": "python-matplotlib",
-    "svglib": "python-svglib",
-    "PIL": "python-pillow",
-}
+MODULES = {"matplotlib": "python-matplotlib", "svglib": "python-svglib", "PIL": "python-pillow"}
 MAX_PASSES = 6  # layout passes allowed before the page references must have settled
 HEADING_TOP_BAND = 70.0  # pt below the frame top within which a section heading opens its page
 
@@ -72,27 +68,23 @@ def build_parser() -> argparse.ArgumentParser:
     """Return the command-line parser; its epilog lists the exit codes from the EXIT_* constants."""
     parser = argparse.ArgumentParser(
         prog="build_report.py",
-        description="Build the GTR9 Pro post-boot log analysis print edition (PDF).",
+        description="Analyse a cachyos-bugreport.log and a ry-verify JSONL log into a print-edition PDF.",
         epilog=(
             f"Exit codes: {EXIT_OK} built or check passed, {EXIT_FAIL} build failed, "
             f"{EXIT_USAGE} usage, {EXIT_PREFLIGHT} preflight failed, {EXIT_INTERRUPT} interrupted."
         ),
     )
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"output PDF (default: ./{DEFAULT_OUT})")
+    parser.add_argument("--bugreport", type=Path, required=True, help="cachyos-bugreport.log from cachyos-bugreport.sh")
+    parser.add_argument(
+        "--verify", type=Path, required=True, help="ry-verify JSONL log (verify-*.jsonl or report-*.jsonl)"
+    )
+    parser.add_argument("--out", type=Path, help="output PDF (default: ./post-boot-log-analysis-<capture date>.pdf)")
     parser.add_argument(
         "--fonts", type=Path, help="directory with the IBM Plex TTF files (default: system font directories)"
     )
+    parser.add_argument("--check", action="store_true", help="run the preflight and parse the inputs; build nothing")
     parser.add_argument(
-        "--assets",
-        type=Path,
-        default=HERE / "assets",
-        help="directory with the two raster figures (default: assets/ beside this script)",
-    )
-    parser.add_argument("--check", action="store_true", help="run the preflight only; build nothing")
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="report the content checks, fonts, figures, each layout pass, and the result on stderr",
+        "--verbose", action="store_true", help="report parsing, analysis, layout passes, and the result"
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -105,11 +97,10 @@ try:
     from reportlab import rl_config
     from reportlab.graphics import shapes as rl_shapes
     from reportlab.lib import colors
-    from reportlab.lib.colors import Color, HexColor
+    from reportlab.lib.colors import HexColor
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.utils import ImageReader
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.pdfmetrics import registerFontFamily, stringWidth
     from reportlab.pdfbase.ttfonts import TTFont
@@ -118,7 +109,6 @@ try:
         CondPageBreak,
         Flowable,
         Frame,
-        Image,
         KeepTogether,
         NextPageTemplate,
         PageBreak,
@@ -136,11 +126,15 @@ except ImportError as exc:
 
 
 class PreflightError(Exception):
-    """A missing module, font, or asset; maps to exit code 3."""
+    """A missing module, font, or input; maps to exit code 3."""
 
 
-def preflight(fonts: Path | None, assets: Path) -> tuple[Path, Path]:
-    """Return the font and asset directories, or raise PreflightError naming what is missing."""
+class InputError(Exception):
+    """An input that is present but not in the expected format; maps to exit code 1."""
+
+
+def preflight(fonts: Path | None, inputs: Sequence[Path]) -> Path:
+    """Return the font directory, or raise PreflightError naming what is missing."""
     missing = [f"{name} (pacman: {pkg})" for name, pkg in MODULES.items() if importlib.util.find_spec(name) is None]
     if missing:
         msg = "missing Python modules: " + ", ".join(missing)
@@ -152,11 +146,11 @@ def preflight(fonts: Path | None, assets: Path) -> tuple[Path, Path]:
         searched = ", ".join(str(d) for d in dirs)
         msg = f"IBM Plex TTF files not found in {searched} (pacman: ttf-ibm-plex, or pass --fonts)"
         raise PreflightError(msg)
-    gone = [f for f in ASSET_FILES if not (assets / f).is_file()]
-    if gone:
-        msg = f"missing assets in {assets}: {', '.join(gone)}"
+    unreadable = [str(p) for p in inputs if not (p.is_file() and os.access(p, os.R_OK))]
+    if unreadable:
+        msg = "cannot read input: " + ", ".join(unreadable)
         raise PreflightError(msg)
-    return font_dir, assets
+    return font_dir
 
 
 @dataclass
@@ -168,1782 +162,1109 @@ class BuildState:
     h1pos: dict[int, tuple[str, bool]] = field(default_factory=dict)  # page -> (heading, opens the page)
     page_section: dict[int, str] = field(default_factory=dict)  # page -> running-header text
     unresolved: set[str] = field(default_factory=set)  # page references not known in this pass
+    figures: list[tuple[int, str]] = field(default_factory=list)  # (number, title) in reading order, this pass
+    fig_ref: list[tuple[int, str]] = field(default_factory=list)  # the same from the previous pass, for the contents
+    model: Model | None = None
+    tables: int = 0
     total: int = 0
     chart_dir: Path = field(default_factory=Path)
     font_dir: Path = field(default_factory=Path)
-    asset_dir: Path = field(default_factory=Path)
     mpl: ModuleType | None = None
 
 
 STATE = BuildState()
 
 
-class Card(TypedDict, total=False):
-    """Content of a finding card; INFO and closed cards leave out the keys they do not use."""
+# ── INPUT ─────────────────────────────────────────────────────────────
+# Parsers for the two capture formats: cachyos-bugreport.sh output and ry-verify JSONL.
+SEPARATOR = re.compile(r"^(?:_{20,}|-{20,})$")
+SECTION_TITLES = {
+    "Start of CachyOS bug report log file": "header",
+    "Getting Hardware Information": "inxi",
+    "Getting Scheduler information": "sched",
+    "dmesg": "dmesg",
+    "journalctl of current boot": "journal-current",
+    "journalctl of previous boot": "journal-previous",
+    "Installed packages": "packages",
+}
+DMESG_LINE = re.compile(r"^\[\s*(?P<t>\d+\.\d+)\]\s?(?P<msg>.*)$")
+JOURNAL_LINE = re.compile(
+    r"^(?P<mon>[A-Z][a-z]{2}) (?P<day>[ \d]\d) (?P<time>\d{2}:\d{2}:\d{2}) (?P<host>\S+) "
+    r"(?P<ident>[^\s\[:]+)(?:\[(?P<pid>\d+)\])?: (?P<msg>.*)$"
+)
+MONTHS = {
+    m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)
+}
 
-    id: str
+
+@dataclass
+class DmesgEntry:
+    """One kernel ring-buffer message: report line, seconds since kernel start, text."""
+
+    no: int
+    t: float
+    text: str
+
+
+@dataclass
+class JournalEntry:
+    """One journal entry at warning level or above."""
+
+    no: int
+    boot: str  # "current" or "previous"
+    when: dt.datetime
+    ident: str
+    pid: str
+    text: str
+
+    @property
+    def line(self) -> str:
+        """Return the entry as quoted in the report: time, process, message."""
+        proc = f"{self.ident}[{self.pid}]" if self.pid else self.ident
+        return f"{self.when:%H:%M:%S} {proc}: {self.text}"
+
+
+@dataclass
+class BugReport:
+    """The parsed cachyos-bugreport.log."""
+
+    path: Path
+    raw: bytes
+    lines: list[str]
+    sections: dict[str, tuple[int, int]]  # name -> (first line, last line), 1-based
+    date_text: str
+    captured: dt.datetime | None
+    uname: str
+    cmdline: str
+    inxi: list[tuple[int, str]]
+    dmesg: list[DmesgEntry]
+    journal: list[JournalEntry]
+    packages: list[tuple[int, str, str, str]]  # (line, repository, name, version)
+
+    def section_lines(self, name: str) -> list[tuple[int, str]]:
+        """Return (line number, text) for every line of a section."""
+        return section_slice(self.lines, self.sections, name)
+
+
+@dataclass
+class VerifyItem:
+    """One ry-verify result record."""
+
+    no: int
+    phase: str  # "static" or "runtime"
+    section: str
+    status: str  # OK, INFO, WARN, FAIL
+    text: str
+
+
+@dataclass
+class VerifyLog:
+    """The parsed ry-verify JSONL log."""
+
+    path: Path
+    raw: bytes
+    records: list[dict[str, Any]]
+    header: dict[str, Any]
+    footer: dict[str, Any]
+    items: list[VerifyItem]
+    phase_results: dict[str, dict[str, int]]  # phase -> counts from its VERIFY_RESULT record
+    combined: dict[str, int]
+    data_lines: list[tuple[int, str]]  # (record number, data) for every log record
+
+    @property
+    def started(self) -> dt.datetime | None:
+        """Return the header timestamp."""
+        return parse_iso(self.header.get("ts", ""))
+
+    @property
+    def finished(self) -> dt.datetime | None:
+        """Return the footer timestamp."""
+        return parse_iso(self.footer.get("ts", ""))
+
+
+def parse_iso(text: str) -> dt.datetime | None:
+    """Return a datetime from ry-verify's ISO stamp (YYYY-MM-DDTHH:MM:SS.fff±hhmm), or None."""
+    try:
+        return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%f%z")
+    except ValueError:
+        return None
+
+
+def parse_sections(lines: Sequence[str]) -> dict[str, tuple[int, int]]:
+    """Split the bug report at its separator lines and name each block by its first text line."""
+    blocks, start = [], 1
+    for n, line in enumerate(lines, 1):
+        if SEPARATOR.match(line):
+            blocks.append((start, n - 1))
+            start = n + 1
+    blocks.append((start, len(lines)))
+    sections = {}
+    for first, last in blocks:
+        title_no = next((n for n in range(first, last + 1) if lines[n - 1].strip()), None)
+        if title_no is None:
+            continue
+        title = lines[title_no - 1].strip()
+        name = next((v for k, v in SECTION_TITLES.items() if title.startswith(k)), None)
+        if name and name not in sections:
+            sections[name] = (title_no + 1, last) if name != "header" else (first, last)
+    return sections
+
+
+def section_slice(lines: Sequence[str], sections: dict[str, tuple[int, int]], name: str) -> list[tuple[int, str]]:
+    """Return (line number, text) for every line of a named report section."""
+    first, last = sections.get(name, (1, 0))
+    return [(n, lines[n - 1]) for n in range(first, last + 1)]
+
+
+def parse_capture_date(text: str) -> dt.datetime | None:
+    """Return the capture time from the report's `date` line (C or en_US locale), or None."""
+    cleaned = " ".join(w for w in text.split() if not re.fullmatch(r"[A-Z]{3,5}|[+-]\d{4}|UTC[+-]?\d*", w))
+    formats = ("%a %b %d %H:%M:%S %Y", "%a %b %d %I:%M:%S %p %Y", "%a %d %b %Y %H:%M:%S", "%a %d %b %Y %I:%M:%S %p")
+    for layout_ in formats:
+        try:
+            return dt.datetime.strptime(cleaned, layout_)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_journal(lines: Iterable[tuple[int, str]], boot: str, year: int) -> list[JournalEntry]:
+    """Return the journal entries of one boot; continuation lines join the entry above them."""
+    entries: list[JournalEntry] = []
+    for n, line in lines:
+        m = JOURNAL_LINE.match(line)
+        if m and m.group("mon") in MONTHS:
+            hh, mm, ss = (int(x) for x in m.group("time").split(":"))
+            when = dt.datetime(year, MONTHS[m.group("mon")], int(m.group("day")), hh, mm, ss)
+            entries.append(JournalEntry(n, boot, when, m.group("ident"), m.group("pid") or "", m.group("msg")))
+        elif entries and line.startswith((" ", "\t")) and line.strip():
+            entries[-1].text += " " + line.strip()
+    return entries
+
+
+def parse_bugreport(path: Path) -> BugReport:
+    """Parse cachyos-bugreport.log; raise InputError when it does not look like one."""
+    raw = path.read_bytes()
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    sections = parse_sections(lines)
+    if "header" not in sections or "dmesg" not in sections:
+        msg = f"{path.name}: not a cachyos-bugreport.log (no report header or dmesg section)"
+        raise InputError(msg)
+    first, last = sections["header"]
+    head = dict(ln.split(": ", 1) for ln in lines[first - 1 : last] if ": " in ln)
+    captured = parse_capture_date(head.get("Date", ""))
+    year = captured.year if captured else dt.datetime.now(tz=dt.UTC).year
+    dmesg: list[DmesgEntry] = []
+    for n, line in section_slice(lines, sections, "dmesg"):
+        m = DMESG_LINE.match(line)
+        if m:
+            dmesg.append(DmesgEntry(n, float(m.group("t")), m.group("msg")))
+        elif dmesg and line.strip():
+            dmesg[-1].text += " " + line.strip()
+    journal = parse_journal(section_slice(lines, sections, "journal-current"), "current", year)
+    journal += parse_journal(section_slice(lines, sections, "journal-previous"), "previous", year)
+    packages = []
+    for n, line in section_slice(lines, sections, "packages"):
+        m = re.match(r"^(?P<repo>[\w.-]+)/(?P<name>\S+) (?P<ver>\S+)", line)
+        if m:
+            packages.append((n, m.group("repo"), m.group("name"), m.group("ver")))
+    inxi = [(n, t) for n, t in section_slice(lines, sections, "inxi") if t.strip()]
+    return BugReport(
+        path,
+        raw,
+        lines,
+        sections,
+        head.get("Date", ""),
+        captured,
+        head.get("uname", ""),
+        head.get("cmdline", ""),
+        inxi,
+        dmesg,
+        journal,
+        packages,
+    )
+
+
+RESULT_LINE = re.compile(r"^(OK|INFO|WARN|FAIL):\s+(.*)$")
+COUNTS = re.compile(r"\b(ok|fail|warn|gen_fail)=(\d+)")
+
+
+def parse_verify(path: Path) -> VerifyLog:
+    """Parse a ry-verify JSONL log; raise InputError when it is not one."""
+    raw = path.read_bytes()
+    records: list[dict[str, Any]] = []
+    for n, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), 1):
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            msg = f"{path.name}: line {n} is not JSON ({exc.msg})"
+            raise InputError(msg) from exc
+    header = next((r for r in records if r.get("event") == "header"), None)
+    if header is None or "version" not in header:
+        msg = f"{path.name}: not a ry-verify log (no header record)"
+        raise InputError(msg)
+    foot = next((r for r in reversed(records) if r.get("event") == "footer"), {})
+    items, phase_results, combined, data_lines = [], {}, {}, []
+    phase, section = "preamble", "PREAMBLE"
+    for n, rec in enumerate(records, 1):
+        data = str(rec.get("data", "")) if rec.get("event") == "log" else ""
+        if not data:
+            continue
+        data_lines.append((n, data))
+        if m := re.match(r"^=== (STATIC|RUNTIME) VERIFICATION (START|END) ===$", data):
+            phase = m.group(1).lower() if m.group(2) == "START" else ""
+            section = "GENERAL"
+            continue
+        if m := re.match(r"^ECHO: ([A-Z][A-Z0-9 /&-]+)$", data):
+            section = m.group(1)
+            continue
+        if data.startswith("VERIFY_RESULT_COMBINED:"):
+            combined = {k: int(v) for k, v in COUNTS.findall(data)}
+        elif data.startswith("VERIFY_RESULT:") and phase_results.keys() >= {"static"}:
+            phase_results["runtime"] = {k: int(v) for k, v in COUNTS.findall(data)}
+        elif data.startswith("VERIFY_RESULT:"):
+            phase_results["static"] = {k: int(v) for k, v in COUNTS.findall(data)}
+        elif (m := RESULT_LINE.match(data)) and phase and section != "VERIFICATION SUMMARY":
+            items.append(VerifyItem(n, phase, section, m.group(1), m.group(2).strip()))
+    return VerifyLog(path, raw, records, header, foot, items, phase_results, combined, data_lines)
+
+
+# ── RULES ─────────────────────────────────────────────────────────────
+# Message patterns and what they mean. Rules carry knowledge, never results: a rule only reaches the
+# report when its pattern matches a line of the inputs, and every count it shows is taken from them.
+SEVERITY_RANK = {"HIGH": 0, "MED": 1, "LOW": 2, "INFO": 3, "WATCH": 4, "SETTING": 5, "NOTE": 6}
+FINDING_LEVELS = ("HIGH", "MED", "LOW", "INFO")
+SHUTDOWN_WINDOW = 15  # seconds before the previous boot's last journal entry that count as shutdown
+KEYWORDS = (
+    "fail", "failed", "failure", "error", "warn", "warning", "unable", "cannot", "can't", "could not", "couldn't",
+    "not supported", "unsupported", "not found", "no such", "denied", "invalid", "timeout", "timed out", "abort",
+    "crash", "crashed", "panic", "oops", "bug", "taint", "call trace", "segfault", "killed", "refused", "reset",
+    "hang", "corrupt", "mismatch", "deprecated", "unknown", "lacking", "kaput",
+)  # fmt: skip
+KEYWORD_RE = re.compile(r"(?i)\b(?:" + "|".join(re.escape(k) for k in KEYWORDS) + r")\b")
+
+
+@dataclass(frozen=True)
+class Rule:
+    """A message class: where it appears, how to recognise it, and what it means."""
+
+    key: str
     title: str
     area: str
-    cmds: str
-    closed: str
-    ev: list[str]
-    lines: str
-    rows: list[tuple[str, str]]
-    bullets: list[str]
+    severity: str
+    streams: tuple[str, ...]
+    patterns: tuple[str, ...]
+    explanation: str
+    action: str = "None"
+    window: str = ""  # "shutdown": only in the previous boot's last SHUTDOWN_WINDOW seconds
+    idents: str = ""  # journal: the process name must match this pattern
+    requires: str = ""  # the rule applies only when this pattern occurs somewhere in the bug report
+    mitigated_by: str = ""  # a ry-verify OK record matching this lowers the severity to INFO
 
 
-# ── CONTENT ───────────────────────────────────────────────────────────
-# Report text, tables, cards, and captions; edit here, then rebuild. T1-T20, TA1, and TB1 are the report's tables.
-REV = "32"
-ISSUED = "2026-10-04"
-CAP = "2026-10-02"
-VERDICT_HEAD = "Healthy — no CRIT, HIGH, or MED findings."
-VERDICT_BODY = (
-    "Open: one LOW finding (L-3, identifiers in the new captures) and 20 INFO findings that need "
-    "no action. "
-    "Closed: five LOW findings, confirmed by these captures. ry-verify reports 299 OK, 0 FAIL, 0 "
-    "WARN, and 0 GEN_FAIL; "
-    "the fix-script `--verify` run exits 0; there is no taint, oops, or splat."
-)
-KPI_OPEN = [("CRIT", 0), ("HIGH", 0), ("MED", 0), ("LOW", 1), ("INFO", 20), ("WATCH", 2), ("UNKNOWNS", 7)]
-KPI_CLOSED = [("LOW", 5), ("UNKNOWNS", 5), ("EVENTS", 1)]
-HEALTH = [
-    ("RY-VERIFY 7.219.0", "299 OK", "0 FAIL · 0 WARN · 0 GEN_FAIL"),
-    ("BOOT TO ROOT MOUNT", "7.22 s", "+1.00 s against 2026-09-27"),
-    ("FAILED UNITS", "0 / 0", "system / user"),
-    ("KERNEL RING", "Clean", "no taint, oops, or splat"),
-    ("NVME (P310 2 TB)", "PASSED", "42.9 °C · 8.92 TB written"),
-    ("GPU FIRMWARE", "MES 0x92", "SMU up · DMUB 0x09005300"),
-]
-DOC_CONTROL = [
-    ("Report", "GTR9 Pro Post-Boot Log Analysis (2026-10-02), print edition"),
-    ("Revision", f"{REV}, issued {ISSUED}"),
-    (
-        "Captures",
-        "cachyos-bugreport.log, ry-verify 7.219.0 JSONL, gtr9-postboot-fix 2.3.0 `--verify` log; 2026-10-02 18:20 PDT",
-    ),
-    ("Masking", "Identifiers in quoted lines are masked (L-3)"),
-    (
-        "This revision",
-        (
-            "Editorial cleanup and consistent typefaces in tables, cards, and the contents; findings, values, "
-            "and evidence unchanged since revision 30."
-        ),
-    ),
-]
-GUIDE = [
-    (
-        "**IDs** — L-n is a LOW finding, I-n an INFO finding, O-n an open action. Every finding has a "
-        "card with its evidence and the lines it cites."
-    ),
-    "**Line prefixes** — BR is cachyos-bugreport.log, VJ the ry-verify JSONL, FL the fix-script log (Appendix B).",
-    (
-        "**Status** — open items are in Sections 4–9 and 11, closed items in Section 10. Watch and "
-        "by-design items are not counted as findings."
-    ),
-    (
-        "**Commands** — Section 11 holds every command, one per line, ready to type in fish; its "
-        "checklist tracks the open actions and unknowns."
-    ),
-    (
-        "**Print** — figures encode series with gray levels, outlines, and marker shapes, so they read "
-        "on a black-and-white printer."
-    ),
-]
-EXEC_INTRO = [
-    (
-        "The captures were taken after the 18:19 reboot on 2026-10-02, with every fix from revisions "
-        "1–19 in place. The 2026-09-27 captures are no longer on the host; Table 1 keeps their values."
-    ),
-    (
-        "Open: L-3, because 65 lines of the new captures carry identifiers; 20 INFO findings that need "
-        "no action; two watch items; and seven unknowns. Closed: L-1, L-2, L-4, L-5, and L-6, five "
-        "unknowns, and one event."
-    ),
-]
-KEY_FACTS = [
-    (
-        "All five fixes hold after a reboot: no NetworkManager P2P warning (L-6), JACK through pw-jack "
-        "with no JACK server (L-2), the soft mixer on the POROSVOC card (L-5), the SDL ignore list in "
-        "the session (L-1), and only the accepted KWallet portal failure (L-4)."
-    ),
-    (
-        "The L-2 upgrade moved the kernel from 7.2.8-1 to 7.2.8-2-cachyos (clang 23.1.1) and Mesa from "
-        "26.2.3 to 26.2.4; the ry-install profile still matches (17/17 checksums, 15/15 kernel tokens "
-        "live)."
-    ),
-    (
-        "Firmware: CPU microcode 0x0B700037 (early update), SMU initialized, DMUB 0x09005300, MES "
-        "0x00000092, and MT7925 Wi-Fi and Bluetooth firmware built 2026-08-13."
-    ),
-    (
-        "The previous boot ran 2 h 10 min and adds I-17 to I-20: a wireless-extensions warning, a "
-        "window that hung on close, a Bluetooth audio device connecting and disconnecting, and Steam's "
-        "driver probe in the task manager (Figure 9)."
-    ),
-    "Idle captures: ry-verify at ≈39 s, the fix script at ≈49 s, and the bug report at ≈55 s after kernel start.",
-]
-CHANGED_INTRO = (
-    "Revision 19 values come from the 2026-09-27 captures. The early boot runs about 1 s later; "
-    "0.8 s of that is the gap before the root mount (forced fsck, inferred; Section 9)."
-)
-T1 = (
-    ["Item", "2026-09-27 (revision 19)", "2026-10-02", "Change"],
-    [
-        ["Kernel", "7.2.8-1-cachyos (clang 22.1.8)", "7.2.8-2-cachyos (clang 23.1.1)", "L-2 upgrade"],
-        ["Mesa", "26.2.3", "26.2.4", "L-2 upgrade"],
-        ["ry-verify 7.219.0", "299 OK; 0 FAIL, 0 WARN, 0 GEN_FAIL", "299 OK; every section count equal", "none"],
-        ["JACK provider", "jack2 1.9.22 (jackd found by inxi)", "pipewire-jack (pw-jack plugin)", "L-2 closed"],
-        ["NM P2P warning per boot", "1", "0 in both boots", "L-6 closed"],
-        [
-            "D-Bus user-unit failures",
-            "1 current, 2 previous (names redacted)",
-            "1 current (KWallet portal), 2 previous",
-            "accepted, L-4 closed",
-        ],
-        ["Journal entries, current boot", "55", "53", "L-6 warning and I-11 framebuffer line gone"],
-        ["Journal entries, previous boot", "87 (2 min 42 s boot)", "114 (2 h 10 min boot)", "longer session"],
-        ["Root mounted", "6.22 s", "7.22 s", "+1.00 s"],
-        ["No log output before the root mount", "3.06 s", "3.87 s", "+0.81 s, fsck inferred"],
-        ["Wi-Fi associated", "13.34 s", "14.30 s", "+0.96 s"],
-        ["Greeter / session hand-over", "≈10.4 / ≈17.4 s", "≈10.45 / ≈17.45 s", "none"],
-        ["MES firmware", "not logged; 0x91 read on 2026-08-14", "0x00000092 (FL 2)", "unknown closed"],
-        ["Failed units", "not captured", "0 system, 0 user (FL 2)", "unknown closed"],
-        [
-            "NVMe (Crucial P310 2 TB)",
-            "39.9 °C; 8.52 TB written; 119 days",
-            "42.9 °C; 8.92 TB; 124 days",
-            "+0.40 TB in 5 days",
-        ],
-        ["VRAM / GTT", "32,768 / 48,091 MiB", "32,768 / 48,091 MiB", "none"],
-    ],
-)
-ACTIONS_INTRO = (
-    "No INFO or watch item needs action. Table 2 lists the three open actions; Section 11 has "
-    "their commands and a checklist."
-)
-T2 = (
-    ["#", "Action", "Why", "How", "Page"],
-    [
-        [
-            "O-1",
-            "Redact the 2026-10-02 captures before posting them (L-3)",
-            "28 bug-report and 37 JSONL lines carry identifiers",
-            "Redact by hand; check with Section 11.1",
-            "{p:sub-11.1}",
-        ],
-        [
-            "O-2",
-            "Merge the seven .pacnew files listed by the 2026-10-02 upgrade",
-            "House rule after every `-Syu`; skip if done since",
-            "`sudo pacdiff`",
-            "{p:sub-11.2}",
-        ],
-        [
-            "O-3",
-            "Hand L-1, L-2, L-5, and L-6 to ry-install 7.224.0",
-            "The profile now carries all four; the old drop-ins duplicate them",
-            "Deploy, delete two drop-ins, run ry-verify",
-            "{p:sub-11.4}",
-        ],
-    ],
-)
-T3 = (
-    ["File", "Bytes", "Lines", "Content"],
-    [
-        [
-            "cachyos-bugreport.log",
-            "147,662",
-            "1,885",
-            (
-                "inxi, sched-ext state, full dmesg, journal of the current and previous boot (warning and "
-                "above), package list"
-            ),
-            "5ee35ae048c94a328a49f45465d35ff3b2b587ab8d1aed335bde4dc3523dea92",
-        ],
-        [
-            "verify-20261002-182017-0700-1942.jsonl",
-            "51,436",
-            "483",
-            "ry-verify 7.219.0 static and runtime passes, profile gtr9_pro",
-            "18d25f823a0778419e5026c4f37d61b895110b74d267ba34ec2f714389b82b41",
-        ],
-        [
-            "20261002-182027-3922.log",
-            "1,048",
-            "11",
-            "gtr9-postboot-fix 2.3.0 `--verify`: one record per step, exit status",
-            "2160b2adc2d0f6077630d8f8e8f757bd0f0402a7eeca3abc3200432678f99440",
-        ],
-    ],
-)
-T4 = (
-    ["Event", "Wall clock (PDT)", "Since kernel start"],
-    [
-        ["Previous boot (journal span)", "16:08:42 → 18:19:29", "ended by reboot at 18:19:28"],
-        ["Current boot: kernel start", "≈18:19:38.05 (±0.16 s)", "0 s"],
-        ["Greeter starts", "18:19:48", "≈10.45 s"],
-        ["Greeter → user session hand-over", "18:19:55", "≈17.45 s"],
-        ["ry-verify 7.219.0 run", "18:20:17.118 → 18:20:19.451", "≈39.06 → 41.40 s"],
-        ["Fix script 2.3.0 `--verify`", "18:20:27.126 → 18:20:27.294", "≈49.07 → 49.24 s"],
-        ["cachyos-bugreport capture", "18:20:33", "≈55.45 s"],
-    ],
-)
-T4_NOTE = (
-    "Kernel start is the intersection of the 1 s journal stamps of seven kernel messages with "
-    "their dmesg offsets. Journal and bug-report times have 1 s resolution; offsets use the middle "
-    "of the second (±0.5 s)."
-)
-METHOD = [
-    (
-        "Every JSONL record, every journal entry of both boots, and all 1,359 dmesg lines were read "
-        "and classified. The 124 lines matching the failure keyword set (Table 5) and the 205 dmesg "
-        "lines matching a wider notice pattern are each attributed (Section 8)."
-    ),
-    (
-        "New messages were traced to their emitting code on 2026-10-02 (Linux v7.2, BlueZ, KWin, "
-        "plasma-desktop, pulseaudio-qt, Chromium, CachyOS-Settings); unchanged messages keep revision "
-        "19's 2026-09-29 checks. Quoted lines are verbatim apart from masked identifiers and dropped "
-        "date and host prefixes; each cites its line (BR, VJ, FL: Appendix B)."
-    ),
-    (
-        "Severity follows the observed impact on this host, not the log level. Commands are "
-        "fish-compatible, one per line, and never wrapped."
-    ),
-]
-KEYWORDS = [
-    "fail",
-    "failed",
-    "failure",
-    "error",
-    "warn",
-    "warning",
-    "unable",
-    "cannot",
-    "can't",
-    "could not",
-    "couldn't",
-    "not supported",
-    "unsupported",
-    "not found",
-    "no such",
-    "denied",
-    "invalid",
-    "timeout",
-    "timed out",
-    "abort",
-    "crash",
-    "crashed",
-    "panic",
-    "oops",
-    "bug",
-    "taint",
-    "call trace",
-    "segfault",
-    "killed",
-    "refused",
-    "reset",
-    "hang",
-    "corrupt",
-    "mismatch",
-    "deprecated",
-    "unknown",
-    "lacking",
-    "kaput",
-]
-T6 = (
-    ["Level / status", "Meaning"],
-    [
-        ["CRIT", "Data loss, unbootable system, or active security exposure."],
-        ["HIGH", "Broken function or hardware at risk."],
-        ["MED", "Degraded function or performance with a visible impact."],
-        ["LOW", "Limited, conditional, or hygiene impact; action is optional or quick."],
-        ["INFO", "Explained and harmless; no action required."],
-        ["OPEN", "Present in the 2026-10-02 captures or awaiting an action; Sections 4–9 and 11."],
-        ["CLOSED", "Fixed and confirmed by the 2026-10-02 captures, answered, or a normal event; Section 10 only."],
-        ["WATCH", "Explained limit kept under observation; open, not counted as a finding."],
-        ["BY DESIGN", "Deliberate host choice surfacing in the logs; not counted."],
-    ],
-)
-T7 = (
-    ["Check", "Result", "Evidence"],
-    [
-        ["ry-verify 7.219.0", "PASS, exit 0", "299 OK = 213 static + 86 runtime; 11 INFO notes (Table 14)"],
-        ["Fix script `--verify`", "exit 0", "7 steps ok; L-3 had no capture pair yet (FL 5)"],
-        ["Managed config, cmdline", "17/17 checksums; 15/15 tokens live", "No kernel parser rejections (VJ 377)"],
-        ["Kernel ring buffer", "No taint, oops, or splat", "1,359 lines; 13 keyword and 205 notice lines classified"],
-        ["Failed units", "0 system, 0 user", "FL 2"],
-        ["CPU vulnerabilities", "None unmitigated", "inxi: 14 not affected, 5 mitigated (BR 50–73)"],
-        ["GPU memory", "VRAM 32,768 MiB", "GTT 48,091 MiB, the kernel default (BR 1384)"],
-        ["amdgpu firmware", "SMU initialized", "DMUB 0x09005300; VCN ENC 1.24 / DEC 9; MES 0x00000092 (FL 2)"],
-        [
-            "CPU / GPU policy",
-            "amd-pstate-epp, EPP performance; GPU DPM high",
-            "Microcode 0x0B700037 (early); governor powersave; dynamic_epp disabled (VJ 392)",
-        ],
-        ["zswap", "Disabled (readback N)", "Pool initialized by the vendor udev rule (I-1)"],
-        ["Temperatures at idle", "CPU 49.6 °C, GPU 46.0 °C", "Board 47.5 °C (BR 163); no fan RPM (I-13)"],
-        [
-            "NVMe (Crucial P310 2 TB)",
-            "SMART PASSED, 42.9 °C",
-            "8.92 TB written, +0.40 TB in 5 days; 124 days powered on",
-        ],
-        ["Wi-Fi (MT7925)", "Associated at 14.30 s", "AP-advertised TX cap 30 dBm (watch)"],
-        ["Boot to root mount", "7.22 s", "3.87 s without log output first (Figure 3)"],
-    ],
-)
-REGISTER_INTRO = (
-    "The register lists the open LOW finding first, then the INFO findings, which need no action. "
-    "Line gives the first evidence line (BR and VJ prefixes: Appendix B); Page gives the finding "
-    "card. Closed findings are in Section 10."
-)
-T8 = [
-    (
-        "L-3",
-        "LOW",
+R = Rule
+RULES = (
+    R("kernel-splat", "Kernel oops, BUG, or warning splat", "Kernel", "HIGH", ("dmesg", "journal"),
+      (r"\bOops\b", r"\bBUG: ", r"kernel BUG at ", r"general protection fault", r"WARNING: CPU: \d+ PID: \d+",
+       r"Call Trace:"),
+      "The kernel reached an unexpected state and printed a splat; the lines after the first match name the "
+      "module and function involved.",
+      "Read the whole splat with `journalctl -k -b` and report it upstream with the module it names."),
+    R("kernel-taint", "Kernel taint flag set", "Kernel", "MED", ("dmesg", "journal"), (r"\bTainted: [A-Z]",),
+      "A taint flag marks the running kernel as modified or degraded (an out-of-tree or unsigned module, or an "
+      "earlier oops); upstream developers ask for reproductions on an untainted kernel.",
+      "Read `/proc/sys/kernel/tainted` and identify the module that set the flag."),
+    R("gpu-hang", "GPU hang or reset", "GPU / amdgpu", "HIGH", ("dmesg", "journal"),
+      (r"amdgpu.*(?:GPU reset|ring \S+ timeout|job timed out|GPU recovery)",),
+      "amdgpu detected a stuck engine and reset the GPU; applications using it may have lost their contexts.",
+      "Note what was running at that time and check the amdgpu lines around the reset."),
+    R("storage-errors", "Storage or file-system errors", "Storage", "HIGH", ("dmesg", "journal"),
+      (r"I/O error", r"EXT4-fs error", r"BTRFS (?:error|critical)", r"XFS .*(?:corruption|metadata I/O error)",
+       r"nvme\d+: (?:controller is down|resetting controller)"),
+      "The kernel reported failed I/O or file-system damage; data on the affected device may be at risk.",
+      "Check the device with `smartctl -a` and run a file-system check from a live system."),
+    R("oom-kill", "Out-of-memory kill", "Memory", "MED", ("dmesg", "journal"),
+      (r"Out of memory: Killed process", r"oom-kill:"),
+      "The kernel ran out of memory and killed a process to recover.",
+      "Find the killed process in the evidence and the memory consumer that caused it."),
+    R("core-dump", "A process crashed and dumped core", "Processes", "MED", ("journal",),
+      (r"Process \d+ \(.+\) of user \d+ (?:dumped core|terminated abnormally)",),
+      "systemd-coredump recorded a crashed program; the evidence names it.",
+      "Inspect it with `coredumpctl list` and `coredumpctl info <PID>`."),
+    R("shutdown-noise", "Shutdown-only noise", "Session / shutdown", "INFO", ("journal",),
+      (r"Failed to enqueue SYSTEMD_(?:USER_)?WANTS job", r"Transaction for .* is destructive", r"PipeWire remote error",
+       r"context kaput", r"dispatcher: .*failed", r"crashed \(signal (?:1|15)\)", r"Authentication error: .*crashed",
+       r"Failed with result '", r"No object for name", r"Could not activate remote peer"),
+      "These lines come from the last seconds of the previous boot, while services stopped for the reboot: "
+      "helpers ended by SIGHUP or SIGTERM are reported as crashes, udev events cannot add jobs to a shutdown "
+      "transaction, D-Bus activations are refused, and PipeWire clients lose their server.",
+      window="shutdown"),
+    R("redacted-unit", "A unit whose name the redactor replaced failed", "Services", "INFO", ("journal",),
+      (r"<email-address-redacted>: Failed with result",),
+      "systemd reported a failed unit, but cachyos-bugreport.sh replaced its name: unit names containing @ look "
+      "like email addresses to its filter. Template and D-Bus-activated units are affected.",
+      "Name it with `journalctl -b -o cat -p warning | rg 'Failed with result'` (add `--user` for user units)."),
+    R("kwallet-off", "KWallet services fail because KWallet is disabled", "Session / KWallet", "INFO", ("journal",),
+      (r"Lacking a socket, pipe", r"kwallet.*Failed with result"),
+      "With the KDE wallet disabled, ksecretd and the KWallet secret portal exit on start and systemd records the "
+      "D-Bus-activated unit as failed; nothing else depends on them.",
+      "None unless secret storage is wanted."),
+    R("kde-startup", "KDE, portal, and D-Bus startup noise", "Desktop / KDE, portal, D-Bus", "INFO", ("journal",),
+      (r"Activation request for '[^']+' failed", r"Service file '[^']+' is not named after the D-Bus name",
+       r"Failed to register with host portal", r"[Cc]harge thresholds? .*not supported|chargethreshold",
+       r"Failed enumerating MM objects", r"no kernel backlight interface", r"\.qml:\d+", r"[Dd]eprecated",
+       r"gtk\.portal|Lockdown", r"UPower", r"@DEFAULT_SOURCE@", r"[Ss]creencast", r"[Ss]creen configuration"),
+      "Plasma, its portals, and D-Bus print these on working desktops: portal host registration for programs "
+      "without desktop files, legacy D-Bus service file names, absent ModemManager or UPower owners, power "
+      "management probing hardware the machine lacks, and QML deprecation warnings.",
+      idents=r"plasmashell|kwin_wayland|ksmserver|kded6|org_kde_powerdevil|dbus-broker-launch|xdg-desktop-portal"
+      r".*|plasmalogin|startplasma.*|kactivitymanagerd|powerdevil|baloo.*|kscreen.*|polkit-kde.*"),
+    R("greeter-helper", "Greeter authentication helper exits with status 255", "Login / plasmalogin", "INFO",
+      ("journal",), (r"plasmalogin-helper exited with 255",),
+      "The greeter's helper exits with 255 when the greeter stops after a successful hand-over to the session."),
+    R("kwin-commit", "KWin atomic commit refused at the session switch", "Desktop / KWin", "INFO", ("journal",),
+      (r"atomic commit failed: Permission denied",),
+      "The outgoing compositor loses DRM master during the greeter-to-session switch and logs the refused commit.",
+      "None unless a login glitch appears."),
+    R("kwin-killer", "KWin discards an unfinished kill prompt", "Desktop / KWin", "INFO", ("journal",),
+      (r"kwin_killer_helper.*still running",),
+      "KWin starts its killer helper when a closing window stops answering and discards it once the window goes "
+      "away: an application hung briefly on close.", "None unless it recurs."),
+    R("unity-launcher", "Task manager finds no desktop file for a launcher entry", "Desktop / task manager", "INFO",
+      ("journal",), (r"Failed to find service for Unity Launcher",),
+      "Plasma's task manager maps Unity LauncherEntry updates to desktop files and drops updates naming files "
+      "that do not exist."),
+    R("bt-audio", "Bluetooth audio device connects and disconnects", "Bluetooth / BlueZ, pulseaudio-qt", "INFO",
+      ("journal",),
+      (r"load_remote_sep\(\) Unable to load LastUsed", r"ext_io_disconnected\(\) Unable to get io data",
+       r"No object for name \"(?:bluez_|@DEFAULT_SINK@)", r"No object for name"),
+      "bluetoothd skips a cached audio endpoint the device no longer offers, or a profile connection closes before "
+      "it is read; each node change makes pulseaudio-qt look up nodes that are gone."),
+    R("bolt-nhi", "bolt does not recognise the USB4 host interfaces", "USB4 / bolt", "INFO", ("journal",),
+      (r"unknown NHI PCI id",),
+      "bolt's table of USB4/Thunderbolt host interfaces lacks these IDs, so it treats the host UUID as unstable, the "
+      "safe default; nothing changes without devices that need bolt authorisation."),
+    R("wpa-multicast", "wpa_supplicant multicast RX registration unsupported", "Network / wpa_supplicant", "INFO",
+      ("journal",), (r"multicast RX registrations are not supported",),
+      "nl80211 refuses multicast management-frame registrations when the driver does not advertise them; "
+      "wpa_supplicant logs it and continues."),
+    R("wext", "A program uses legacy wireless extensions", "Network / cfg80211", "INFO", ("dmesg", "journal"),
+      (r"uses wireless extensions which will stop working",),
+      "The kernel warns once per boot when a program queries Wi-Fi through the legacy wireless-extensions ioctls, "
+      "which Wi-Fi 7 multi-link devices refuse; connectivity is unaffected."),
+    R("nm-p2p", "NetworkManager warns on the Wi-Fi P2P device", "Network / NetworkManager", "LOW", ("journal",),
+      (r"p2p-dev-\w+.*(?:forwarding|No such file or directory)",),
+      "NetworkManager configures a P2P device that has no kernel network device and logs the failure.",
+      "Unmanage `type:wifi-p2p` devices in a NetworkManager conf.d drop-in.", mitigated_by=r"(?i)p2p"),
+    R("zswap-pool", "zswap pool initialized", "Memory / zswap", "INFO", ("dmesg",), (r"zswap: loaded using pool",),
+      "zswap set up its compressed pool. When the command line disables zswap, a later write to its `enabled` "
+      "parameter does this (CachyOS's zram udev rule writes it); zswap stays as configured.",
+      mitigated_by=r"zswap"),
+    R("wq-name", "Workqueue name truncated", "Kernel", "INFO", ("dmesg",), (r"workqueue: name exceeds WQ_NAME_LEN",),
+      "A driver names a workqueue longer than the kernel's limit, and the kernel truncates it once."),
+    R("bt-esco", "Bluetooth controller lacks enhanced synchronous connections", "Bluetooth / btusb", "INFO",
+      ("dmesg",), (r"Enhanced Setup Synchronous Connection command is advertised, but not supported",),
+      "btusb marks the command broken for this controller; voice links use the legacy setup and A2DP audio is "
+      "unaffected."),
+    R("acp-machine", "Audio co-processor finds no machine driver", "Audio / ACP", "INFO", ("dmesg",),
+      (r"No matching ASoC machine driver found",),
+      "No ACP machine description matches the board, so audio runs through HDA and USB devices instead."),
+    R("nvme-notice", "NVMe UUID and SGL notices", "Storage / NVMe", "INFO", ("dmesg",),
+      (r"passthrough uses implicit buffer lengths", r"No UUID available providing old NGUID"),
+      "Informational notices for a controller without SGL support and a namespace without a UUID."),
+    R("tdx", "TDX message on a CPU without TDX", "Kernel / TDX", "INFO", ("dmesg",),
+      (r"TDX not supported by the host platform",),
+      "The kernel's Intel TDX host code logs this whenever the CPU lacks TDX host support."),
+    R("platform-gaps", "Platform visibility gaps (AER, fan speed, USB LPM)", "Platform / firmware", "INFO",
+      ("dmesg", "inxi"),
+      (r"_OSC: platform does not support \[[^\]]*AER", r"We don't know the algorithms for LPM",
+       r"No LPM exit latency info found", r"Could not reserve \[mem", r"Fan Speeds \(rpm\): N/A"),
+      "Firmware keeps PCIe error reporting (AER) instead of granting it to the OS, so link errors are not reported; "
+      "no fan tachometer is exposed; USB link power management is off for controllers without exit-latency data.",
+      "None; a clean ring is not proof of a clean PCIe link."),
+    R("inxi-labels", "inxi mislabels the CPU or GPU generation", "Tooling / inxi", "INFO", ("inxi",),
+      (r"arch: Zen 6", r"code: Phoenix"),
+      "inxi's model tables label Strix Halo as Zen 6 and its GPU as Phoenix; the hardware is Zen 5 with an RDNA 3.5 "
+      "GPU.", "None; note it when sharing inxi output.", requires=r"(?i)ryzen ai max"),
+    R("egistec", "Fingerprint reader without a driver", "Input / fingerprint", "INFO", ("dmesg",),
+      (r"idVendor=1c7a, idProduct=0577",),
+      "libfprint lists the EgisTec EH577 (1c7a:0577) as unsupported, so the sensor enumerates but no driver binds.",
+      "None unless fingerprint login is wanted."),
+    R("hid-joystick", "Keyboard receiver exposes a HID joystick interface", "Input / HID", "LOW", ("dmesg",),
+      (r"Joystick \[Keychron",),
+      "The receiver presents a joystick interface that SDL and Proton games can take for a game controller.",
+      "Add the receiver's VID/PID pairs to SDL_GAMECONTROLLER_IGNORE_DEVICES for the session.",
+      mitigated_by=r"SDL_GAMECONTROLLER_IGNORE_DEVICES"),
+    R("usb-volume", "USB audio device reports a tiny hardware volume range", "Audio / USB", "LOW", ("dmesg",),
+      (r"Unlikely small volume range",),
+      "The device's hardware volume control spans so little that the slider has almost no effect.",
+      "Enable WirePlumber's soft mixer (api.alsa.soft-mixer) for the card.", mitigated_by=r"(?i)soft.?mixer"),
+    R("jack-server", "A JACK server runs beside PipeWire", "Audio / JACK", "LOW", ("inxi",),
+      (r"Server-\d+: JACK", r"\bjackd\b"),
+      "jack2 provides libjack, so JACK clients bypass PipeWire.",
+      "Replace jack2 with pipewire-jack.", mitigated_by=r"pipewire-jack"),
+    R("wifi-tx-cap", "Wi-Fi TX power capped by the access point", "Network / Wi-Fi", "WATCH", ("dmesg",),
+      (r"Limiting TX power to \d+",),
+      "The access point advertises a transmit-power limit and the driver applies it.",
+      "Watch for a lower cap after router or firmware changes."),
+    R("link-down", "Wired network ports down", "Network / Ethernet", "WATCH", ("dmesg",),
+      (r"\b(?:eth|en)\w*: Link is Down",),
+      "These ports have no cable or link partner.", "Watch for a cabled port that stays down."),
+    R("secure-boot", "Secure Boot state", "Boot / Secure Boot", "SETTING", ("dmesg",),
+      (r"Secure boot (?:disabled|enabled)",), "The firmware's Secure Boot state as the kernel reports it."),
+    R("ipv6-off", "IPv6 administratively disabled", "Network / IPv6", "SETTING", ("dmesg",),
+      (r"IPv6: Loaded, but administratively disabled",), "ipv6.disable=1 on the kernel command line."),
+    R("cstate-cap", "CPU idle states limited", "CPU / idle", "SETTING", ("dmesg",),
+      (r"processor limited to max C-state",), "processor.max_cstate on the kernel command line."),
+    R("cmdline", "Kernel command line", "Boot", "NOTE", ("dmesg",), (r"^(?:Kernel )?[Cc]ommand line:",),
+      "The command line the kernel booted with."),
+    R("memmap", "Firmware memory map, ACPI table reservations", "Boot / firmware", "NOTE", ("dmesg",),
+      (r"BIOS-e820:", r"^e820: ", r"^ACPI: .*(?:table|Reserving)", r"reserve setup_data"),
+      "Boilerplate printed on every boot."),
+    R("pnp-reserve", "PNP0C02 resource reservations", "Boot / ACPI", "NOTE", ("dmesg",),
+      (r"system 00:\w+: \[(?:mem|io) .*\] (?:has been|could not be) reserved", r"PNP0C02"),
+      "Boilerplate printed on every boot."),
+    R("mitigations", "CPU vulnerability mitigations", "CPU / security", "NOTE", ("dmesg",),
+      ((r"(?i)\b(?:spectre|meltdown|mds|taa|mmio stale|srbds|retbleed|gds|srso|rfds|its|tsa|vmscape|l1tf"
+       r"|speculative store bypass)\b.*(?:mitigation|vulnerable|not affected|disabled)"), r"(?i)\bmitigations?: "),
+      "Posture lines printed on every boot; inxi's Vulnerabilities block summarises them."),
+    R("xhci-quirks", "xHCI quirk masks", "USB", "NOTE", ("dmesg",), (r"xhci_hcd .*(?:hcc params|quirks)",),
+      "Boilerplate printed on every boot."),
+    R("amdgpu-optional", "amdgpu optional features", "GPU / amdgpu", "NOTE", ("dmesg",),
+      ((r"amdgpu .*(?:Direct firmware load for .* failed|not supported|is not available|runtime pm is manually "
+       r"disabled)"),),
+      "Optional firmware or features absent on this GPU; boilerplate."),
+    R("unmet-conditions", "systemd unmet conditions", "Boot / systemd", "NOTE", ("dmesg",),
+      ((r"was skipped because (?:no trigger condition checks were met|of an unmet condition check|all trigger "
+       r"condition checks failed)"),),
+      "Units skipped by design on this system (no TPM measurement, no hibernation, and similar)."),
+    R("audit", "Audit subsystem", "Kernel / audit", "NOTE", ("dmesg",), (r"\baudit[:(]",),
+      "Boilerplate printed on every boot."),
+    R("reset-reason", "Previous reset reason", "Boot", "NOTE", ("dmesg",),
+      (r"(?i)reset reason|wrote 0x\w+ to reset control register",),
+      "How the previous boot ended, as the platform recorded it."),
+    R("unit-failed", "systemd units failed", "Services", "LOW", ("journal",),
+      (r"Failed with result '", r"Failed to start "),
+      "systemd reports units that ended in failure; the evidence names each unit.",
+      "Inspect each unit with `systemctl status` and `journalctl -b -u <unit>`."),
+)  # fmt: skip
+del R
+COMPILED = {r.key: [re.compile(p) for p in r.patterns] for r in RULES}
+IDENT_RES = {r.key: re.compile(r.idents) for r in RULES if r.idents}
+
+# Identifier classes: what makes a log traceable to one machine or person.
+UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+IDENTIFIERS = (
+    ("Root UUID, root=UUID= form", re.compile(rf"root=UUID={UUID}"), "root=UUID=[root UUID]"),
+    ("DMI system UUID", re.compile(rf"\buuid: {UUID}"), "uuid: [DMI UUID]"),
+    ("USB4 domain ID", re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-domain"), "<USB4 domain id>-domain"),
+    ("Other UUID", re.compile(rf"\b{UUID}\b"), "[UUID]"),
+    ("USB serial numbers", re.compile(r"SerialNumber:\s*(?!<)\S+"), "SerialNumber: [serial]"),
+    ("Bluetooth address, underscore form", re.compile(r"\b(?:[0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2}\b"), "[BT MAC]"),
+    ("MAC address, colon form", re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "[MAC]"),
+    ("Home directory", re.compile(r"/home/(?!<)[A-Za-z0-9._-]+"), "/home/<user>"),
+    ("IPv4 address", re.compile(r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"), "[IPv4]"),
+    ("Email address", re.compile(r"[\w.%+-]+@[\w-]+\.(?!service\b|socket\b|timer\b|target\b|mount\b|slice\b|scope\b)"
+                                 r"[A-Za-z]{2,}\b"), "[email]"),
+)  # fmt: skip
+
+
+def mask(text: str) -> str:
+    """Return text with every identifier replaced by a placeholder, for quoting in the report."""
+    for _name, pattern, placeholder in IDENTIFIERS:
+        text = pattern.sub(placeholder, text)
+    return text
+
+
+# ── ANALYSIS ──────────────────────────────────────────────────────────
+# Turns the parsed inputs into findings, health checks, coverage, identifiers, timeline, and actions.
+@dataclass
+class Match:
+    """One input line attributed to a finding."""
+
+    stream: str  # dmesg, journal, inxi, verify
+    no: int  # bug-report line or JSONL record
+    text: str  # masked quote
+    boot: str = ""
+    when: dt.datetime | None = None
+
+
+@dataclass
+class Finding:
+    """A finding, watch item, setting, or boilerplate family with its evidence."""
+
+    key: str
+    title: str
+    area: str
+    severity: str
+    explanation: str
+    action: str
+    matches: list[Match] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    fid: str = ""
+
+    def count(self, stream: str, boot: str = "") -> int:
+        """Return the evidence lines from one stream (and, for the journal, one boot)."""
+        return sum(1 for m in self.matches if m.stream == stream and (not boot or m.boot == boot))
+
+    def lines(self) -> str:
+        """Return the evidence line references, e.g. 'BR 12, 40-41 · VJ 7'."""
+        br = sorted({m.no for m in self.matches if m.stream != "verify"})
+        vj = sorted({m.no for m in self.matches if m.stream == "verify"})
+        parts = [f"BR {ranges(br)}"] if br else []
+        return " · ".join([*parts, f"VJ {ranges(vj)}"] if vj else parts)
+
+
+@dataclass
+class Action:
+    """An action the findings call for, with its commands and completion test."""
+
+    aid: str
+    title: str
+    why: str
+    commands: list[str]
+    done_when: str
+
+
+@dataclass
+class Model:
+    """Everything the report shows, derived from the two inputs."""
+
+    br: BugReport
+    vj: VerifyLog
+    findings: list[Finding]
+    others: list[Finding]  # WATCH, SETTING, NOTE
+    unclassified: list[Match]
+    identifiers: list[tuple[str, list[int], list[int]]]  # (class, bug-report lines, JSONL records)
+    milestones: dict[str, float]
+    quiet_gap: tuple[float, float] | None
+    kernel_start: tuple[dt.datetime, float] | None  # (estimate, half-width in seconds)
+    verify_sections: list[tuple[str, str, dict[str, int]]]
+    facts: dict[str, str]
+    health: list[tuple[str, str, str]]
+    keyword_lines: dict[str, int]
+    actions: list[Action]
+
+
+def ranges(numbers: Sequence[int]) -> str:
+    """Return sorted numbers as compact ranges: 1, 3-5, 9."""
+    out, streak = [], []
+    for n in numbers:
+        if streak and n == streak[-1] + 1:
+            streak.append(n)
+            continue
+        if streak:
+            out.append(f"{streak[0]}–{streak[-1]}" if len(streak) > 1 else str(streak[0]))
+        streak = [n]
+    if streak:
+        out.append(f"{streak[0]}–{streak[-1]}" if len(streak) > 1 else str(streak[0]))
+    return ", ".join(out)
+
+
+def applicable_rules(br: BugReport) -> list[Rule]:
+    """Return the rules whose `requires` pattern (if any) occurs in the bug report."""
+    text = "\n".join(br.lines)
+    return [r for r in RULES if not r.requires or re.search(r.requires, text)]
+
+
+def match_rule(
+    rules: Sequence[Rule], stream: str, text: str, ident: str = "", *, shutdown: bool = False
+) -> Rule | None:
+    """Return the first rule matching a line of a stream, honouring process and shutdown-window limits."""
+    for rule in rules:
+        if stream not in rule.streams or (rule.window == "shutdown" and not shutdown):
+            continue
+        if rule.idents and not IDENT_RES[rule.key].fullmatch(ident):
+            continue
+        if any(p.search(text) for p in COMPILED[rule.key]):
+            return rule
+    return None
+
+
+def attribute(br: BugReport, rules: Sequence[Rule]) -> tuple[dict[str, Finding], list[Match]]:
+    """Attribute every journal entry, every dmesg line a rule knows, and inxi lines to rules."""
+    found: dict[str, Finding] = {}
+    unclassified: list[Match] = []
+
+    def add(rule: Rule, match: Match) -> None:
+        """Add one evidence line to its rule's finding."""
+        f = found.setdefault(
+            rule.key, Finding(rule.key, rule.title, rule.area, rule.severity, rule.explanation, rule.action)
+        )
+        f.matches.append(match)
+
+    for e in br.dmesg:
+        rule = match_rule(rules, "dmesg", e.text)
+        if rule:
+            add(rule, Match("dmesg", e.no, mask(f"[{e.t:12.6f}] {e.text}")))
+        elif KEYWORD_RE.search(e.text):
+            unclassified.append(Match("dmesg", e.no, mask(f"[{e.t:12.6f}] {e.text}")))
+    previous = [e for e in br.journal if e.boot == "previous"]
+    last_prev = max((e.when for e in previous), default=None)
+    for e in br.journal:
+        shutdown = bool(last_prev and e.boot == "previous" and (last_prev - e.when).total_seconds() <= SHUTDOWN_WINDOW)
+        rule = match_rule(rules, "journal", e.text, e.ident, shutdown=shutdown)
+        if rule is None and e.ident == "kernel":  # kernel warnings repeat in the journal; dmesg rules know them
+            rule = match_rule(rules, "dmesg", e.text)
+        quote = Match("journal", e.no, mask(e.line), e.boot, e.when)
+        if rule:
+            add(rule, quote)
+        else:
+            unclassified.append(quote)
+    for n, line in br.inxi:
+        rule = match_rule(rules, "inxi", line)
+        if rule:
+            add(rule, Match("inxi", n, mask(line.strip())))
+    return found, unclassified
+
+
+def apply_mitigations(found: dict[str, Finding], vj: VerifyLog) -> None:
+    """Lower a finding to INFO when ry-verify reports its mitigation in place, citing the record."""
+    for rule in RULES:
+        f = found.get(rule.key)
+        if not f or not rule.mitigated_by or SEVERITY_RANK[f.severity] > SEVERITY_RANK["LOW"]:
+            continue
+        hit = next((i for i in vj.items if i.status == "OK" and re.search(rule.mitigated_by, i.text)), None)
+        if hit:
+            f.severity = "INFO"
+            f.notes.append(f"ry-verify reports the mitigation in place (VJ {hit.no}: {mask(hit.text)[:90]}).")
+
+
+def verify_findings(vj: VerifyLog) -> list[Finding]:
+    """Group ry-verify FAIL and WARN records by section into findings."""
+    groups: dict[tuple[str, str, str], list[VerifyItem]] = {}
+    for item in vj.items:
+        if item.status in ("FAIL", "WARN"):
+            groups.setdefault((item.status, item.phase, item.section), []).append(item)
+    out = []
+    for (status, phase, section), items in groups.items():
+        sev = "MED" if status == "FAIL" else "LOW"
+        title = f"ry-verify {status}: {section_title(section)} ({phase})"
+        f = Finding(
+            f"verify-{status}-{phase}-{section}",
+            title,
+            "ry-verify / " + section_title(section),
+            sev,
+            f"ry-verify {vj.header.get('version', '')} checks the managed configuration; these {phase} checks "
+            f"reported {status}.",
+            "Fix each listed item, then run `ry-verify.fish --verify` again.",
+        )
+        f.matches = [Match("verify", i.no, mask(f"{i.status}: {i.text}")) for i in items]
+        out.append(f)
+    return out
+
+
+def section_title(section: str) -> str:
+    """Return a ry-verify section name in sentence case (WIFI STATE -> Wi-Fi state)."""
+    return section.capitalize().replace("Wifi", "Wi-Fi").replace("Preamble", "Before the checks")
+
+
+def find_identifiers(br: BugReport, vj: VerifyLog) -> list[tuple[str, list[int], list[int]]]:
+    """Return each identifier class with the bug-report lines and JSONL records that carry it."""
+    root = re.search(rf"root=UUID=({UUID})", br.cmdline)
+    classes = list(IDENTIFIERS)
+    if root:
+        classes.insert(1, ("Root UUID, bare", re.compile(rf"(?<!root=UUID=){re.escape(root.group(1))}"), ""))
+    out = []
+    for name, pattern, _ in classes:
+        br_lines = [n for n, line in enumerate(br.lines, 1) if pattern.search(line)]
+        vj_lines = [n for n, data in vj.data_lines if pattern.search(data)]
+        if name == "Other UUID":
+            known = re.compile(rf"root=UUID={UUID}|uuid: {UUID}" + (f"|{re.escape(root.group(1))}" if root else ""))
+            br_lines = [
+                n
+                for n in br_lines
+                if not known.search(br.lines[n - 1]) or pattern.search(known.sub("", br.lines[n - 1]))
+            ]
+            vj_lines = [n for n, d in vj.data_lines if n in vj_lines and pattern.search(known.sub("", d))]
+        if br_lines or vj_lines:
+            out.append((name, br_lines, vj_lines))
+    return out
+
+
+def privacy_finding(ids: Sequence[tuple[str, list[int], list[int]]]) -> Finding | None:
+    """Return the LOW finding for identifiers in the logs, or None when there are none."""
+    if not ids:
+        return None
+    br = sorted({n for _, b, _ in ids for n in b})
+    vj = sorted({n for _, _, v in ids for n in v})
+    f = Finding(
+        "identifiers",
         "Logs carry identifiers the bug-report redactor misses",
         "Privacy / log sharing",
-        "BR 8",
-        "Redact the Table 9 identifiers before posting",
-    ),
-    ("I-1", "INFO", "zswap pool initialized although zswap.enabled=0", "Memory / zswap", "BR 1566", "None"),
+        "LOW",
+        "cachyos-bugreport.sh redacts the hostname, user name, home directory, IPv4 and colon-form MAC "
+        "addresses, and email-shaped strings. UUIDs, USB serial numbers, USB4 domain IDs, underscore-form "
+        "Bluetooth addresses, and anything in the ry-verify log stay readable; they tie posted logs to this "
+        "machine.",
+        "Post only copies with these identifiers removed (Section 9).",
+    )
+    f.matches = [Match("bugreport", n, "") for n in br] + [Match("verify", n, "") for n in vj]
+    f.notes.append(f"{len(br)} bug-report lines and {len(vj)} ry-verify records carry identifiers (Section 5).")
+    return f
+
+
+MILESTONES = (
+    ("initrd starts", r"Run /init as init process"),
+    ("switch-root", r"systemd\[1\]: Switching root"),
     (
-        "I-2",
-        "INFO",
-        "bolt does not recognize the Strix Halo USB4 NHIs",
-        "USB4 / bolt",
-        "BR 1674",
-        "None; upstream bolt table entry",
-    ),
-    (
-        "I-3",
-        "INFO",
-        "amdgpu workqueue name truncated",
-        "Kernel / amdgpu DC",
-        "BR 1416",
-        "None; renamed in Linux 7.3-rc3",
-    ),
-    ("I-4", "INFO", "MediaTek Bluetooth eSCO quirk notice", "Bluetooth / btusb", "BR 1635", "None"),
-    ("I-5", "INFO", "ACP70 finds no ASoC machine driver", "Audio / ACP", "BR 1598", "None"),
-    ("I-6", "INFO", "NVMe UUID and SGL notices", "Storage / NVMe", "BR 1335", "None"),
-    (
-        "I-7",
-        "INFO",
-        "wpa_supplicant multicast RX registration unsupported",
-        "Network / wpa_supplicant",
-        "BR 1677",
-        "None",
-    ),
-    ("I-8", "INFO", "TDX message on an AMD CPU", "Kernel / TDX", "BR 650", "None"),
-    (
-        "I-9",
-        "INFO",
-        "KDE, portal, and D-Bus startup noise",
-        "Desktop / KDE, portal, D-Bus",
-        "BR 1676",
-        "None; skip the /usr and PAM workarounds",
-    ),
-    ("I-10", "INFO", "plasmalogin-helper exits with status 255", "Login / plasmalogin", "BR 1721", "None"),
-    (
-        "I-11",
-        "INFO",
-        "KWin warning at session hand-over",
-        "Desktop / KWin",
-        "BR 1684",
-        "None unless a login glitch appears",
-    ),
-    ("I-12", "INFO", "Shutdown-only noise", "Session / shutdown", "BR 1808", "None"),
-    (
-        "I-13",
-        "INFO",
-        "Platform visibility gaps (AER, fan RPM) and boilerplate",
-        "Platform / ACPI firmware",
-        "BR 164",
-        "None; note the AER blind spot",
-    ),
-    (
-        "I-14",
-        "INFO",
-        "inxi mislabels the CPU and GPU generation",
-        "Tooling / inxi",
-        "BR 35",
-        "None; note it when sharing the report",
-    ),
-    (
-        "I-15",
-        "INFO",
-        "EgisTec EH577 fingerprint reader has no driver",
-        "Input / fingerprint",
-        "BR 1395",
-        "None unless fingerprint login is wanted",
-    ),
-    ("I-16", "INFO", "Secure Boot disabled", "Boot / Secure Boot", "BR 360", "None; posture note"),
-    (
-        "I-17",
-        "INFO",
-        "Wireless-extensions warning from a Chromium-based process",
-        "Network / cfg80211",
-        "BR 1781",
-        "None",
-    ),
-    ("I-18", "INFO", "KWin discards an unfinished kill prompt", "Desktop / KWin", "BR 1789", "None unless it recurs"),
-    (
-        "I-19",
-        "INFO",
-        "Bluetooth audio device connects and disconnects",
-        "Bluetooth / BlueZ, pulseaudio-qt",
-        "BR 1782",
-        "None",
-    ),
-    (
-        "I-20",
-        "INFO",
-        "Task manager finds no desktop file for gldriverquery",
-        "Desktop / task manager",
-        "BR 1779",
-        "None",
-    ),
-]
-L3: Card = {
-    "id": "L-3",
-    "title": "Logs carry identifiers the bug-report redactor misses",
-    "area": "Privacy / log sharing",
-    "cmds": "sub-11.1",
-    "ev": [
-        "cmdline root=UUID=[root UUID] (4 lines: header, inxi, dmesg ×2)",
-        "dmesg systemd[1]: Expecting device /dev/disk/by-uuid/[root UUID]...",
-        "dmesg EXT4-fs (nvme0n1p2): mounted filesystem [root UUID] r/w (and re-mounted)",
-        "inxi uuid: [DMI UUID] Firmware: UEFI vendor: American",
-        "dmesg usb 3-2: SerialNumber: [serial] (Logitech USB Receiver; 3-3 EgisTec EH577, 3-4 POROSVOC)",
-        "journal boltd[837]: [<USB4 domain id>-domain0 ...] (4 lines)",
-        'journal kded6[1313]: No object for name "bluez_output.[BT MAC].1" (3 lines)',
-        "JSONL OK: root=UUID=[root UUID]: present (1 line)",
-        "JSONL CHECK_FILE: /home/<user>/.config/environment.d/... (36 lines)",
-    ],
-    "lines": "BR 8, 17, 28, 306, 516, 1285, 1310, 1346, 1399, 1405, 1459, 1469, 1561, 1674–1675, 1731–1732, "
-    "1787, 1791–1792 · VJ 66, 203, 347",
-    "rows": [
+        "root mounted",
         (
-            "Cause",
-            (
-                "cachyos-bugreport.sh (CachyOS-Settings) redacts the hostname, user name, home directory, IPv4 "
-                "addresses, colon-form MAC addresses, and email-shaped strings. It leaves the DMI system UUID, "
-                "USB serial numbers, the root UUID, the USB4 domain ID, and underscore-form Bluetooth "
-                "addresses (PipeWire node names). The JSONL embeds the root UUID and home paths."
-            ),
+            r"EXT4-fs \([^)]+\): mounted filesystem|XFS \([^)]+\): Ending clean mount|BTRFS info .*: "
+            r"(?:first mount|enabling ssd)|F2FS-fs \([^)]+\): Mounted"
         ),
-        ("Impact", "Only on sharing: the values tie posted reports to this machine and to a paired Bluetooth device."),
-        ("Fix", "Post only copies with the Table 9 identifiers removed; Section 11.1 checks a copy."),
-        ("Status", "Open for the 2026-10-02 pair: 28 bug-report and 37 JSONL lines carry identifiers (Table 9)."),
-    ],
-}
-T9 = [
-    ("Root UUID, root=UUID= form (header, inxi, dmesg)", "BR 8, 17, 306, 516", "4"),
-    ("Root UUID, bare (systemd device, EXT4 mount and re-mount)", "BR 1285, 1469, 1561", "3"),
-    ("Root UUID in the JSONL", "VJ 66", "1"),
-    ("DMI system UUID (inxi)", "BR 28", "1"),
-    (
-        "USB serial numbers (3 device-unique)",
-        "BR 1125, 1133, 1146, 1154, 1167, 1175, 1188, 1196, 1310, 1346, 1399, 1405, 1459",
-        "13",
     ),
-    ("USB4 domain ID (bolt)", "BR 1674–1675, 1731–1732", "4"),
-    ("Bluetooth address with underscores (pulseaudio-qt)", "BR 1787, 1791–1792", "3"),
-    (
-        "Home directory (JSONL)",
-        (
-            "VJ 203–205, 207, 209, 211, 213, 215, 217, 219, 221, 223, 225, 228–230, 232, 234, 236, 238, "
-            "240, 242, 244, 246, 248, 250, 252, 254, 256, 258, 260, 262, 264, 266, 346–347"
-        ),
-        "36",
-    ),
-    ("Identifier lines in total", "BR 28 · VJ 37", "65"),
-]
-INFO_INTRO = (
-    "No action is needed. I-1 to I-16 recur from 2026-09-27 with the same cause; I-17 to I-20 are "
-    "new, from the longer previous boot."
+    ("Wi-Fi associated", r"\bwl\w+: associated"),
 )
-EXPLANATION = "Explanation"
-INFO: list[Card] = [
-    {
-        "id": "I-1",
-        "ev": ["[ 7.991631] zswap: loaded using pool zstd", "ry-verify: OK: zswap.enabled: N"],
-        "lines": "BR 1566 · VJ 398",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "CachyOS's 30-zram.rules, which also sets vm.swappiness to 150, writes N to zswap's enabled "
-                    "parameter when zram0 initializes. In Linux v7.2 that runtime write, with zswap still "
-                    "uninitialized because of zswap.enabled=0, runs zswap_setup(), which prints this line, and "
-                    "then stores N. zswap stays off (ry-verify readback N; inxi: zswap no), as ry-install intends "
-                    "with zram as the swap path; the only cost is the pool allocation."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-2",
-        "ev": [
-            (
-                "18:19:47 boltd[837]: [<USB4 domain id>-domain0 ] udev: failed to determine if uid is stable: "
-                "unknown NHI PCI id '0x158d'"
-            ),
-            (
-                "18:19:47 boltd[837]: [<USB4 domain id>-domain1 ] udev: failed to determine if uid is stable: "
-                "unknown NHI PCI id '0x158e'"
-            ),
-        ],
-        "lines": "BR 1674–1675",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "bolt keeps a table of known USB4/Thunderbolt native host interface (NHI) IDs to decide "
-                    "whether a host UUID survives reboots. Its table (0.9.11) lacks these Strix Halo IDs, so it "
-                    "treats the UUID as unstable — the safe default, as native USB4 host UUIDs can change at every "
-                    "boot. There is no effect without USB4 or Thunderbolt peripherals that need bolt authorization."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-3",
-        "ev": ["[ 2.783176] workqueue: name exceeds WQ_NAME_LEN. Truncating to: hdmi_frl_status_polling_workque"],
-        "lines": "BR 1416",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "In v7.2, amdgpu_dm names a workqueue hdmi_frl_status_polling_workqueue, longer than the "
-                    "workqueue name limit, so the kernel truncates it once. Linux 7.3-rc3 shortens the name to "
-                    "hdmi_frl_status_polling_wq."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-4",
-        "ev": [
-            (
-                "[ 8.455021] Bluetooth: hci0: HCI Enhanced Setup Synchronous Connection command is advertised, "
-                "but not supported."
-            )
-        ],
-        "lines": "BR 1635",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "btusb marks the Enhanced Setup Synchronous Connection command broken on every MediaTek "
-                    "controller, and the Bluetooth core lists active quirks at setup. Voice links use the legacy "
-                    "synchronous connection-oriented (SCO) setup instead; A2DP audio, which the SR-C20A soundbar "
-                    "uses, is unaffected."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-5",
-        "ev": ["[ 8.106935] platform acp_asoc_acp70.0: warning: No matching ASoC machine driver found"],
-        "lines": "BR 1598",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "The Audio Co-Processor (ACP) driver logs this when no ACP machine description (DMIC or I2S "
-                    "codec) matches the board. Audio runs through the HDA codec (ALC897) and USB devices."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-6",
-        "ev": [
-            "[ 0.923433] nvme nvme0: passthrough uses implicit buffer lengths",
-            "[ 18.614978] block nvme0n1: No UUID available providing old NGUID",
-        ],
-        "lines": "BR 1335, 1663",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "The first is an informational notice for a controller without scatter-gather list (SGL) "
-                    "support. The second is a one-time warning when userspace reads the namespace uuid attribute "
-                    "and the drive exposes only a namespace globally unique identifier (NGUID)."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-7",
-        "ev": [
-            (
-                "18:19:48 wpa_supplicant[930]: wlan0: nl80211: kernel reports: multicast RX registrations are "
-                "not supported"
-            ),
-            (
-                "18:19:48 wpa_supplicant[930]: p2p-dev-wlan0: nl80211: kernel reports: multicast RX "
-                "registrations are not supported"
-            ),
-        ],
-        "lines": "BR 1677–1678",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "nl80211 rejects multicast management-frame registrations with EOPNOTSUPP when the driver does "
-                    "not advertise NL80211_EXT_FEATURE_MULTICAST_REGISTRATIONS; wpa_supplicant logs it and "
-                    "continues. The P2P line remains because wpa_supplicant still creates that device, which "
-                    "NetworkManager no longer manages (L-6, closed)."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-8",
-        "ev": ["[ 0.282216] virt/tdx: TDX not supported by the host platform"],
-        "lines": "BR 650",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "The kernel's Intel Trust Domain Extensions (TDX) host code logs this at error level whenever "
-                    "the CPU lacks TDX host support — always the case on AMD."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-9",
-        "ev": [
-            (
-                "18:19:48 dbus-broker-launch[833]: Activation request for 'org.freedesktop.home1' failed: The "
-                "systemd unit 'dbus-org.freedesktop.home1.service' could not be found."
-            ),
-            (
-                "18:19:48 dbus-broker-launch[957]: Service file "
-                "'/usr/share/dbus-1/services/org.kde.dolphin.FileManager1.service' is not named after the "
-                "D-Bus name 'org.freedesktop.FileManager1'."
-            ),
-            (
-                "18:19:56 ksmserver[1302]: Failed to register with host portal "
-                'QDBusError("org.freedesktop.portal.Error.Failed", "Could not register app ID: App info not '
-                "found for 'org.kde.ksmserver'\")"
-            ),
-            (
-                "18:19:56 org_kde_powerdevil[1346]: org.kde.powerdevil.chargethresholdhelper.getthreshold "
-                'failed "Charge thresholds are not supported by the kernel for this hardware"'
-            ),
-            (
-                "18:19:56 kded6[1304]: Failed enumerating MM objects: "
-                '"org.freedesktop.DBus.Error.NameHasNoOwner" "Could not activate remote peer '
-                "'org.freedesktop.ModemManager1': activation request failed: unknown unit\""
-            ),
-        ],
-        "lines": "BR 1676, 1679, 1690, 1693, 1701",
-        "bullets": [
-            (
-                "Portal host-registration failures (10 programs) are common on Plasma and had no visible "
-                "effect; the circulating workaround adds placeholder .desktop files under "
-                "/usr/share/applications, which the no-edits-under-/usr rule excludes."
-            ),
-            (
-                "dbus-broker flags three legacy service-file names; the greeter and the session each run a "
-                "broker, so each notice appears twice per boot. The home1 request comes from pam_systemd_home "
-                "while systemd-homed is unused; silencing it means editing a pambase-owned file."
-            ),
-            "ModemManager is not installed, so kded6 cannot enumerate modem objects.",
-            (
-                "powerdevil probes charge thresholds because the Logitech PRO X 2 exposes a HID++ battery "
-                "(inxi: hidpp_battery_0), finds no kernel backlight (DDC/CI is off by design), and cannot "
-                "check the screen configuration for button handling."
-            ),
-            (
-                "Also benign: QML override and deprecated-signal warnings, the gtk.portal fallback for "
-                "Lockdown, a UPower owner race at greeter start, @DEFAULT_SOURCE@ lookups before WirePlumber "
-                "picks a default source, and a screencast request for a closed window (18:18:48, previous "
-                "boot)."
-            ),
-        ],
-        "rows": [],
-    },
-    {
-        "id": "I-10",
-        "ev": [
-            "18:20:01 plasmalogin[920]: Auth: plasmalogin-helper exited with 255",
-            "[prev] 16:09:05 plasmalogin[926]: Auth: plasmalogin-helper exited with 255",
-        ],
-        "lines": "BR 1721, 1778",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "The greeter's authentication helper exits with 255 when the greeter stops after a successful "
-                    "hand-over to the user session; the same message is widely reported on working systems."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-11",
-        "ev": [
-            "18:19:55 kwin_wayland[959]: atomic commit failed: Permission denied",
-            "[prev] 16:09:00 kwin_wayland[965]: atomic commit failed: Permission denied",
-        ],
-        "lines": "BR 1684, 1741",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "The permission error accompanies each greeter-to-session switch, consistent with the outgoing "
-                    "compositor losing DRM master. KDE bugs 521568 and 524540 report the same line at this "
-                    "transition, on NVIDIA systems with visible symptoms; here the session starts normally. The "
-                    "2026-09-27 framebuffer warning does not recur."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-12",
-        "ev": [
-            (
-                "[prev] 18:19:28 plasmalogin[926]: Authentication error: PLASMALOGIN::Auth::ERROR_INTERNAL "
-                '"Process crashed"'
-            ),
-            (
-                "[prev] 18:19:28 plasmalogin[926]: Auth: plasmalogin-helper (--socket "
-                "/tmp/plasmalogin-auth-[id] --id 4 --start /usr/bin/startplasma-login-wayland --user "
-                "plasmalogin --greeter) crashed (signal 15)"
-            ),
-            (
-                "[prev] 18:19:28 systemd[1]: sys-devices-virtual-misc-rfkill.device: Failed to enqueue "
-                "SYSTEMD_WANTS job, ignoring: Transaction for systemd-rfkill.socket/start is destructive "
-                "(systemd-reboot.service has 'start' job queued, but 'stop' is included in transaction)."
-            ),
-            (
-                "[prev] 18:19:28 systemd[1123]: "
-                "sys-devices-pci0000:00-0000:00:08.1-0000:c6:00.6-sound-card0-controlC0.device: Failed to "
-                "enqueue SYSTEMD_USER_WANTS job, ignoring: Transaction for sound.target/start is destructive "
-                "(exit.target has 'start' job queued, but 'stop' is included in transaction)."
-            ),
-            "[prev] 18:19:28 plasmashell[1325]: PipeWire remote error: -2 target not found",
-            "[prev] 18:19:28 kded6[1313]: context kaput",
-            (
-                "[prev] 18:19:29 NetworkManager[900]: <warn> [1790990369.0699] dispatcher: (10) failed (after "
-                "0.001 sec): Could not activate remote peer 'org.freedesktop.nm_dispatcher': activation "
-                "request failed: unit is invalid"
-            ),
-            "[prev] 18:19:29 systemd[1]: <email-address-redacted>: Failed with result 'exit-code'.",
-        ],
-        "lines": "BR 1808, 1811, 1817–1819, 1824, 1835, 1839",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "All occur during the 18:19:28 reboot. The session and greeter helpers, ended by SIGHUP and "
-                    "SIGTERM, are reported as crashes (signals 1 and 15). udev events cannot add jobs to the "
-                    "shutdown transaction of the system or the user manager. D-Bus activations (bluez, obex, "
-                    "UDisks2, NetworkManager dispatcher) are refused while units stop, which NetworkManager logs "
-                    "as a failed dispatcher call. PipeWire clients lose their server: Plasma and KWin log remote "
-                    "errors, and pulseaudio-qt logs “context kaput” and lookups of vanished nodes. One system unit "
-                    "whose name contains @ exits with failure as it stops; the redactor replaced the name (Section "
-                    "9)."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-13",
-        "ev": [
-            "inxi: Fan Speeds (rpm): N/A",
-            "[ 0.307147] acpi PNP0A08:00: _OSC: platform does not support [SHPCHotplug AER LTR DPC]",
-            "[ 0.335423] acpi PNP0C02:01: Could not reserve [mem 0xfec00000-0xfec0ffff]",
-            "[ 0.371843] usb usb2: We don't know the algorithms for LPM for this host, disabling LPM.",
-            "[ 0.779023] usb 5-1: No LPM exit latency info found, disabling LPM.",
-        ],
-        "lines": "BR 164, 695, 941, 1128, 1270",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "Firmware keeps Advanced Error Reporting (AER), Latency Tolerance Reporting (LTR), and "
-                    "Downstream Port Containment (DPC) instead of granting them to the OS, and the BIOS has no "
-                    "option that hands them over, so the kernel's AER driver cannot report PCIe link errors — a "
-                    "clean ring is not proof of a clean link. No fan tachometer is exposed. The USB link power "
-                    "management (LPM) lines — four host controllers, and usb 5-1, the USB-C display cable, without "
-                    "exit-latency data — and the four reservation overlaps are standard; the ACPI core treats such "
-                    "overlaps as usually harmless."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-14",
-        "ev": [
-            "inxi: bits: 64 type: MT MCP arch: Zen 6 note: 6 level: v4 note: check built: 2026+",
-            "inxi: process: TSMC n2/n3 (2,3nm) family: 0x1A (26) model-id: 0x70 (112)",
-            "inxi: Radeon 8050S 8060S Graphics] driver: amdgpu v: kernel arch: RDNA-3",
-            "inxi: code: Phoenix process: TSMC n4 (4nm) built: 2023+ pcie: gen: 4",
-        ],
-        "lines": "BR 35–36, 76–77",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "inxi 3.3.41 maps AMD family 0x1A models from 0x50 up to Zen 6, so this model 0x70 CPU reads "
-                    "as Zen 6, and it labels the GPU Phoenix with RDNA-3. The Ryzen AI Max+ 395 is Zen 5 (16C/32T) "
-                    "with a gfx1151 Radeon 8060S, RDNA 3.5 (Strix Halo)."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-15",
-        "ev": [
-            "[ 2.343811] usb 3-3: New USB device found, idVendor=1c7a, idProduct=0577, bcdDevice=10.41",
-            "[ 2.347684] usb 3-3: Product: EgisTec EH577",
-        ],
-        "lines": "BR 1395, 1397",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "The sensor (1c7a:0577) enumerates, but no driver binds: libfprint lists it as unsupported, "
-                    "and the upstream support request was closed in 2023. The only working path in circulation, "
-                    "the eh577-libfprint fork, runs EgisTec's Windows matching engine and replaces the packaged "
-                    "libfprint, which does not suit a managed host."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-16",
-        "ev": ["[ 0.002960] Secure boot disabled"],
-        "lines": "BR 360",
-        "rows": [
-            (EXPLANATION, "UEFI Secure Boot is off, the firmware default; nothing in either capture depends on it.")
-        ],
-    },
-    {
-        "id": "I-17",
-        "ev": [
-            (
-                "[prev] 16:09:20 kernel: warning: `ThreadPoolForeg' uses wireless extensions which will stop "
-                "working for Wi-Fi 7 hardware; use nl80211"
-            )
-        ],
-        "lines": "BR 1781",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "Linux v7.2 prints this once per boot (net/wireless/wext-core.c) for the first process that "
-                    "uses the legacy wireless-extensions ioctls on a cfg80211 device; mt7925 sets "
-                    "WIPHY_FLAG_SUPPORTS_MLO, so the call is refused. ThreadPoolForeg is Chromium's "
-                    "ThreadPoolForegroundWorker thread cut to 15 characters; Chromium's network code uses "
-                    "SIOCGIWNAME and SIOCGIWESSID to classify an interface as Wi-Fi and read its SSID. Steam, "
-                    "whose web helper is Chromium-based, was starting four seconds earlier (I-20) and is the "
-                    "likely source. That process cannot read the SSID this way; connectivity is unaffected."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-18",
-        "ev": [
-            (
-                "[prev] 16:27:40 kwin_wayland[1210]: QProcess: Destroyed while process "
-                '("/usr/lib/kwin_killer_helper") is still running.'
-            )
-        ],
-        "lines": "BR 1789",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "KWin starts kwin_killer_helper when a window it asked to close stops answering pings, to "
-                    "offer to terminate the application, and stops it when the window answers or goes away. Here "
-                    "the window went away while the helper still ran, so Qt warned as KWin discarded it: an "
-                    "application hung briefly on close at 16:27:40. The warning-level journal does not name it."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-19",
-        "ev": [
-            (
-                "[prev] 16:09:54 bluetoothd[840]: profiles/audio/a2dp.c:load_remote_sep() Unable to load "
-                "LastUsed: rseid 2 not found"
-            ),
-            '[prev] 16:09:55 kded6[1313]: No object for name "bluez_output.[BT MAC].1" returning nullptr',
-            (
-                "[prev] 16:57:32 bluetoothd[840]: src/profile.c:ext_io_disconnected() Unable to get io data "
-                "for Hands-Free Voice gateway: getpeername: Transport endpoint is not connected (107)"
-            ),
-            '[prev] 16:57:32 kded6[1313]: No object for name "@DEFAULT_SINK@" returning nullptr',
-        ],
-        "lines": "BR 1782, 1787, 1790, 1793",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "At 16:09:54 bluetoothd found the device's cached LastUsed endpoint pair but not remote "
-                    "endpoint 2 among those the device now offered, so it skipped the cached choice (BlueZ "
-                    "a2dp.c); the device's audio node appeared a second later. At 16:57:32 the device closed its "
-                    "Hands-Free Profile (HFP) connection before bluetoothd read the socket's peer address "
-                    "(profile.c ext_io_disconnected; ENOTCONN, 107). Each node change makes pulseaudio-qt, used by "
-                    "Plasma's audio applet and kded6, look up nodes that are gone: the device's sink and source, "
-                    "the default sink and source, and the null sink. The device is not the SR-C20A that "
-                    "reconnect-soundbar manages."
-                ),
-            )
-        ],
-    },
-    {
-        "id": "I-20",
-        "ev": [
-            '[prev] 16:09:16 plasmashell[1325]: Failed to find service for Unity Launcher "gldriverquery.desktop"',
-            '[prev] 16:09:16 plasmashell[1325]: Failed to find service for Unity Launcher "gldriverquery.desktop"',
-        ],
-        "lines": "BR 1779–1780",
-        "rows": [
-            (
-                EXPLANATION,
-                (
-                    "Plasma's task manager maps Unity LauncherEntry updates (badges, progress) to desktop files "
-                    "(plasma-desktop smartlauncherbackend.cpp). At 16:09:16 two updates named "
-                    "gldriverquery.desktop, which does not exist, so they were dropped. gldriverquery is the "
-                    "OpenGL driver-query helper Steam runs at start-up."
-                ),
-            )
-        ],
-    },
-]
-WATCH_INTRO = (
-    "Watch items are explained limits under observation: open, but not counted. By-design items "
-    "are deliberate host choices and are not counted either. The normal reboot event is in Section "
-    "10.4."
+
+
+def timeline(br: BugReport) -> tuple[dict[str, float], tuple[float, float] | None]:
+    """Return boot milestones (seconds since kernel start) and the longest quiet gap before the root mount."""
+    marks: dict[str, float] = {}
+    for name, pattern in MILESTONES:
+        hit = next((e.t for e in br.dmesg if re.search(pattern, e.text)), None)
+        if hit is not None:
+            marks[name] = hit
+    limit = marks.get("root mounted", marks.get("switch-root", 0.0))
+    times = [e.t for e in br.dmesg if e.t <= limit]
+    gaps = [(b - a, a, b) for a, b in itertools.pairwise(times)]
+    best = max(gaps, default=None)
+    quiet = (best[1], best[2]) if best and best[0] >= 1.0 else None
+    return marks, quiet
+
+
+def kernel_start(br: BugReport) -> tuple[dt.datetime, float] | None:
+    """Estimate the wall-clock kernel start from journal kernel entries that also appear in dmesg."""
+    offsets = {}
+    for e in br.dmesg:
+        offsets.setdefault(e.text, e.t)
+    lo, hi = None, None
+    for e in br.journal:
+        if e.boot != "current" or e.ident != "kernel" or e.text not in offsets:
+            continue
+        start = e.when - dt.timedelta(seconds=offsets[e.text])
+        lo = max(lo, start) if lo else start
+        end = start + dt.timedelta(seconds=1)
+        hi = min(hi, end) if hi else end
+    if lo is None or hi is None or hi < lo:
+        return None
+    half = (hi - lo).total_seconds() / 2
+    return lo + dt.timedelta(seconds=half), half
+
+
+def verify_sections(vj: VerifyLog) -> list[tuple[str, str, dict[str, int]]]:
+    """Return per-section status counts in log order, phase by phase."""
+    order: dict[tuple[str, str], dict[str, int]] = {}
+    for item in vj.items:
+        if item.phase == "preamble":
+            continue
+        counts = order.setdefault((item.phase, item.section), {"OK": 0, "INFO": 0, "WARN": 0, "FAIL": 0})
+        counts[item.status] += 1
+    return [(phase, section, counts) for (phase, section), counts in order.items()]
+
+
+INXI_FACTS = (
+    ("machine", r"System:\s*(.+?)\s+product:\s*(.+?)\s+(?:v:|serial:|$)", "{0} {1}"),
+    ("firmware", r"UEFI:\s*(.+?)\s+v:\s*(\S+)\s+date:\s*(\S+)", "{0} {1} ({2})"),
+    ("cpu", r"\bmodel:\s*(.+?)\s+bits:", "{0}"),
+    ("kernel", r"Kernel:\s*(\S+)", "{0}"),
+    ("distro", r"Distro:\s*(.+?)(?:\s+base:|\s*$)", "{0}"),
+    ("desktop", r"Desktop:\s*(.+?)\s+v:\s*(\S+)", "{0} {1}"),
+    ("gpu", r"Device-1:\s*(.+?)\s+driver:\s*amdgpu", "{0}"),
+    ("mesa", r"\bmesa v:\s*(\S+)|Mesa (\d+\.\d+\.\d+)", "{0}"),
+    ("pipewire", r"PipeWire v:\s*(\S+)", "{0}"),
+    ("memory", r"Memory:\s*total:\s*([\d.]+ \w+)(?:.*?available:\s*([\d.]+ \w+))?", "{0} total, {1} available"),
+    ("swap", r"type:\s*zram\s+size:\s*([\d.]+ \w+)", "zram {0}"),
+    ("temperatures", r"System Temperatures:\s*(.+)", "{0}"),
+    ("fans", r"Fan Speeds \(rpm\):\s*(.+)", "{0}"),
+    ("drive", r"ID-1:\s*/dev/(nvme\w+)\s.*?model:\s*(\S+)", "{0} {1}"),
+    ("smart", r"health:\s*(\w+)", "{0}"),
+    ("drive-temp", r"\btemp:\s*([\d.]+ C)", "{0}"),
+    ("written", r"written:\s*([\d.]+ \w+)", "{0}"),
 )
-T10 = (
-    ["Item", "Evidence", "Watch for", "Then"],
-    [
-        [
-            "Wi-Fi TX power capped at 30 dBm",
-            "wlan0: Limiting TX power to 30 (30 - 0) dBm as advertised by the AP (BR 1661)",
-            "A lower cap after a router or firmware change, or Wi-Fi range or throughput complaints",
-            "Check the router's country and transmit-power settings; the cap follows the AP.",
-        ],
-        [
-            "10 GbE ports down",
-            "enp193s0, enp197s0: Link is Down (BR 1645, 1647)",
-            "Latency or jitter in online games over Wi-Fi, or a cabled port that stays down",
-            "Connect one port to the router (tuning-audit item G-8) and confirm the link comes up.",
-        ],
-    ],
-)
-T11 = (
-    ["Item", "Evidence", "Line", "Why"],
-    [
-        ["IPv6 disabled", "IPv6: Loaded, but administratively disabled", "BR 1217", "ipv6.disable=1"],
-        [
-            "CPU idle limited to C1",
-            "ACPI: processor limited to max C-state 1",
-            "BR 1108",
-            "processor.max_cstate=1; firmware twin: Global C-state Control",
-        ],
-        ["Sleep states masked", "ry-verify: the five sleep targets inactive", "VJ 423", "Masked by ry-install"],
-        [
-            "swappiness 150, cache pressure 50, zram 93.93 GiB",
-            "inxi Swap block",
-            "BR 158",
-            (
-                "CachyOS-Settings: 30-zram.rules sets swappiness 150 when zram0 starts, "
-                "70-cachyos-settings.conf cache pressure 50; not in ry-install's overrides (VJ 160–176)"
-            ),
-        ],
-        ["KWallet disabled", "ksecretd: Lacking a socket, pipe: 0 env: 0", "BR 1717", "kdewallet off; see L-4, closed"],
-        [
-            "Monitor brightness control off",
-            "no kernel backlight interface found; POWERDEVIL_NO_DDCUTIL=1",
-            "BR 1692",
-            "DDC/CI off by design (VJ 215)",
-        ],
-        [
-            "32 GiB UMA carve-out; GTT at default",
-            "32768M of VRAM memory ready · 48091M of GTT memory ready",
-            "BR 1383",
-            "Permanent choice since 2026-09-06; the small-carve-out recipe is not used",
-        ],
-        ["fsck forced every boot", "fsck.mode=force: active", "VJ 362", "fsck.mode=force; ≈3.9 s per boot, inferred"],
-        [
-            "NetworkManager logging and checks",
-            "dispatcher LogLevelMax=notice · level=WARN · connectivity enabled=false",
-            "VJ 123, 134, 136",
-            "Fewer NM journal lines by design; no captive-portal detection",
-        ],
-    ],
-)
-COVERAGE_INTRO = "Every stream was read in full; Tables 12–15 and Figures 7–9 show the classification."
-T12 = (
-    ["Stream", "Size", "Method", "Result"],
-    [
-        ["inxi and scheduler blocks", "291 lines", "Read in full", "Facts; feeds L-3, I-13, I-14, and the L-2 check"],
-        [
-            "Kernel ring (dmesg)",
-            "1,359 lines",
-            "Read line by line",
-            "0 unexplained; 205 notice lines in 20 families (Table 13)",
-        ],
-        [
-            "Kernel splat patterns",
-            "1,359 lines",
-            "Tainted:, Oops, WARNING: CPU, BUG:, Call Trace, general protection fault, kernel taint",
-            "0 matches",
-        ],
-        ["Journal, current boot", "53 entries", "Every entry attributed", "53 / 53 (Table 15)"],
-        ["Journal, previous boot", "114 entries", "Every entry attributed", "114 / 114 (Table 15)"],
-        ["Package list (cachyos-znver4)", "41 packages", "Read", "Versions only"],
-        [
-            "ry-verify JSONL",
-            "483 records",
-            "Every record read",
-            "299 OK; 11 INFO notes (Table 14); 0 FAIL, WARN, GEN_FAIL",
-        ],
-        ["Fix-script log", "11 lines", "Every record read", "7 steps ok, L-3 none; exit 0"],
-        [
-            "Keyword sweep, whole report",
-            "124 lines",
-            "38-term set (Table 5)",
-            "124 / 124: 109 journal, 13 dmesg, 2 report header",
-        ],
-    ],
-)
-T13 = (
-    ["Notice family", "Lines", "First", "Disposition"],
-    [
-        ["Firmware memory map, ACPI table reservations", "80", "BR 307", "Boilerplate"],
-        ["PNP0C02 resource reservations", "51", "BR 905", "I-13 for the four overlaps; the rest boilerplate"],
-        ["CPU vulnerability mitigations", "10", "BR 568", "Posture: none unmitigated (Table 7)"],
-        ["USB link power management", "5", "BR 1128", "I-13"],
-        ["xHCI quirk masks", "4", "BR 1117", "Boilerplate"],
-        ["amdgpu optional features", "7", "BR 1375", "Boilerplate: optional firmware absent; no runtime PM on an APU"],
-        ["systemd unmet conditions", "18", "BR 1292", "Boilerplate: no measured boot, no hibernation"],
-        ["Audit subsystem off", "3", "BR 636", "Boilerplate"],
-        ["Kernel command line", "2", "BR 306", "By design: ry-install profile"],
-        ["Kernel and PCI notices", "17", "BR 334", "Boilerplate"],
-        ["Secure Boot state", "1", "BR 360", "I-16"],
-        ["CPU idle and IPv6 policy", "2", "BR 1108", "By design (Table 11)"],
-        ["Previous reset reason", "1", "BR 1219", "Closed event (Table 19)"],
-        ["TDX probe", "1", "BR 650", "I-8"],
-        ["Workqueue name truncated", "1", "BR 1416", "I-3"],
-        ["ACP machine driver", "1", "BR 1598", "I-5"],
-        ["USB mic volume range", "1", "BR 1628", "L-5 (closed)"],
-        ["Bluetooth eSCO quirk", "1", "BR 1635", "I-4"],
-        ["10 GbE links down", "2", "BR 1645", "Watch (Table 10)"],
-        ["Wi-Fi TX power cap", "1", "BR 1661", "Watch (Table 10)"],
-    ],
-)
-T14 = (
-    ["VJ", "Note", "Reading"],
-    [
-        ["301", "No IgnorePkg set", "No package is held back from upgrades."],
-        [
-            "349",
-            "no .ry.bak copies (no run has rewritten a boot file or fstab, or they were removed by hand)",
-            "No pending backups of boot files or fstab.",
-        ],
-        ["382", "Checking cpu0 (representative)", "CPU policy checks read cpu0 as representative."],
-        ["407", "No module_blacklist= entry in KERNEL_PARAMS", "No module blacklisted on the kernel command line."],
-        ["432", "NM Wi-Fi radio: enabled", "Wi-Fi radio on."],
-        [
-            "434",
-            "firewall posture: ufw=inactive nft_rules=5",
-            "nftables ruleset active, input policy drop (VJ 195); ufw unused.",
-        ],
-        ["458", "root filesystem: ext4", "As expected."],
-        [
-            "470",
-            "/boot/loader/loader.conf: skipped (vfat — unix perms synthesized from mount options)",
-            "vfat has no Unix permissions; expected for /boot.",
-        ],
-        [
-            "472",
-            "1 file(s) skipped on boot partition (vfat or undetermined fstype — unix perms not verifiable)",
-            "vfat has no Unix permissions; expected for /boot.",
-        ],
-        [
-            "474",
-            "/boot/loader: skipped (vfat — unix perms synthesized from mount options)",
-            "vfat has no Unix permissions; expected for /boot.",
-        ],
-        [
-            "476",
-            "1 dir(s) skipped on boot partition (vfat or undetermined fstype — unix perms not verifiable)",
-            "vfat has no Unix permissions; expected for /boot.",
-        ],
-    ],
-)
-ATTR_INTRO = "Shaded rows are closed findings whose lines still print as expected (L-4 accepted, L-5 kernel warning)."
-T15 = [
-    ("L-4", "D-Bus-activated user units exit with failure after login", "CLOSED", 2, 3),
-    ("L-5", "USB microphone hardware gain spans under 1 dB", "CLOSED", 2, 2),
-    ("L-6", "NetworkManager warns on the Wi-Fi P2P device at every boot", "CLOSED", 0, 0),
-    ("I-2", "bolt does not recognize the Strix Halo USB4 NHIs", "OPEN", 2, 2),
-    ("I-3", "amdgpu workqueue name truncated", "OPEN", 1, 1),
-    ("I-4", "MediaTek Bluetooth eSCO quirk notice", "OPEN", 1, 1),
-    ("I-5", "ACP70 finds no ASoC machine driver", "OPEN", 1, 1),
-    ("I-6", "NVMe UUID and SGL notices", "OPEN", 1, 1),
-    ("I-7", "wpa_supplicant multicast RX registration unsupported", "OPEN", 2, 2),
-    ("I-8", "TDX message on an AMD CPU", "OPEN", 1, 1),
-    ("I-9", "KDE, portal, and D-Bus startup noise", "OPEN", 38, 39),
-    ("I-10", "plasmalogin-helper exits with status 255", "OPEN", 1, 1),
-    ("I-11", "KWin warning at session hand-over", "OPEN", 1, 1),
-    ("I-12", "Shutdown-only noise", "OPEN", 0, 32),
-    ("I-17", "Wireless-extensions warning from a Chromium-based process", "OPEN", 0, 1),
-    ("I-18", "KWin discards an unfinished kill prompt", "OPEN", 0, 1),
-    ("I-19", "Bluetooth audio device connects and disconnects", "OPEN", 0, 23),
-    ("I-20", "Task manager finds no desktop file for gldriverquery", "OPEN", 0, 2),
-]
-UNKNOWN_INTRO = (
-    "What these captures cannot show, and how to close each item. The five unknowns of revision 19 "
-    "that have since been answered are in Section 10.3."
-)
-T16 = (
-    ["Item", "Why it matters", "How to close"],
-    [
-        [
-            "Idle capture",
-            (
-                "Both capture sets are from idle, ≈39–55 s after kernel start: no GPU reset, thermal, or "
-                "frametime data under load."
-            ),
-            (
-                "Capture again after a gaming or LLM session; `ry-dashboard --log` records CPU and GPU "
-                "temperature, clock, load, and power to CSV meanwhile."
-            ),
-        ],
-        [
-            "Native AER unavailable",
-            "Firmware withholds AER (I-13), so PCIe link errors are not reported.",
-            "Account for it when diagnosing PCIe devices.",
-        ],
-        [
-            "Redacted shutdown unit",
-            "A system unit with @ in its name failed as it stopped at 18:19:29 (I-12).",
-            "Section 11.3, first command, while the 18:19 boot is current.",
-        ],
-        [
-            "Unnamed D-Bus failure, previous boot",
-            "The 16:10:00 failure (L-4) is unnamed; the fix script reads only the current boot.",
-            "Section 11.3, second command; expected: KSplash.",
-        ],
-        [
-            "Window that hung on close",
-            "I-18 does not name the application.",
-            "Only if it recurs: note what was closed.",
-        ],
-        [
-            "Bluetooth device",
-            "The I-19 device is not the SR-C20A; the capture shows only its address.",
-            "Section 11.3, third command.",
-        ],
-        [
-            "Gap before the root mount",
-            "Grew from 3.06 s to 3.87 s; inferred to be the forced fsck, which neither capture times.",
-            "Section 11.3, fourth command.",
-        ],
-    ],
-)
-CLOSED_INTRO = "Fixed and confirmed, answered, or normal; kept for the record. Nothing here needs action."
-T17 = [
-    (
-        "L-4",
-        "D-Bus-activated user units exit with failure after login",
-        "2026-09-30",
-        "FL 3: only the KWallet portal failed; 0 failed units",
-        "none needed",
-    ),
-    (
-        "L-1",
-        "Keychron Link receiver exposes a HID joystick interface",
-        "2026-10-02",
-        "FL 4: both pairs in the session (session=active)",
-        "ry-install 7.224.0",
-    ),
-    (
-        "L-5",
-        "USB microphone hardware gain spans under 1 dB",
-        "2026-09-30",
-        "FL 6: soft_mixer=true",
-        "ry-install 7.224.0",
-    ),
-    (
-        "L-6",
-        "NetworkManager warns on the Wi-Fi P2P device at every boot",
-        "2026-10-01",
-        "FL 7: unmanaged, 0 warnings; no warning in either boot",
-        "ry-install 7.224.0",
-    ),
-    (
-        "L-2",
-        "JACK clients bypassed PipeWire (jack2 provided libjack)",
-        "2026-10-02",
-        "FL 8: pipewire-jack; inxi lists pw-jack, no JACK server",
-        "ry-install 7.224.0",
-    ),
-]
-CLOSED: list[Card] = [
-    {
-        "id": "L-4",
-        "closed": "2026-09-30",
-        "area": "Session / systemd --user",
-        "ev": [
-            (
-                "fix log: fix=L-4 state=ok failed=0 journal_failures=1 "
-                "units=dbus-:1.2-org.freedesktop.impl.portal.desktop.kwallet@0.service other="
-            ),
-            "18:19:56 ksecretd[1572]: Lacking a socket, pipe: 0 env: 0",
-            "18:19:56 systemd[1116]: dbus-:<email-address-redacted>: Failed with result 'exit-code'.",
-            "[prev] 16:10:00 systemd[1123]: dbus-:<email-address-redacted>: Failed with result 'exit-code'.",
-        ],
-        "lines": "BR 1717–1718, 1788 · FL 3",
-        "rows": [
-            (
-                "Was",
-                (
-                    "D-Bus-activated user units exited with failure after login; the bug report's email filter hid "
-                    "their names."
-                ),
-            ),
-            (
-                "Fix in place",
-                (
-                    "None needed: kdewallet is disabled by design, so the KWallet portal and KSplash fail on "
-                    "start; the script reads their names from the user journal. Accepted 2026-09-30."
-                ),
-            ),
-            (
-                "Confirmed",
-                (
-                    "One failure this boot, the KWallet portal, and no failed unit left (FL 3). The previous boot "
-                    "shows the pair at 16:09:01 and 16:10:00; Section 9 checks the second name."
-                ),
-            ),
-        ],
-    },
-    {
-        "id": "L-1",
-        "closed": "2026-10-02",
-        "area": "Input / HID",
-        "ev": [
-            (
-                "fix log: fix=L-1 state=ok pairs=0x3434/0x0e20,0x3434/0xd030 "
-                "global=0x3434/0x0e20,0x3434/0xd030 file=ours session=active"
-            ),
-            (
-                "[ 0.900672] hid-generic 0003:3434:D030.0004: input,hiddev97,hidraw3: USB HID v1.11 Joystick "
-                "[Keychron Keychron Link ] on usb-0000:c8:00.0-1/input1"
-            ),
-        ],
-        "lines": "BR 1328 · FL 4",
-        "rows": [
-            (
-                "Was",
-                (
-                    "The Keychron Link receiver (3434:d030) exposes interface 1 as a HID joystick that Proton and "
-                    "SDL games can take for a controller, which stops mouse input."
-                ),
-            ),
-            (
-                "Fix in place",
-                (
-                    "~/.config/environment.d/60-sdl-ignore.conf sets "
-                    "SDL_GAMECONTROLLER_IGNORE_DEVICES=0x3434/0x0e20,0x3434/0xd030 for the session (2026-09-30)."
-                ),
-            ),
-            (
-                "Confirmed",
-                (
-                    "Both pairs reach the session (session=active, FL 4), so Steam inherits them. Steam Input must "
-                    "be off per game, and the proton-cachyos sdlinput and wayland modes need "
-                    "PROTON_NO_STEAMINPUT=0."
-                ),
-            ),
-            (
-                "Profile",
-                (
-                    "ry-install 7.224.0 sets the pair in ~/.config/environment.d/10-environment.conf, and "
-                    "ry-verify checks it; delete 60-sdl-ignore.conf afterwards (O-3)."
-                ),
-            ),
-        ],
-    },
-    {
-        "id": "L-5",
-        "closed": "2026-09-30",
-        "area": "Audio / USB mic",
-        "ev": [
-            "fix log: fix=L-5 state=ok soft_mixer=true",
-            "[ 8.200254] usb 3-4: Warning! Unlikely small volume range (=100), linear volume or custom curve?",
-            "[ 8.200257] usb 3-4: [12] FU [Mic Capture Volume] ch = 1, val = 0/100/1",
-        ],
-        "lines": "BR 1628–1629 · FL 6",
-        "rows": [
-            (
-                "Was",
-                (
-                    "The POROSVOC card (1d6b:a4a7) reports Mic Capture Volume as 0–100 in 1/256 dB, about 0.39 dB "
-                    "in total."
-                ),
-            ),
-            (
-                "Fix in place",
-                (
-                    "WirePlumber rule 51-porosvoc-softmixer.conf sets api.alsa.soft-mixer = true for "
-                    "alsa_card.usb-POROSVOC* (2026-09-30)."
-                ),
-            ),
-            (
-                "Confirmed",
-                (
-                    "soft_mixer=true (FL 6). The kernel warning still prints twice per boot because the driver "
-                    "registers the hardware control; this is expected."
-                ),
-            ),
-            (
-                "Profile",
-                (
-                    "ry-install 7.224.0 manages this path (mode 0600, its own text), and ry-verify reads the "
-                    "property through pactl (O-3)."
-                ),
-            ),
-        ],
-    },
-    {
-        "id": "L-6",
-        "closed": "2026-10-01",
-        "area": "Network / NetworkManager",
-        "ev": ["fix log: fix=L-6 state=ok nm_state=unmanaged warnings=0"],
-        "lines": "FL 7",
-        "rows": [
-            (
-                "Was",
-                (
-                    "NetworkManager 1.54 set IPv4 forwarding on p2p-dev-wlan0, which has no kernel netdev, and "
-                    "logged ENOENT at every boot."
-                ),
-            ),
-            (
-                "Fix in place",
-                (
-                    "/etc/NetworkManager/conf.d/90-no-p2p.conf unmanages type:wifi-p2p devices (2026-09-30); Wi-Fi "
-                    "Direct and Miracast are off."
-                ),
-            ),
-            (
-                "Confirmed",
-                (
-                    "Unmanaged with 0 warnings (FL 7); no forwarding warning in either boot, against one per boot "
-                    "on 2026-09-27."
-                ),
-            ),
-            (
-                "Profile",
-                (
-                    "ry-install 7.224.0 adds [device-no-p2p] to 99-cachyos-nm.conf, and ry-verify checks it; "
-                    "delete 90-no-p2p.conf afterwards (O-3)."
-                ),
-            ),
-        ],
-    },
-    {
-        "id": "L-2",
-        "closed": "2026-10-02",
-        "area": "Audio / JACK",
-        "ev": [
-            "fix log: fix=L-2 state=ok installed=pipewire-jack",
-            "inxi: Server-2: PipeWire v: 1.6.9 status: n/a (root, process) with:",
-            "inxi: 3: pipewire-alsa type: plugin 4: pw-jack type: plugin",
-        ],
-        "lines": "BR 119, 121 · FL 8",
-        "rows": [
-            ("Was", "jack2 provided libjack, and inxi found a JACK server (jackd), so JACK clients bypassed PipeWire."),
-            (
-                "Fix in place",
-                "pipewire-jack replaced jack2 1.9.22-2.1 on 2026-10-02 in a 14 s unattended upgrade (script 2.3.0).",
-            ),
-            ("Confirmed", "pipewire-jack installed (FL 8); inxi lists pw-jack under PipeWire and no JACK server."),
-            (
-                "Profile",
-                "ry-install 7.224.0 declares pipewire-jack in PKGS_ADD; pacman's conflict keeps jack2 out (O-3).",
-            ),
-        ],
-    },
-]
-T18 = (
-    ["Unknown in revision 19", "Answer", "Evidence", "Closed"],
-    [
-        ["Failed-unit state not captured", "0 failed system units, 0 failed user units", "FL 2", "2026-10-02"],
-        ["MES firmware not logged", "0x00000092, newer than the 0x91 reading of 2026-08-14", "FL 2", "2026-09-30"],
-        [
-            "L-2 not confirmed by pacman",
-            "pacman listed jack2 1.9.22-2.1 alone; now pipewire-jack",
-            "FL 8",
-            "2026-10-01",
-        ],
-        ["Stray .ry.orig not visible", "The root sweep of /etc finds none", "FL 2, FL 9 (scope=root)", "2026-10-02"],
-        ["L-1 session check pending", "The drop-in reached the session", "FL 4 (session=active)", "2026-10-02"],
-    ],
-)
-T19 = (
-    ["Event", "Evidence", "Line", "Status"],
-    [
-        [
-            "Previous boot ended by reboot",
-            "software wrote 0x6 to reset control register 0xCF9",
-            "BR 1219",
-            "Closed; normal 18:19:28 reboot (shutdown lines: I-12)",
+
+
+def inxi_facts(br: BugReport) -> dict[str, str]:
+    """Return the facts inxi reports, keyed by name; absent facts are left out."""
+    text = "\n".join(line for _, line in br.inxi)
+    facts = {}
+    for key, pattern, template in INXI_FACTS:
+        m = re.search(pattern, text)
+        if m:
+            groups = [g or "?" for g in m.groups()]
+            facts[key] = mask(template.format(*groups)).replace(", ? available", "")
+    vuln = re.findall(r"Type:\s*\S+\s+(?:status|mitigation):\s*(Not affected|Vulnerable|[^\n]+)", text)
+    if vuln:
+        unaffected = sum(1 for v in vuln if v.startswith("Not affected"))
+        vulnerable = sum(1 for v in vuln if v.startswith("Vulnerable"))
+        facts["vulnerabilities"] = (
+            f"{unaffected} not affected, {len(vuln) - unaffected - vulnerable} mitigated, {vulnerable} vulnerable"
+        )
+    return facts
+
+
+def dmesg_facts(br: BugReport) -> dict[str, str]:
+    """Return firmware, memory, and boot facts the kernel ring buffer states."""
+    text = "\n".join(e.text for e in br.dmesg)
+    out = {}
+    probes = (
+        ("microcode", r"microcode: (?:updated early|Current revision):? (?:0x[0-9a-f]+ -> )?(0x[0-9a-f]+)"),
+        ("vram", r"(\d+)M of VRAM memory ready"),
+        ("gtt", r"(\d+)M of GTT memory ready"),
+        ("dmub", r"DMUB firmware.*version[=:]\s*(0x[0-9a-fA-F]+)"),
+        ("vcn", r"VCN firmware Version ENC: ([\d.]+) DEC: (\d+)"),
+        ("secure-boot", r"Secure boot (disabled|enabled)"),
+    )
+    for key, pattern in probes:
+        m = re.search(pattern, text)
+        if m:
+            out[key] = " / ".join(m.groups())
+    out["smu"] = "initialized" if re.search(r"SMU is initialized", text) else ""
+    return {k: v for k, v in out.items() if v}
+
+
+def verify_health(m: Model) -> list[tuple[str, str, str]]:
+    """Return the ry-verify and journal health rows."""
+    vj, foot = m.vj, m.vj.footer
+    static, runtime = vj.phase_results.get("static", {}), vj.phase_results.get("runtime", {})
+    info = sum(1 for i in vj.items if i.status == "INFO")
+    rows = []
+    if foot:
+        result = ("PASS" if foot.get("exit_code") == 0 else "FAIL") + f", exit {foot.get('exit_code')}"
+        evidence = (
+            f"{foot.get('pass', 0)} OK = {static.get('ok', 0)} static + {runtime.get('ok', 0)} runtime; "
+            f"{foot.get('fail', 0)} FAIL, {foot.get('warn', 0)} WARN, {foot.get('gen_fail', 0)} GEN_FAIL; {info} INFO"
+        )
+        rows.append((f"ry-verify {vj.header.get('version', '')}", result, evidence))
+    splats = [x for x in m.findings if x.key in ("kernel-splat", "kernel-taint")]
+    ring = "No taint, oops, or splat" if not splats else f"{len(splats)} splat findings"
+    rows.append(
+        ("Kernel ring buffer", ring, f"{len(m.br.dmesg)} lines; {m.keyword_lines.get('dmesg', 0)} keyword lines")
+    )
+    failed_keys = ("unit-failed", "redacted-unit", "kwallet-off")
+    failed = sum(x.count("journal", "current") for x in [*m.findings, *m.others] if x.key in failed_keys)
+    rows.append(("Unit failures, current boot", str(failed), "journal, warning and above"))
+    return rows
+
+
+def boot_health(m: Model) -> list[tuple[str, str, str]]:
+    """Return the boot-timing, GPU memory, and firmware health rows."""
+    d, rows = m.facts, []
+    if "root mounted" in m.milestones:
+        gap = f"; {m.quiet_gap[1] - m.quiet_gap[0]:.2f} s without output first" if m.quiet_gap else ""
+        rows.append(("Boot to root mount", f"{m.milestones['root mounted']:.2f} s", f"dmesg{gap}"))
+    if "Wi-Fi associated" in m.milestones:
+        rows.append(("Wi-Fi associated", f"{m.milestones['Wi-Fi associated']:.2f} s", "dmesg"))
+    if "vram" in d:
+        gtt = f"GTT {int(d['gtt']):,} MiB" if "gtt" in d else "GTT not logged"
+        rows.append(("GPU memory", f"VRAM {int(d['vram']):,} MiB", gtt))
+    labels = (("smu", "SMU {}"), ("dmub", "DMUB {}"), ("vcn", "VCN ENC/DEC {}"))
+    fw = [label.format(d[key]) for key, label in labels if key in d]
+    if fw:
+        rows.append(("amdgpu firmware", fw[0], "; ".join(fw[1:]) or "dmesg"))
+    return rows
+
+
+def hardware_health(m: Model) -> list[tuple[str, str, str]]:
+    """Return the CPU, sensor, swap, Secure Boot, and drive health rows."""
+    f, rows = m.facts, []
+    for key, label in (
+        ("microcode", "CPU microcode"),
+        ("vulnerabilities", "CPU vulnerabilities"),
+        ("temperatures", "Temperatures"),
+        ("fans", "Fan speeds"),
+        ("swap", "Swap"),
+        ("secure-boot", "Secure Boot"),
+    ):
+        if key in f:
+            rows.append((label, f[key], "dmesg" if key in ("microcode", "secure-boot") else "inxi"))
+    if "drive" in f:
+        smart = " · ".join(x for x in (f.get("smart", ""), f.get("drive-temp", ""), f.get("written", "")) if x)
+        rows.append((f"Drive {f['drive']}", smart or "no SMART data", "inxi"))
+    return rows
+
+
+def health_rows(m: Model) -> list[tuple[str, str, str]]:
+    """Return (check, result, evidence) rows for the system-health table, from facts the inputs state."""
+    return [*verify_health(m), *boot_health(m), *hardware_health(m)]
+
+
+def keyword_lines(br: BugReport) -> dict[str, int]:
+    """Count the lines matching the failure keyword set, per report section."""
+    out: dict[str, int] = {}
+    for name in br.sections:
+        key = "journal" if name.startswith("journal") else name
+        out[key] = out.get(key, 0) + sum(1 for _, line in br.section_lines(name) if KEYWORD_RE.search(line))
+    return out
+
+
+def redaction_action(m: Model) -> Action | None:
+    """Return the redaction action when the logs carry identifiers."""
+    if not m.identifiers:
+        return None
+    bug, ver = m.br.path.name, m.vj.path.name
+    pub_bug, pub_ver = f"{m.br.path.stem}-public{m.br.path.suffix}", f"{m.vj.path.stem}-public{m.vj.path.suffix}"
+    cmds = [
+        f"cp {bug} {pub_bug}",
+        f"cp {ver} {pub_ver}",
+        "# edit both copies: remove every line class listed in Section 5, then:",
+        f"rg -c '{UUID}' {pub_bug} {pub_ver}",
+        rf"rg -c 'SerialNumber:\s*[^<\s]|[[:xdigit:]]{{8}}-[[:xdigit:]]{{4}}-domain' {pub_bug}",
+        f"rg -c '([[:xdigit:]]{{2}}[_:]){{5}}[[:xdigit:]]{{2}}' {pub_bug} {pub_ver}",
+        f"rg -c '/home/[^<]' {pub_bug} {pub_ver}",
+    ]
+    total = sum(len(b) + len(v) for _, b, v in m.identifiers)
+    return Action(
+        "",
+        "Redact the identifiers before posting",
+        f"{total} identifier lines across both logs",
+        cmds,
+        "Every rg check prints nothing (rg exits 1)",
+    )
+
+
+def failure_actions(m: Model) -> list[Action]:
+    """Return the actions for ry-verify failures, kernel errors, and failed units."""
+    acts = []
+    fails = [f for f in m.findings if f.key.startswith("verify-")]
+    if fails:
+        acts.append(
+            Action(
+                "",
+                "Fix the failing ry-verify checks",
+                f"{len(fails)} ry-verify sections with FAIL or WARN",
+                ["./ry-verify.fish --verify"],
+                "ry-verify exits 0 with no FAIL or WARN",
+            )
+        )
+    if any(f.key in ("kernel-splat", "kernel-taint", "gpu-hang", "storage-errors") for f in m.findings):
+        acts.append(
+            Action(
+                "",
+                "Investigate the kernel errors",
+                "HIGH or MED kernel findings in Section 4",
+                ["journalctl -k -b -p err", "journalctl -k -b -1 -p err"],
+                "The cause is identified",
+            )
+        )
+    units = sorted(
+        {
+            re.sub(r"^.*?: (.+?): Failed with result.*$", r"\1", mt.text)
+            for f in m.findings
+            if f.key == "unit-failed"
+            for mt in f.matches
+            if "Failed with result" in mt.text
+        }
+    )
+    if units:
+        acts.append(
+            Action(
+                "",
+                "Inspect the failed units",
+                f"{len(units)} units ended in failure",
+                ["systemctl --failed", *[f"journalctl -b -u '{u}'" for u in units[:6]]],
+                "No unit stays failed",
+            )
+        )
+    return acts
+
+
+def plan_actions(m: Model) -> list[Action]:
+    """Return the actions the findings call for, each with commands and a completion test."""
+    acts = [a for a in (redaction_action(m),) if a] + failure_actions(m)
+    if m.unclassified:
+        acts.append(
+            Action(
+                "",
+                "Review the unclassified lines",
+                f"{len(m.unclassified)} lines match no rule (Section 7.4)",
+                [f"rg -n 'warn|error|fail' {m.br.path.name}"],
+                "Each line is explained or a rule is added",
+            )
+        )
+    for n, a in enumerate(acts, 1):
+        a.aid = f"A-{n}"
+    return acts
+
+
+def analyze(br: BugReport, vj: VerifyLog) -> Model:
+    """Run every analysis step and return the model the report is built from."""
+    rules = applicable_rules(br)
+    found, unclassified = attribute(br, rules)
+    apply_mitigations(found, vj)
+    findings = [f for f in found.values() if f.severity in FINDING_LEVELS] + verify_findings(vj)
+    ids = find_identifiers(br, vj)
+    pf = privacy_finding(ids)
+    if pf:
+        firsts = {}
+        for name, b_lines, _v in ids:
+            if b_lines:
+                firsts.setdefault(b_lines[0], name)
+        pf.matches = [
+            Match("bugreport", n, mask(br.lines[n - 1].strip()) if n in firsts else "") for _, b, _ in ids for n in b
         ]
-    ],
-)
-IMPL_INTRO = (
-    "When each step from revisions 1–19 was done, and with which script version. Step 4 covered "
-    "the 2026-09-27 pair; L-3 is open for the new pair."
-)
-T20 = (
-    ["Step", "ID", "Action", "Done", "Script", "Result"],
-    [
-        [
-            "1",
-            "BASE",
-            "Baseline checks",
-            "2026-09-30; root sweep 2026-10-02",
-            "2.0.x, 2.3.0",
-            "0 failed units, MES 0x00000092, no stray .ry.orig",
-        ],
-        ["2", "L-4", "Identify the failing D-Bus units", "2026-09-30", "2.0.1", "KWallet portal and KSplash, accepted"],
-        ["3", "L-1", "Session-wide SDL drop-in", "2026-09-30", "2.0.x", "session=active on 2026-10-02"],
-        [
-            "4",
-            "L-3",
-            "-public copies of the 2026-09-27 pair",
-            "2026-09-30",
-            "2.0.x",
-            "Superseded; the 2026-10-02 pair is open, Section 5",
-        ],
-        ["5", "L-5", "WirePlumber soft-mixer rule", "2026-09-30", "2.0.x", "soft_mixer=true"],
-        ["6", "L-6", "NetworkManager P2P drop-in", "2026-09-30", "2.0.x", "0 warnings since the 2026-10-01 boot"],
-        ["7", "L-2", "pipewire-jack inside a full -Syu", "2026-10-02", "2.3.0", "jack2 out in 14 s, third attempt"],
-        ["—", "TIDY", "Delete leftovers of earlier runs", "2026-10-02", "2.3.0", "old=0, ry_orig=0"],
-    ],
-)
-CHECKLIST = [
-    ("O-1", "Redact the 2026-10-02 captures (Section 11.1)", "All six checks print nothing"),
-    ("O-2", "Merge the .pacnew files (Section 11.2)", "pacdiff lists nothing left to merge"),
-    ("O-3", "Hand over to ry-install 7.224.0 (Section 11.4)", "PASS; ry-verify shows no FAIL after a reboot"),
-    ("U", "Close the open unknowns (Section 11.3)", "Unit name, D-Bus unit, device name, fsck timing noted"),
-]
-S111 = (
-    (
-        "Post only copies with the Table 9 identifiers removed, saved as bugreport-public.log and "
-        "verify-public.jsonl. Check them from the directory that holds them:"
-    ),
-    "MANUAL CROSS-CHECK",
-    [
-        "rg -c 'uuid: [[:xdigit:]]{8}-|root=UUID=[[:xdigit:]]' bugreport-public.log verify-public.jsonl",
-        "rg -c 'SerialNumber: [^\\[\\s]|[[:xdigit:]]{8}-[[:xdigit:]]{4}-domain' bugreport-public.log",
-        "rg -c '([[:xdigit:]]{2}_){5}[[:xdigit:]]{2}' bugreport-public.log verify-public.jsonl",
-        "rg -o -m 1 -r '$1' 'root=UUID=(\\S{36})' cachyos-bugreport.log | rg -c -F -f - bugreport-public.log",
-        "rg -o -m 1 -r '$1' 'root=UUID=(\\S{36})' cachyos-bugreport.log | rg -c -F -f - verify-public.jsonl",
-        'rg -c -F "$HOME" bugreport-public.log verify-public.jsonl',
-    ],
-    "Expected: no output from any of them; rg exits 1 when nothing matches.",
-)
-S112 = (
-    None,
-    "APPLY",
-    ["sudo pacdiff"],
-    "Expected: the seven files the 2026-10-02 upgrade listed; nothing to do if they were merged since.",
-)
-S113 = (
-    None,
-    "CHECK",
-    [
-        "journalctl -b -1 _PID=1 -p warning -o cat | rg 'Failed with result'",
-        "journalctl --user -b -1 -o cat -u 'dbus-*'",
-        "bluetoothctl devices",
-        "journalctl -b -o short-monotonic -u systemd-fsck-root.service",
-    ],
-    (
-        "Expected, while the 18:19 boot is current (-b -1 is relative): the templated unit's name "
-        "(I-12); the 16:10:00 D-Bus failure, likely KSplash; paired Bluetooth devices by name (I-19); "
-        "and the root fsck's start and finish, whose difference measures the gap in Table 1."
-    ),
-)
-S114 = (
-    (
-        "After O-1 and O-2. ry-install 7.224.0 carries L-1 (ENV_VARS), L-2 (pipewire-jack in "
-        "PKGS_ADD), L-5 (the same WirePlumber path, mode 0600), and L-6 ([device-no-p2p] in "
-        "99-cachyos-nm.conf); ry-verify checks all four."
-    ),
-    "HAND OVER",
-    [
-        "cd ~/ry-install",
-        "./ry-install.fish",
-        "rm ~/.config/environment.d/60-sdl-ignore.conf",
-        "sudo rm /etc/NetworkManager/conf.d/90-no-p2p.conf",
-        "./ry-verify.fish --verify",
-    ],
-    (
-        "Expected: ry-install ends PASS or PASS-WITH-WARNINGS; after the next boot and login, "
-        "ry-verify reports no FAIL. The fix script is retired: running it again would undo the profile."
-    ),
-)
-TA1 = [
-    ("Machine", "Beelink GTR9 Pro (DMI: AZW GTR Pro); BIOS GTRPRPI1001C (2026-05-12); AGESA StrixHaloPI-FP11 1.0.0.1c"),
-    ("CPU", "AMD Ryzen AI Max+ 395, 16C/32T; microcode 0x0B700037 (early update from 0x0B700034)"),
-    ("GPU", "Radeon 8060S (1002:1586, gfx1151); VRAM 32,768 MiB; GTT 48,091 MiB"),
-    ("Memory", "96 GiB outside the carve-out, 93.93 GiB usable; zram swap 93.93 GiB (zstd)"),
-    ("Storage", "Crucial P310 2 TB (CT2000P310SSD8, firmware V8CR001); ext4 root (43.4% used), vfat /boot"),
-    ("Network", "MediaTek MT7925 Wi-Fi 7 (mt7925e) and Bluetooth 5.4 (13d3:3604); 2 × Realtek RTL8127 10 GbE (r8169)"),
-    ("Audio", "HDA ALC897; POROSVOC USB audio; AMD ACP (no machine driver); PipeWire 1.6.9 with pw-jack"),
-    (
-        "Input",
-        (
-            "Keychron K2 HE (3434:0e20), Keychron Link receiver (3434:d030), Logitech Lightspeed receiver "
-            "(046d:c54d) with a PRO X 2 mouse, EgisTec EH577 reader (no driver)"
-        ),
-    ),
-    ("Display", "BenQ PD3420Q, 3440 × 1440 at 60 Hz on DP-2 through an Anker USB-C to HDMI cable (usb 5-1)"),
-    (
-        "Kernel",
-        (
-            "7.2.8-2-cachyos (clang 23.1.1); sched-ext disabled; fallback linux-cachyos-lts 6.18.52; both "
-            "newer than 6.18.4, the toolboxes' validated kernel"
-        ),
-    ),
-    ("Userspace", "systemd 262 · KDE Plasma 6.7.5 (Wayland) · Mesa 26.2.4 · PipeWire 1.6.9 · inxi 3.3.41"),
-    ("Profile", "ry-verify 7.219.0, profile gtr9_pro; gtr9-postboot-fix 2.3.0 at capture, retired since"),
-]
-TB1 = [
-    ("A2DP", "Advanced Audio Distribution Profile (Bluetooth stereo audio)"),
-    ("ACP", "Audio Co-Processor, the AMD audio block"),
-    ("ACPI", "Advanced Configuration and Power Interface"),
-    ("AER", "Advanced Error Reporting (PCI Express)"),
-    ("AGESA", "AMD Generic Encapsulated Software Architecture, the platform firmware base"),
-    ("AP", "Wi-Fi access point"),
-    ("ASoC", "ALSA System on Chip, the Linux audio layer for on-chip audio"),
-    ("BR", "Line number in cachyos-bugreport.log"),
-    ("DC", "Display Core, the amdgpu display driver"),
-    ("DDC/CI", "Display Data Channel Command Interface (monitor control)"),
-    ("DMI", "Desktop Management Interface; the SMBIOS identity data"),
-    ("DMIC", "Digital microphone"),
-    ("DMUB", "AMD display microcontroller firmware"),
-    ("DPC", "Downstream Port Containment (PCI Express)"),
-    ("DPM", "Dynamic Power Management (amdgpu)"),
-    ("DRM", "Direct Rendering Manager, the kernel graphics subsystem"),
-    ("EPP", "Energy Performance Preference (amd-pstate)"),
-    ("eSCO", "Enhanced Synchronous Connection-Oriented link (Bluetooth voice)"),
-    ("FL", "Line number in the fix-script log"),
-    ("GTT", "Graphics Translation Table; system memory the GPU can map"),
-    ("HCI", "Host Controller Interface (Bluetooth)"),
-    ("HDA", "High Definition Audio"),
-    ("HFP", "Hands-Free Profile (Bluetooth voice)"),
-    ("HID", "Human Interface Device (USB input class)"),
-    ("I2S", "Inter-IC Sound, a serial audio bus"),
-    ("JACK", "JACK Audio Connection Kit, a low-latency audio server and API"),
-    ("JSONL", "JSON Lines: one JSON object per line"),
-    ("L-n, I-n", "LOW and INFO finding identifiers"),
-    ("LPM", "Link Power Management (USB)"),
-    ("LTR", "Latency Tolerance Reporting (PCI Express)"),
-    ("MES", "MicroEngine Scheduler, AMD GPU firmware that schedules queues"),
-    ("MLO", "Multi-Link Operation (Wi-Fi 7)"),
-    ("NGUID", "Namespace Globally Unique Identifier (NVMe)"),
-    ("NHI", "Native Host Interface, the USB4 host controller function"),
-    ("NM", "NetworkManager"),
-    ("NVMe", "Non-Volatile Memory Express, the SSD interface"),
-    ("O-n", "Open action identifiers (Table 2)"),
-    ("P2P", "Peer-to-peer; here Wi-Fi Direct"),
-    ("PAM", "Pluggable Authentication Modules"),
-    ("PCIe", "PCI Express"),
-    ("PDT", "Pacific Daylight Time (UTC−7)"),
-    ("QML", "Qt Modeling Language, used by KDE interfaces"),
-    ("RDNA", "AMD GPU architecture family"),
-    ("SCO", "Synchronous Connection-Oriented link (Bluetooth voice)"),
-    ("SDL", "Simple DirectMedia Layer, the input and media library many games use"),
-    ("SGL", "Scatter-Gather List (NVMe data transfer)"),
-    ("SMART", "Self-Monitoring, Analysis and Reporting Technology"),
-    ("SMBIOS", "System Management BIOS, the firmware identity tables"),
-    ("SMU", "System Management Unit, AMD power-management firmware"),
-    ("SSID", "Service Set Identifier, a Wi-Fi network name"),
-    ("TDX", "Intel Trust Domain Extensions"),
-    ("TX", "Transmit"),
-    ("UEFI", "Unified Extensible Firmware Interface"),
-    ("UMA", "Unified Memory Architecture; here the fixed VRAM carve-out"),
-    ("UUID", "Universally Unique Identifier"),
-    ("VCN", "Video Core Next, the AMD video codec engine"),
-    ("VJ", "Line number in the ry-verify JSONL"),
-    ("VRAM", "Video memory; here the UMA carve-out"),
-    ("wext", "Wireless Extensions, the legacy Wi-Fi ioctl interface"),
-]
-CAPTIONS = {
-    1: "Open and closed items, 2026-10-02. Left: the open LOW finding, the INFO findings, the watch "
-    "items, and the open unknowns. Right: closed LOW findings with their closing dates, the "
-    "answered unknowns, and the normal reboot.",
-    2: "Boot milestones, 2026-09-27 against 2026-10-02 (Table 1). The root mount and Wi-Fi "
-    "association move about 1 s later; the shaded box is the stretch without log output before the "
-    "root mount, inferred to be the forced fsck. Hollow markers: 2026-09-27; filled: 2026-10-02.",
-    3: "Current boot. Top: dmesg lines per 0.5 s (log scale); the empty stretch is the 3.87 s without "
-    "output before the root mount (forced fsck in the initrd, inferred). Bottom: phase edges from "
-    "dmesg (systemd in the initrd at 0.79 s, after switch-root at 7.65 s) and the journal (greeter "
-    "≈10.45 s, session ≈17.45 s); capture points from the JSONL, the fix-script log, and the bug "
-    "report.",
-    4: "ry-verify 7.219.0 results by section. Static phase left, runtime right; dark bars are OK "
-    "checks, outlined bars INFO notes (Table 14). Section counts exclude each phase's summary "
-    "lines and match the 2026-09-27 run.",
-    5: "Open INFO findings by area (Table 8) against the journal entries they explain in both boots "
-    "(Table 15). Desktop and shutdown noise make up 114 of the 158 entries; five areas surface "
-    "only in dmesg or inxi.",
-    6: "Identifier lines to redact before posting, by class (Table 9). Home-directory paths in the "
-    "JSONL account for 36 of the 65 lines.",
-    7: "dmesg notice lines by family (Table 13), shaded by disposition. Boilerplate dominates; every "
-    "finding-linked family is one to five lines.",
-    8: "Journal entries per finding (Table 15). Left: current boot, 2026-09-27 (light) against "
-    "2026-10-02 (dark); L-6 drops to 0 and I-11 loses its framebuffer warning, and the rest recur "
-    "at the same rate. Right: the 114 entries of the previous boot.",
-    9: "Previous boot, 16:08:42–18:19:29: journal entries by finding over time. Startup notices "
-    "cluster at 16:08–16:10; I-18 is at 16:27:40, I-19 at 16:09:54 and 16:57:32, and I-12 is the "
-    "18:19:28 reboot.",
-    10: "Fix history from Tables 17 and 20: when each fix was applied and when the captures confirmed "
-    "it. L-3's earlier copies covered the 2026-09-27 pair; the 2026-10-02 pair is open.",
-}
+        pf.matches += [Match("verify", n, "") for _, _, v in ids for n in v]
+        findings.append(pf)
+    findings.sort(key=lambda f: (SEVERITY_RANK[f.severity], min((x.no for x in f.matches), default=0), f.key))
+    counters: dict[str, int] = {}
+    for f in findings:
+        letter = f.severity[0]
+        counters[letter] = counters.get(letter, 0) + 1
+        f.fid = f"{letter}-{counters[letter]}"
+    others = sorted(
+        (f for f in found.values() if f.severity not in FINDING_LEVELS), key=lambda f: SEVERITY_RANK[f.severity]
+    )
+    marks, quiet = timeline(br)
+    facts = {**inxi_facts(br), **dmesg_facts(br)}
+    m = Model(
+        br,
+        vj,
+        findings,
+        others,
+        unclassified,
+        ids,
+        marks,
+        quiet,
+        kernel_start(br),
+        verify_sections(vj),
+        facts,
+        [],
+        keyword_lines(br),
+        [],
+    )
+    m.health = health_rows(m)
+    m.actions = plan_actions(m)
+    return m
 
 
 # ── FIGURES ───────────────────────────────────────────────────────────
-# Vector charts: matplotlib with text as paths, embedded through svglib; grayscale only.
+# Vector charts from the model: matplotlib with text as paths, embedded through svglib; grayscale only.
 C_INK, C_DARK, C_MID, C_LIGHT, C_PALE = "#1d1d1d", "#3c3c3c", "#8a8a8a", "#c9c9c9", "#ececec"
 CW = 7.1  # chart width in inches: the 512 pt text frame
-MPL_FONTS = (
-    "IBMPlexSans-Regular",
-    "IBMPlexSans-SemiBold",
-    "IBMPlexSans-Medium",
-    "IBMPlexSansCondensed-Regular",
-    "IBMPlexSansCondensed-SemiBold",
-)
+MPL_FONTS = ("IBMPlexSans-Regular", "IBMPlexSans-SemiBold", "IBMPlexSans-Medium", "IBMPlexSansCondensed-Regular")
 MPL_STYLE: dict[str, Any] = {
-    "font.family": "IBM Plex Sans",
-    "font.size": 7.6,
-    "svg.fonttype": "path",
-    "svg.hashsalt": "gtr9-postboot",
-    "axes.linewidth": 0.6,
-    "axes.edgecolor": "#3a3a3a",
-    "xtick.major.width": 0.5,
-    "ytick.major.width": 0,
-    "xtick.major.size": 2.5,
-    "axes.labelcolor": "#222",
-    "xtick.color": "#333",
-    "ytick.color": "#222",
-    "axes.titlesize": 8.2,
-    "axes.titleweight": "semibold",
-    "axes.titlelocation": "left",
-    "legend.frameon": False,
+    "font.family": "IBM Plex Sans", "font.size": 7.6, "svg.fonttype": "path", "svg.hashsalt": "gtr9-postboot",
+    "axes.linewidth": 0.6, "axes.edgecolor": "#3a3a3a", "xtick.major.width": 0.5, "ytick.major.width": 0,
+    "xtick.major.size": 2.5, "axes.labelcolor": "#222", "xtick.color": "#333", "ytick.color": "#222",
+    "axes.titlesize": 8.2, "axes.titleweight": "semibold", "axes.titlelocation": "left", "legend.frameon": False,
     "legend.fontsize": 7.2,
+}  # fmt: skip
+STATUS_STYLE: dict[str, dict[str, Any]] = {
+    "OK": {"color": C_LIGHT},
+    "INFO": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.6},
+    "WARN": {"color": C_MID},
+    "FAIL": {"color": C_INK},
 }
-
-
-class Lane(NamedTuple):
-    """One capture date in Figure 2: lane height, quiet gap, milestones, and approximate labels."""
-
-    name: str
-    y: int
-    gap: tuple[float, float]
-    root: float
-    greet: float
-    wifi: float
-    sess: float
-    greet_label: str
-    sess_label: str
-
-
-BOOT_LANES = (
-    Lane("2026-09-27\n(revision 19)", 1, (6.22 - 3.06, 6.22), 6.22, 10.4, 13.34, 17.4, "≈10.4", "≈17.4"),
-    Lane("2026-10-02", 0, (3.35, 7.22), 7.22, 10.45, 14.30, 17.45, "≈10.45", "≈17.45"),
-)
-BOOT_DELTAS = ((6.22, 7.22, 6.72, "+1.00 s"), (13.34, 14.30, 13.82, "+0.96 s"))  # from, to, label x, label
-# Figure 4: (section, OK checks, INFO notes) as in the revision-28 figure
-FIG_VERIFY_STATIC = (
-    ("Boot configuration", 65, 0),
-    ("System configuration", 48, 0),
-    ("User configuration", 32, 0),
-    ("Packages", 29, 1),
-    ("Services", 11, 0),
-    ("Syntax validation", 11, 0),
-    ("Checksum verification", 17, 1),
-)
-FIG_VERIFY_RUNTIME = (
-    ("Kernel cmdline", 17, 0),
-    ("Hardware state", 11, 1),
-    ("Module state", 9, 1),
-    ("Service state", 19, 0),
-    ("Wi-Fi state", 3, 2),
-    ("Environment state", 24, 1),
-    ("File permissions", 3, 4),
-)
-# Figure 6: (class, bug-report lines, JSONL lines), largest first
-FIG_IDENT = (
-    ("Home directory (JSONL)", 0, 36),
-    ("USB serial numbers", 13, 0),
-    ("Root UUID, root=UUID= form", 4, 0),
-    ("USB4 domain ID", 4, 0),
-    ("Root UUID, bare", 3, 0),
-    ("Bluetooth address, underscore form", 3, 0),
-    ("DMI system UUID", 1, 0),
-    ("Root UUID in the JSONL", 0, 1),
-)
-# Figure 7: (Table 13 family, lines, disposition key, tag), largest first
-FIG_FAMILIES = (
-    ("Firmware memory map, ACPI table reservations", 80, "B", ""),
-    ("PNP0C02 resource reservations", 51, "B", "4 overlaps: I-13"),
-    ("systemd unmet conditions", 18, "B", ""),
-    ("Kernel and PCI notices", 17, "B", ""),
-    ("CPU vulnerability mitigations", 10, "P", "posture"),
-    ("amdgpu optional features", 7, "B", ""),
-    ("USB link power management", 5, "I", "I-13"),
-    ("xHCI quirk masks", 4, "B", ""),
-    ("Audit subsystem off", 3, "B", ""),
-    ("Kernel command line", 2, "D", "by design"),
-    ("CPU idle and IPv6 policy", 2, "D", "by design"),
-    ("10 GbE links down", 2, "W", "watch"),
-    ("Secure Boot state", 1, "I", "I-16"),
-    ("Previous reset reason", 1, "C", "closed event"),
-    ("TDX probe", 1, "I", "I-8"),
-    ("Workqueue name truncated", 1, "I", "I-3"),
-    ("ACP machine driver", 1, "I", "I-5"),
-    ("USB mic volume range", 1, "C", "L-5, closed"),
-    ("Bluetooth eSCO quirk", 1, "I", "I-4"),
-    ("Wi-Fi TX power cap", 1, "W", "watch"),
-)
-FAMILY_STYLES: dict[str, dict[str, Any]] = {
-    "B": {"color": C_LIGHT},
-    "P": {"color": C_MID},
-    "I": {"color": C_DARK},
-    "D": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.8},
-    "W": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.8, "ls": (0, (2, 1.5))},
-    "C": {"facecolor": C_PALE, "edgecolor": C_INK, "lw": 0.6},
+SEVERITY_STYLE: dict[str, dict[str, Any]] = {
+    "HIGH": {"color": C_INK},
+    "MED": {"color": C_INK},
+    "LOW": {"color": C_DARK},
+    "INFO": {"color": C_MID},
+    "WATCH": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.8, "ls": (0, (2, 1.5))},
+    "SETTING": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.8},
+    "NOTE": {"color": C_LIGHT},
+    "UNCLASSIFIED": {"facecolor": C_PALE, "edgecolor": C_INK, "lw": 0.6},
 }
-FAMILY_NAMES = {"B": "boilerplate", "P": "posture", "I": "INFO finding", "D": "by design", "W": "watch", "C": "closed"}
-R19_EXTRA = {"L-6": 1, "I-11": 1}  # current-boot lines of 2026-09-27 gone by 2026-10-02 (Table 1)
-# Figure 10: (finding, fix applied, closed or None, note)
-FIG_FIXES = (
-    ("L-4", "2026-09-30", "2026-09-30", "accepted"),
-    ("L-1", "2026-09-30", "2026-10-02", "session=active"),
-    ("L-5", "2026-09-30", "2026-09-30", "soft_mixer=true"),
-    ("L-6", "2026-09-30", "2026-10-01", "0 warnings"),
-    ("L-2", "2026-10-02", "2026-10-02", "pipewire-jack"),
-    ("L-3", "2026-09-30", None, "new pair open (Section 5)"),
-)
 
 
 def _mpl() -> ModuleType:
@@ -1966,271 +1287,276 @@ def _mpl() -> ModuleType:
 
 def clean(ax: Axes, *, grid: bool = True) -> None:
     """Hide the top, right, and left spines and add a light vertical grid behind the bars."""
-    for side in ("top", "right"):
+    for side in ("top", "right", "left"):
         ax.spines[side].set_visible(b=False)
-    ax.spines["left"].set_visible(b=False)
     if grid:
         ax.xaxis.grid(visible=True, color="#dcdcdc", lw=0.5)
         ax.set_axisbelow(b=True)
 
 
-def save(fig: Figure, name: str) -> None:
-    """Write one figure as SVG into the build's chart directory and close it."""
-    fig.savefig(STATE.chart_dir / name, format="svg", bbox_inches="tight", pad_inches=0.04, metadata={"Date": None})
-    _mpl().close(fig)
-
-
-def fig_boot() -> None:
-    """Draw Figure 2: boot milestones on both capture dates (Tables 1 and 4)."""
-    plt = _mpl()
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch, Rectangle
-
-    fig, ax = plt.subplots(figsize=(CW, 1.85))
-    for lane in BOOT_LANES:
-        y = lane.y
-        ax.plot([0, 19.6], [y, y], color=C_LIGHT, lw=1.2, zorder=1)
-        width = lane.gap[1] - lane.gap[0]
-        ax.add_patch(
-            Rectangle((lane.gap[0], y - 0.17), width, 0.34, facecolor=C_LIGHT, edgecolor=C_DARK, lw=0.6, zorder=2)
-        )
-        mid = (lane.gap[0] + lane.gap[1]) / 2
-        ax.text(mid, y, f"no output {width:.2f} s", ha="center", va="center", fontsize=6.2, color=C_INK, zorder=3)
-        marks = ((lane.root, "v", None), (lane.greet, "o", lane.greet_label))
-        marks += ((lane.wifi, "s", None), (lane.sess, "D", lane.sess_label))
-        for x, marker, label in marks:
-            face = C_INK if y == 0 else "white"
-            ax.plot([x], [y], marker=marker, ms=5.2, color=C_INK, mfc=face, mew=0.9, zorder=4, ls="none")
-            ty, va = (y + 0.24, "bottom") if y else (y - 0.24, "top")
-            ax.text(x, ty, label or f"{x:.2f}", ha="center", va=va, fontsize=6.6, color=C_INK)
-        ax.text(-0.35, y, lane.name, ha="right", va="center", fontsize=7.2, color=C_INK, linespacing=1.05)
-    for x, label in ((0.79, "systemd\nin initrd"), (7.65, "switch-\nroot")):
-        ax.plot([x, x], [-0.16, 0.16], color=C_INK, lw=0.9, zorder=3)
-        ax.text(x, -0.62, label, ha="center", va="top", fontsize=6.0, color=C_MID, linespacing=0.95)
-    for start, end, label_x, label in BOOT_DELTAS:
-        arrow = {"arrowstyle": "->", "lw": 0.7, "color": C_DARK}
-        ax.annotate("", xy=(end, 0.5), xytext=(start, 0.5), arrowprops=arrow)
-        ax.text(label_x, 0.55, label, ha="center", va="bottom", fontsize=6.4, color=C_DARK)
-    ax.set_xlim(0, 19.6)
-    ax.set_ylim(-1.05, 1.72)
-    ax.set_yticks([])
-    ax.set_xticks(range(0, 20, 2))
-    ax.set_xlabel("Seconds since kernel start", fontsize=7.2)
-    clean(ax)
-    handles = [
-        Line2D([], [], marker="v", ls="none", color=C_INK, ms=5, label="root mounted"),
-        Line2D([], [], marker="o", ls="none", color=C_INK, ms=5, label="greeter starts"),
-        Line2D([], [], marker="s", ls="none", color=C_INK, ms=5, label="Wi-Fi associated"),
-        Line2D([], [], marker="D", ls="none", color=C_INK, ms=4.5, label="session hand-over"),
-        Patch(facecolor=C_LIGHT, edgecolor=C_DARK, label="no log output (forced fsck, inferred)"),
-    ]
-    ax.legend(
-        handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.2), ncol=5, handletextpad=0.4, columnspacing=1.2
+def save(fig: Figure, name: str) -> str:
+    """Write one figure as SVG into the build's chart directory, close it, and return its name."""
+    fig.savefig(
+        STATE.chart_dir / f"{name}.svg", format="svg", bbox_inches="tight", pad_inches=0.04, metadata={"Date": None}
     )
-    save(fig, "fig02_boot.svg")
+    _mpl().close(fig)
+    return name
 
 
-def fig_verify() -> None:
-    """Draw Figure 4: ry-verify 7.219.0 OK checks and INFO notes per section, static and runtime."""
+def capture_points(m: Model) -> dict[str, float]:
+    """Return the capture times as seconds since kernel start, when the kernel start is known."""
+    if not m.kernel_start:
+        return {}
+    start = m.kernel_start[0]
+    out = {}
+    for label, when in (("ry-verify starts", m.vj.started), ("ry-verify ends", m.vj.finished)):
+        if when:
+            out[label] = (when.replace(tzinfo=None) - start).total_seconds()
+    if m.br.captured:
+        out["bug report"] = (m.br.captured - start).total_seconds()
+    return {k: v for k, v in out.items() if 0 <= v <= 3600}
+
+
+def fig_boot(m: Model) -> str | None:
+    """Draw the boot timeline: dmesg lines per 0.5 s, the quiet gap, milestones, and capture points."""
+    if not m.br.dmesg:
+        return None
+    plt = _mpl()
+    captures = capture_points(m)
+    xmax = min(max([max(e.t for e in m.br.dmesg if e.t < 600), *m.milestones.values(), *captures.values()]) * 1.06, 600)
+    bins = int(xmax / 0.5) + 1
+    counts = [0] * bins
+    for e in m.br.dmesg:
+        if e.t < xmax:
+            counts[int(e.t / 0.5)] += 1
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(CW, 2.7), sharex=True, gridspec_kw={"height_ratios": [1.5, 1], "hspace": 0.12}
+    )
+    ax1.bar([i * 0.5 + 0.25 for i in range(bins)], counts, width=0.42, color=C_DARK)
+    ax1.set_yscale("log")
+    ax1.set_ylabel("dmesg lines\nper 0.5 s", fontsize=7)
+    if m.quiet_gap:
+        a, b = m.quiet_gap
+        ax1.axvspan(a, b, color=C_LIGHT, zorder=0)
+        ax1.text((a + b) / 2, max(counts) ** 0.5, f"no output\n{b - a:.2f} s", ha="center", va="center", fontsize=6.4)
+    for row, marks, marker in ((1, m.milestones, "v"), (0, captures, "s")):
+        last, level = -1e9, 0
+        for x, label in sorted((v, k) for k, v in marks.items()):
+            level = 1 - level if x - last < xmax * 0.09 else 0
+            last = x
+            ax2.plot([x], [row], marker=marker, ms=5, color=C_INK, ls="none")
+            y = row + 0.25 + 0.95 * level if row else row - 0.3 - 0.95 * level
+            ax2.text(x, y, f"{label}\n{x:.2f} s", ha="center", va="bottom" if row else "top", fontsize=6.2)
+    ax2.set_yticks([1, 0] if captures else [1])
+    ax2.set_yticklabels(["Boot", "Captures"] if captures else ["Boot"])
+    ax2.set_ylim(-2.0, 2.9)
+    ax2.set_xlim(0, xmax)
+    ax2.set_xlabel("Seconds since kernel start", fontsize=7.2)
+    for ax in (ax1, ax2):
+        clean(ax, grid=ax is ax1)
+        ax.tick_params(axis="y", length=0)
+    return save(fig, "boot")
+
+
+def fig_verify(m: Model) -> str | None:
+    """Draw ry-verify results per section, one panel per phase, stacked by status."""
+    phases = [p for p in ("static", "runtime") if any(s[0] == p for s in m.verify_sections)]
+    if not phases:
+        return None
     plt = _mpl()
     from matplotlib.patches import Patch
 
-    fig, axs = plt.subplots(1, 2, figsize=(CW, 2.05), gridspec_kw={"wspace": 0.62})
-    panels = ((axs[0], FIG_VERIFY_STATIC, "Static"), (axs[1], FIG_VERIFY_RUNTIME, "Runtime"))
-    for ax, data, phase in panels:
-        names = [d[0] for d in data][::-1]
-        ok = [d[1] for d in data][::-1]
-        info = [d[2] for d in data][::-1]
-        ax.barh(names, ok, color=C_DARK, height=0.62)
-        ax.barh(names, info, left=ok, color="white", edgecolor=C_INK, lw=0.7, height=0.62)
-        for i, (o, f) in enumerate(zip(ok, info, strict=True)):
-            ax.text(o + f + 1.2, i, f"{o}" + (f" + {f}" if f else ""), va="center", fontsize=6.8)
-        ax.set_xlim(0, 75)
-        ax.set_title(f"{phase}: {sum(ok)} OK, {sum(info)} INFO")
+    fig, axs = plt.subplots(
+        1,
+        len(phases),
+        figsize=(CW, 0.4 + 0.24 * max(sum(1 for s in m.verify_sections if s[0] == p) for p in phases)),
+        squeeze=False,
+        gridspec_kw={"wspace": 0.62},
+    )
+    for ax, phase in zip(axs[0], phases, strict=True):
+        rows = [s for s in m.verify_sections if s[0] == phase][::-1]
+        names = [section_title(s[1]) for s in rows]
+        left = [0] * len(rows)
+        for status in ("OK", "INFO", "WARN", "FAIL"):
+            vals = [s[2][status] for s in rows]
+            ax.barh(names, vals, left=left, height=0.62, **STATUS_STYLE[status])
+            left = [a + b for a, b in zip(left, vals, strict=True)]
+        for i, s in enumerate(rows):
+            c = s[2]
+            label = f"{c['OK']}" + "".join(f" + {c[k]} {k}" for k in ("INFO", "WARN", "FAIL") if c[k])
+            ax.text(left[i] + 0.6, i, label, va="center", fontsize=6.4)
+        totals = {k: sum(s[2][k] for s in rows) for k in ("OK", "INFO", "WARN", "FAIL")}
+        ax.set_title(f"{phase.capitalize()}: " + ", ".join(f"{v} {k}" for k, v in totals.items() if v))
+        ax.set_xlim(0, max(left, default=1) * 1.45 + 1)
         clean(ax)
         ax.tick_params(axis="y", length=0)
-    handles = [Patch(color=C_DARK, label="OK checks"), Patch(facecolor="white", edgecolor=C_INK, label="INFO notes")]
-    axs[1].legend(handles=handles, loc="lower right")
-    save(fig, "fig04_verify.svg")
+    handles = [Patch(label=k, **STATUS_STYLE[k]) for k in ("OK", "INFO", "WARN", "FAIL")]
+    fig.legend(handles=handles, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.06))
+    return save(fig, "verify")
 
 
-def area_rows() -> list[tuple[str, int, str, int]]:
-    """Return (area, findings, IDs, journal entries in both boots) per area from Tables 8 and 15, busiest first."""
-    journal = {r[0]: r[3] + r[4] for r in T15}
-    areas: dict[str, list[str]] = {}
-    for fid, sev, _finding, area, _line, _action in T8:
-        if sev == "INFO":
-            areas.setdefault(area.split(" / ")[0], []).append(fid)
-    order = {name: i for i, name in enumerate(areas)}
-    rows = [(name, len(ids), ", ".join(ids), sum(journal.get(i, 0) for i in ids)) for name, ids in areas.items()]
-    return sorted(rows, key=lambda r: (-r[3], -r[1], order[r[0]]))
-
-
-def fig_areas() -> None:
-    """Draw Figure 5: open INFO findings per area beside the journal entries they explain."""
+def fig_areas(m: Model) -> str | None:
+    """Draw findings per area beside the journal entries they explain (both boots)."""
+    if not m.findings:
+        return None
     plt = _mpl()
-    rows = area_rows()[::-1]
+    areas: dict[str, list[Finding]] = {}
+    for f in m.findings:
+        areas.setdefault(f.area.split(" / ")[0], []).append(f)
+    rows = sorted(areas.items(), key=lambda kv: (-sum(f.count("journal") for f in kv[1]), -len(kv[1]), kv[0]))[::-1]
     fig, axs = plt.subplots(
-        1, 2, figsize=(CW, 2.75), sharey=True, gridspec_kw={"width_ratios": [1, 1.25], "wspace": 0.08}
+        1, 2, figsize=(CW, 0.5 + 0.2 * len(rows)), sharey=True, gridspec_kw={"width_ratios": [1, 1.25], "wspace": 0.08}
     )
     names = [r[0] for r in rows]
-    axs[0].barh(names, [r[1] for r in rows], color=C_MID, height=0.6)
+    counts = [len(r[1]) for r in rows]
+    journal = [sum(f.count("journal") for f in r[1]) for r in rows]
+    axs[0].barh(names, counts, color=C_MID, height=0.6)
     for i, r in enumerate(rows):
-        axs[0].text(r[1] + 0.08, i, r[2], va="center", fontsize=6.4, color=C_INK)
-    axs[0].set_xlim(0, 7.2)
-    axs[0].set_xticks([0, 1, 2, 3, 4])
-    axs[0].set_title(f"Open INFO findings ({sum(r[1] for r in rows)})")
-    axs[1].barh(names, [r[3] for r in rows], color=C_DARK, height=0.6)
-    for i, r in enumerate(rows):
-        text, color = (str(r[3]), C_INK) if r[3] else ("— not in the journal", C_MID)
-        axs[1].text(r[3] + 1, i, text, va="center", fontsize=6.4, color=color)
-    axs[1].set_xlim(0, 100)
-    axs[1].set_title(f"Journal entries, both boots ({sum(r[3] for r in rows)})")
+        axs[0].text(counts[i] + 0.08, i, ", ".join(f.fid for f in r[1]), va="center", fontsize=6.2)
+    axs[0].set_xlim(0, max(counts) * 2.2 + 1)
+    axs[0].set_title(f"Findings ({sum(counts)})")
+    axs[1].barh(names, journal, color=C_DARK, height=0.6)
+    for i, v in enumerate(journal):
+        axs[1].text(
+            v + max([*journal, 1]) * 0.01 + 0.3,
+            i,
+            str(v) if v else "— not in the journal",
+            va="center",
+            fontsize=6.2,
+            color=C_INK if v else C_MID,
+        )
+    axs[1].set_xlim(0, max([*journal, 1]) * 1.25 + 1)
+    axs[1].set_title(f"Journal entries, both boots ({sum(journal)})")
     for ax in axs:
         clean(ax)
         ax.tick_params(axis="y", length=0)
-    save(fig, "fig05_areas.svg")
+    return save(fig, "areas")
 
 
-def fig_ident() -> None:
-    """Draw Figure 6: identifier lines to redact before posting, by class and source (Table 9)."""
+def fig_identifiers(m: Model) -> str | None:
+    """Draw identifier lines per class, bug report and ry-verify log stacked."""
+    if not m.identifiers:
+        return None
     plt = _mpl()
-    rows = FIG_IDENT[::-1]
-    fig, ax = plt.subplots(figsize=(CW, 2.0))
+    rows = sorted(m.identifiers, key=lambda r: len(r[1]) + len(r[2]))
+    fig, ax = plt.subplots(figsize=(CW, 0.5 + 0.22 * len(rows)))
     names = [r[0] for r in rows]
-    br = [r[1] for r in rows]
-    vj = [r[2] for r in rows]
-    ax.barh(names, br, color=C_DARK, height=0.6, label="cachyos-bugreport.log (BR)")
-    ax.barh(names, vj, left=br, color="white", edgecolor=C_INK, lw=0.7, height=0.6, label="ry-verify JSONL (VJ)")
+    br = [len(r[1]) for r in rows]
+    vj = [len(r[2]) for r in rows]
+    ax.barh(names, br, color=C_DARK, height=0.6, label=f"{m.br.path.name} ({sum(br)})")
+    ax.barh(
+        names, vj, left=br, color="white", edgecolor=C_INK, lw=0.7, height=0.6, label=f"{m.vj.path.name} ({sum(vj)})"
+    )
     for i, (b, v) in enumerate(zip(br, vj, strict=True)):
-        ax.text(b + v + 0.5, i, str(b + v), va="center", fontsize=6.8)
-    ax.set_xlim(0, 42)
+        ax.text(b + v + 0.3, i, str(b + v), va="center", fontsize=6.6)
+    ax.set_xlim(0, max(b + v for b, v in zip(br, vj, strict=True)) * 1.2 + 1)
     ax.set_xlabel("Lines to redact before posting", fontsize=7.2)
     clean(ax)
     ax.tick_params(axis="y", length=0)
-    title = f"{sum(br) + sum(vj)} lines: BR {sum(br)} · VJ {sum(vj)}"
-    ax.legend(
-        loc="lower right", title=title, title_fontproperties={"weight": "semibold", "size": 7.2}, alignment="left"
-    )
-    save(fig, "fig06_ident.svg")
+    ax.legend(loc="lower right")
+    return save(fig, "identifiers")
 
 
-def fig_families() -> None:
-    """Draw Figure 7: dmesg notice lines per family, shaded by disposition (Table 13)."""
+def family_rows(m: Model) -> list[tuple[str, int, str]]:
+    """Return (family, dmesg lines, severity) for every rule with dmesg evidence, plus the unclassified lines."""
+    rows = [(f.title, f.count("dmesg"), f.severity) for f in [*m.findings, *m.others] if f.count("dmesg")]
+    unclassified = sum(1 for u in m.unclassified if u.stream == "dmesg")
+    if unclassified:
+        rows.append(("Unclassified keyword lines", unclassified, "UNCLASSIFIED"))
+    return sorted(rows, key=lambda r: (-r[1], r[0]))
+
+
+def fig_families(m: Model) -> str | None:
+    """Draw dmesg notice lines per family, styled by disposition."""
+    rows = family_rows(m)[::-1]
+    if not rows:
+        return None
     plt = _mpl()
     from matplotlib.patches import Patch
 
-    rows = FIG_FAMILIES[::-1]
-    fig, ax = plt.subplots(figsize=(CW, 3.55))
-    for i, (_name, value, key, tag) in enumerate(rows):
-        ax.barh(i, value, height=0.62, **FAMILY_STYLES[key])
-        ax.text(value + 0.8, i, f"{value}" + (f"   {tag}" if tag else ""), va="center", fontsize=6.6)
+    fig, ax = plt.subplots(figsize=(CW, 0.5 + 0.17 * len(rows)))
+    for i, (_name, value, sev) in enumerate(rows):
+        ax.barh(i, value, height=0.62, **SEVERITY_STYLE[sev])
+        ax.text(value + 0.6, i, str(value), va="center", fontsize=6.4)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([r[0] for r in rows])
-    ax.set_xlim(0, 92)
-    ax.set_xlabel("dmesg notice lines", fontsize=7.2)
+    ax.set_xlim(0, max(r[1] for r in rows) * 1.15 + 1)
+    ax.set_xlabel("dmesg lines", fontsize=7.2)
     clean(ax)
     ax.tick_params(axis="y", length=0)
-    handles = [Patch(label=FAMILY_NAMES[k], **FAMILY_STYLES[k]) for k in "BPIDWC"]
-    ax.legend(handles=handles, loc="lower right", ncol=2)
-    save(fig, "fig07_families.svg")
+    present = [s for s in SEVERITY_STYLE if any(r[2] == s for r in rows)]
+    ax.legend(handles=[Patch(label=s.lower(), **SEVERITY_STYLE[s]) for s in present], loc="lower right", ncol=2)
+    return save(fig, "families")
 
 
-def journal_series() -> tuple[list[str], list[int], list[int], list[int]]:
-    """Return finding IDs with current-boot (2026-09-27, 2026-10-02) and previous-boot counts from Table 15."""
-    ids = [r[0] for r in T15]
-    cur = [r[3] for r in T15]
-    r19 = [c + R19_EXTRA.get(fid, 0) for fid, c in zip(ids, cur, strict=True)]
-    prev = [r[4] for r in T15]
-    return ids, r19, cur, prev
+def journal_rows(m: Model) -> list[tuple[str, int, int]]:
+    """Return (label, current-boot entries, previous-boot entries) for every finding with journal evidence."""
+    rows = [
+        (f.fid or f.title, f.count("journal", "current"), f.count("journal", "previous"))
+        for f in [*m.findings, *m.others]
+        if f.count("journal")
+    ]
+    cur = sum(1 for u in m.unclassified if u.stream == "journal" and u.boot == "current")
+    prev = sum(1 for u in m.unclassified if u.stream == "journal" and u.boot == "previous")
+    if cur or prev:
+        rows.append(("Unclassified", cur, prev))
+    return rows
 
 
-def fig_journal() -> None:
-    """Draw Figure 8: journal entries per finding, current boot on both dates and the previous boot."""
+def fig_journal(m: Model) -> str | None:
+    """Draw journal entries per finding, current boot beside previous boot."""
+    rows = journal_rows(m)
+    if not rows:
+        return None
     plt = _mpl()
-    ids, r19, cur, prev = journal_series()
-    fig, axs = plt.subplots(1, 2, figsize=(CW, 3.2), sharey=True, gridspec_kw={"wspace": 0.1})
-    y = list(range(len(ids)))[::-1]
-    h = 0.36
-    axs[0].barh([v + h / 2 for v in y], r19, height=h, color=C_LIGHT, label=f"2026-09-27 ({sum(r19)})")
-    axs[0].barh([v - h / 2 for v in y], cur, height=h, color=C_DARK, label=f"2026-10-02 ({sum(cur)})")
-    for v, a, b in zip(y, r19, cur, strict=True):
-        if a or b:
-            text = f"{a} → {b}" if a != b else f"{b}"
-            weight = "semibold" if a != b else "normal"
-            axs[0].text(max(a, b) + 0.6, v, text, va="center", fontsize=6.4, fontweight=weight)
-    axs[0].set_title("Current boot, both capture dates")
-    axs[0].set_xlim(0, 46)
-    axs[0].legend(loc="lower right")
-    axs[1].barh(y, prev, height=0.6, color=C_MID)
-    for v, p in zip(y, prev, strict=True):
-        if p:
-            axs[1].text(p + 0.6, v, str(p), va="center", fontsize=6.4)
-    axs[1].set_title(f"Previous boot, 2026-10-02 ({sum(prev)})")
-    axs[1].set_xlim(0, 46)
-    axs[0].set_yticks(y)
-    axs[0].set_yticklabels(ids)
-    for ax in axs:
+    fig, axs = plt.subplots(1, 2, figsize=(CW, 0.6 + 0.17 * len(rows)), sharey=True, gridspec_kw={"wspace": 0.1})
+    y = list(range(len(rows)))[::-1]
+    for ax, idx, title in ((axs[0], 1, "Current boot"), (axs[1], 2, "Previous boot")):
+        vals = [r[idx] for r in rows]
+        ax.barh(y, vals, height=0.6, color=C_DARK if idx == 1 else C_MID)
+        for v, n in zip(y, vals, strict=True):
+            if n:
+                ax.text(n + 0.4, v, str(n), va="center", fontsize=6.2)
+        ax.set_title(f"{title} ({sum(vals)})")
+        ax.set_xlim(0, max([r[1] for r in rows] + [r[2] for r in rows]) * 1.18 + 1)
+        ax.set_xlabel("Journal entries", fontsize=7.2)
         clean(ax)
         ax.tick_params(axis="y", length=0)
-    for ax in axs:
-        ax.set_xlabel("Journal entries", fontsize=7.2)
-    save(fig, "fig08_journal.svg")
+    axs[0].set_yticks(y)
+    axs[0].set_yticklabels([r[0] for r in rows])
+    return save(fig, "journal")
 
 
-def day(iso: str) -> dt.datetime:
-    """Return midnight UTC of an ISO date."""
-    return dt.datetime.fromisoformat(f"{iso}T00:00:00+00:00")
-
-
-def fig_fixes() -> None:
-    """Draw Figure 10: when each fix was applied and when the captures confirmed it (Tables 17 and 20)."""
+def fig_prevboot(m: Model) -> str | None:
+    """Draw the previous boot's journal entries over wall-clock time, one row per finding."""
+    prev = [
+        (f.fid or f.title, [x.when for x in f.matches if x.boot == "previous" and x.when])
+        for f in [*m.findings, *m.others]
+    ]
+    prev = [(k, t) for k, t in prev if t]
+    unc = [u.when for u in m.unclassified if u.boot == "previous" and u.when]
+    if unc:
+        prev.append(("Unclassified", unc))
+    if not prev:
+        return None
     plt = _mpl()
-    from matplotlib.lines import Line2D
+    import matplotlib.dates as mdates
 
-    fig, ax = plt.subplots(figsize=(CW, 1.95))
-    note_x = day("2026-10-03") + dt.timedelta(hours=8)
-    open_x = day("2026-10-02") + dt.timedelta(hours=18.3)
-    for i, (_fid, applied, closed, note) in enumerate(FIG_FIXES[::-1]):
-        if closed:
-            ax.plot([day(applied), day(closed)], [i, i], color=C_DARK, lw=1.4, zorder=2)
-            ax.plot([day(applied)], [i], marker="o", ms=5, color=C_INK, zorder=3)
-            ax.plot([day(closed)], [i], marker="s", ms=5.2, color=C_INK, zorder=4)
-        else:
-            ax.plot([day(applied)], [i], marker="o", ms=5, color=C_INK, zorder=3)
-            ax.plot([day(applied), open_x], [i, i], color=C_DARK, lw=1.0, ls=(0, (2, 2)), zorder=2)
-            ax.plot([open_x], [i], marker="D", ms=5, mfc="white", mec=C_INK, mew=0.9, zorder=4)
-        ax.text(note_x, i, note, va="center", fontsize=6.6)
-    captures = (
-        (day("2026-09-27"), "2026-09-27 captures\n(revision 19)"),
-        (day("2026-10-02") + dt.timedelta(hours=18.33), "2026-10-02 18:20\ncaptures"),
-    )
-    for x, label in captures:
-        ax.axvline(x, color=C_MID, lw=0.7, ls=(0, (3, 2)), zorder=1)
-        top = len(FIG_FIXES) - 0.35
-        ax.text(x, top, label, ha="center", va="bottom", fontsize=6.2, color=C_DARK, linespacing=1.0)
-    ax.set_yticks(range(len(FIG_FIXES)))
-    ax.set_yticklabels([r[0] for r in FIG_FIXES[::-1]])
-    ax.set_xlim(day("2026-09-26") + dt.timedelta(hours=12), day("2026-10-05") + dt.timedelta(hours=12))
-    ax.set_ylim(-0.6, len(FIG_FIXES) + 0.5)
-    ax.set_xticks([day(f"2026-09-{d}") for d in (27, 28, 29, 30)] + [day(f"2026-10-0{d}") for d in (1, 2, 3)])
-    ax.set_xticklabels(["09-27", "09-28", "09-29", "09-30", "10-01", "10-02", "10-03"])
+    fig, ax = plt.subplots(figsize=(CW, 0.6 + 0.17 * len(prev)))
+    for i, (_label, times) in enumerate(prev[::-1]):
+        ax.plot(times, [i] * len(times), marker="|", ms=7, mew=1.2, ls="none", color=C_INK)
+    ax.set_yticks(range(len(prev)))
+    ax.set_yticklabels([f"{k} ({len(t)})" for k, t in prev[::-1]])
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    first = min(min(t) for _, t in prev)
+    ax.set_xlabel(f"Previous boot, {first:%Y-%m-%d}; one tick per journal entry", fontsize=7.2)
     clean(ax)
     ax.tick_params(axis="y", length=0)
-    handles = [
-        Line2D([], [], marker="o", ls="none", color=C_INK, ms=5, label="fix applied"),
-        Line2D([], [], marker="s", ls="none", color=C_INK, ms=5, label="confirmed, closed"),
-        Line2D([], [], marker="D", ls="none", mfc="white", mec=C_INK, ms=5, label="open"),
-    ]
-    ax.legend(handles=handles, loc="lower left", ncol=3, bbox_to_anchor=(0.0, -0.42))
-    save(fig, "fig10_fixes.svg")
-
-
-FIGURES = (fig_boot, fig_verify, fig_areas, fig_ident, fig_families, fig_journal, fig_fixes)
+    return save(fig, "prevboot")
 
 
 # ── LAYOUT ────────────────────────────────────────────────────────────
-# ReportLab platypus: styles, flowables, sections, page templates.
+# ReportLab platypus: styles, references, flowables, sections, page templates.
 INK, MUTE, RULE, LIGHT, ZEBRA, DARK, MID = (
     HexColor(x) for x in ("#1b1b1b", "#5a5a5a", "#a3a3a3", "#e8e8e8", "#f4f4f4", "#2d2d2d", "#8a8a8a")
 )
@@ -2238,18 +1564,7 @@ PW, PH = letter
 LM = RM = 50
 TOPM, BOTM = 58, 54
 FW = PW - LM - RM
-FIGURE_TITLES = (
-    "Open and closed items",
-    "Boot milestones, both captures",
-    "Current boot: dmesg, phases, captures",
-    "ry-verify results by section",
-    "Open INFO findings by area",
-    "Identifier lines by class",
-    "dmesg notice lines by family",
-    "Journal entries per finding",
-    "Previous boot timeline",
-    "Fix history",
-)
+EVIDENCE_LINES = 8  # evidence lines quoted per card; the Lines row lists them all
 
 
 def style(name: str, parent: ParagraphStyle | None = None, **kw: object) -> ParagraphStyle:
@@ -2270,7 +1585,6 @@ sty_table_title = style(
     "ttl", fontName="Plex-SB", fontSize=8.1, leading=10.8, spaceBefore=7, spaceAfter=3.5, keepWithNext=1
 )
 sty_caption = style("cap", fontName="Plex-It", fontSize=7.5, leading=10, textColor=MUTE, spaceBefore=3, spaceAfter=11)
-sty_note = style("note", fontName="Plex-It", fontSize=7.4, leading=9.8, textColor=MUTE, spaceBefore=3, spaceAfter=8)
 sty_th = style("th", fontName="PlexC-SB", fontSize=7.6, leading=9.5)
 sty_td = style("td", fontName="PlexC", fontSize=7.8, leading=9.9)
 sty_td_right = style("tdr", parent=sty_td, alignment=TA_RIGHT)
@@ -2278,6 +1592,14 @@ sty_td_mono = style("tdm", fontName="PlexM", fontSize=6.9, leading=9.1)
 sty_code = style("code", fontName="PlexM", fontSize=7.3, leading=10.6)
 sty_label = style("lab", fontName="PlexC-SB", fontSize=7.4, leading=9.6, textColor=MUTE)
 sty_card_value = style("cv", parent=sty_td, fontSize=8.0, leading=10.6)
+
+
+def model() -> Model:
+    """Return the model of the current build."""
+    if STATE.model is None:
+        msg = "no model"
+        raise RuntimeError(msg)
+    return STATE.model
 
 
 def page_of(key: str) -> str:
@@ -2307,38 +1629,36 @@ def para(text: str, st: ParagraphStyle = sty_body) -> Paragraph:
     return Paragraph(fmt(text, st), st)
 
 
+def bullet_paragraphs(texts: Iterable[str]) -> list[Flowable]:
+    """Return bulleted body paragraphs."""
+    return [Paragraph(fmt(t), sty_bullet, bulletText="•") for t in texts]
+
+
 STRUCT = (
-    ("sec-1", 0, "1", "Executive summary"),
+    ("sec-1", 0, "1", "Summary"),
     ("sub-1.1", 1, "1.1", "Key facts"),
-    ("sub-1.2", 1, "1.2", "What changed since 2026-09-27"),
-    ("sub-1.3", 1, "1.3", "Open actions"),
-    ("sec-2", 0, "2", "Scope and method"),
+    ("sub-1.2", 1, "1.2", "Findings register"),
+    ("sub-1.3", 1, "1.3", "Actions"),
+    ("sec-2", 0, "2", "Inputs and method"),
     ("sub-2.1", 1, "2.1", "Inputs"),
     ("sub-2.2", 1, "2.2", "Capture window"),
     ("sub-2.3", 1, "2.3", "Method"),
-    ("sub-2.4", 1, "2.4", "Severity and status"),
+    ("sub-2.4", 1, "2.4", "Severity scale"),
     ("sec-3", 0, "3", "System health"),
-    ("sec-4", 0, "4", "Open findings register"),
-    ("sec-5", 0, "5", "Open LOW finding"),
-    ("sec-6", 0, "6", "Open INFO findings"),
-    ("sec-7", 0, "7", "Open watch and by-design items"),
-    ("sec-8", 0, "8", "Coverage and double-check"),
-    ("sub-8.1", 1, "8.1", "Journal attribution by finding"),
-    ("sec-9", 0, "9", "Open unknowns and risks"),
-    ("sec-10", 0, "10", "Closed"),
-    ("sub-10.1", 1, "10.1", "Closed findings register"),
-    ("sub-10.2", 1, "10.2", "Closed finding cards"),
-    ("sub-10.3", 1, "10.3", "Closed unknowns"),
-    ("sub-10.4", 1, "10.4", "Closed events"),
-    ("sub-10.5", 1, "10.5", "Implementation record"),
-    ("sec-11", 0, "11", "Open actions"),
-    ("sub-11.1", 1, "11.1", "Redact the captures before posting (O-1)"),
-    ("sub-11.2", 1, "11.2", "Merge the .pacnew files (O-2)"),
-    ("sub-11.3", 1, "11.3", "Close the open unknowns"),
-    ("sub-11.4", 1, "11.4", "Hand over to ry-install 7.224.0 (O-3)"),
-    ("sub-11.5", 1, "11.5", "Checklist"),
+    ("sec-4", 0, "4", "Findings"),
+    ("sec-5", 0, "5", "Identifiers"),
+    ("sec-6", 0, "6", "Watch items and settings"),
+    ("sec-7", 0, "7", "Coverage"),
+    ("sub-7.1", 1, "7.1", "Streams and cross-checks"),
+    ("sub-7.2", 1, "7.2", "dmesg notice families"),
+    ("sub-7.3", 1, "7.3", "Journal attribution"),
+    ("sub-7.4", 1, "7.4", "Unclassified lines"),
+    ("sec-8", 0, "8", "ry-verify"),
+    ("sub-8.1", 1, "8.1", "Sections"),
+    ("sub-8.2", 1, "8.2", "Notes, warnings, and failures"),
+    ("sec-9", 0, "9", "Actions"),
     ("sec-A", 0, "A", "Environment snapshot"),
-    ("sec-B", 0, "B", "Abbreviations"),
+    ("sec-B", 0, "B", "Rules and keywords"),
 )
 SD = {key: (level, number, title) for key, level, number, title in STRUCT}
 
@@ -2350,10 +1670,11 @@ class HPara(Paragraph):
         """Compose the heading for a STRUCT key."""
         level, number, title = SD[key]
         self.key, self.level, self.toc = key, level, f"{number}  {title}"
-        if level == 0:
-            num = f'<font name="Plex-Md" color="#8a8a8a">{number}</font>\u2002'
-        else:
-            num = f'<font color="#5a5a5a">{number}</font>\u2002'
+        num = (
+            f'<font name="Plex-Md" color="#8a8a8a">{number}</font>\u2002'
+            if level == 0
+            else f'<font color="#5a5a5a">{number}</font>\u2002'
+        )
         super().__init__(f'<a name="{key}"/>{num}{escape(title)}', sty_h1 if level == 0 else sty_h2)
 
     def draw(self) -> None:
@@ -2406,6 +1727,12 @@ TABLE_STYLE = (
     ("BOTTOMPADDING", (0, 0), (-1, -1), 2.9),
     ("LINEBELOW", (0, -1), (-1, -1), 0.8, INK),
 )
+ZERO_PAD = (
+    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+    ("TOPPADDING", (0, 0), (-1, -1), 0),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+)
 Cell = tuple[int, int]
 
 
@@ -2414,7 +1741,7 @@ def cell(value: object, column: int, mono: Sequence[int], right: Sequence[int]) 
     if isinstance(value, Flowable):
         return value
     if column in mono:
-        return Paragraph(fmt(str(value), sty_td_mono), sty_td_mono)
+        return Paragraph(escape(str(value)), sty_td_mono)
     return Paragraph(fmt(str(value), sty_td), sty_td_right if column in right else sty_td)
 
 
@@ -2423,46 +1750,49 @@ def table(
     rows: Sequence[Sequence[object]],
     widths: Sequence[float],
     *,
-    num: int | str | None = None,
     title: str = "",
     mono: Sequence[int] = (),
     right: Sequence[int] = (),
     bold_last: bool = False,
-    shade: Sequence[int] = (),
     spans: Sequence[tuple[Cell, Cell]] = (),
 ) -> list[Flowable]:
     """Return a house table (optional numbered title, ruled zebra grid, repeated header) and a spacer.
 
     Raise ValueError when the column widths do not fill the text frame or a row has the wrong number of cells.
     """
-    label = f"Table {num}" if num is not None else "untitled table"
+    label = title or "untitled table"
     if len(widths) != len(head) or abs(sum(widths) - FW) > 0.5:
         msg = f"{label}: {len(widths)} widths summing to {sum(widths):g} pt for {len(head)} columns, frame {FW:g} pt"
         raise ValueError(msg)
     if any(len(row) != len(head) for row in rows):
         msg = f"{label}: every row needs {len(head)} cells"
         raise ValueError(msg)
+    if not rows:
+        rows = [["—", *[""] * (len(head) - 1)]]
     data: list[list[Flowable]] = [[Paragraph(fmt(h, sty_th), sty_th) for h in head]]
     data += [[cell(value, j, mono, right) for j, value in enumerate(row)] for row in rows]
     grid = Table(data, colWidths=list(widths), repeatRows=1, hAlign="LEFT")
     commands: list[tuple[object, ...]] = list(TABLE_STYLE)
-    commands += [("BACKGROUND", (0, r), (-1, r), LIGHT) for r in shade]
     commands += [("SPAN", *span) for span in spans]
     if bold_last:
         commands.append(("LINEABOVE", (0, -1), (-1, -1), 0.6, INK))
     grid.setStyle(TableStyle(commands))
     out: list[Flowable] = []
-    if num is not None:
-        out.append(Anchor(f"tab-{num}", keep_with_next=True))
-        out.append(Paragraph(f'<font color="#5a5a5a">Table {num}</font>\u2002{escape(title)}', sty_table_title))
+    if title:
+        STATE.tables += 1
+        out.append(Anchor(f"tab-{STATE.tables}", keep_with_next=True))
+        out.append(
+            Paragraph(f'<font color="#5a5a5a">Table {STATE.tables}</font>\u2002{escape(title)}', sty_table_title)
+        )
     return [*out, grid, Spacer(1, 6)]
 
 
 CHIP_COLORS = {
-    "LOW": (INK, colors.white, INK),
+    "HIGH": (INK, colors.white, INK),
+    "MED": (DARK, colors.white, DARK),
+    "LOW": (colors.white, INK, INK),
     "INFO": (LIGHT, INK, MID),
-    "OPEN": (colors.white, INK, INK),
-    "CLOSED": (DARK, colors.white, DARK),
+    "MITIGATED": (colors.white, MUTE, MID),
 }
 
 
@@ -2472,7 +1802,7 @@ def chip_width(text: str) -> float:
 
 
 def chip(text: str) -> Table:
-    """Return a small bordered label (LOW, INFO, OPEN, CLOSED) as a one-cell table."""
+    """Return a small bordered label (severity or MITIGATED) as a one-cell table."""
     fill, ink, border = CHIP_COLORS[text]
     label = Paragraph(
         f'<font name="PlexC-SB" size="6.8" color="{ink.hexval()}">{text}</font>',
@@ -2484,10 +1814,8 @@ def chip(text: str) -> Table:
             [
                 ("BACKGROUND", (0, 0), (-1, -1), fill),
                 ("BOX", (0, 0), (-1, -1), 0.7, border),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                *ZERO_PAD[:3],
                 ("TOPPADDING", (0, 0), (-1, -1), 1.4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ]
         )
@@ -2495,80 +1823,59 @@ def chip(text: str) -> Table:
     return box
 
 
-ZERO_PAD = (
-    ("LEFTPADDING", (0, 0), (-1, -1), 0),
-    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-    ("TOPPADDING", (0, 0), (-1, -1), 0),
-    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-)
-
-
-def card_header(fid: str, title: str, kind: str) -> Table:
-    """Return a card's header row: monospace ID, title, and severity and status chips."""
-    dark = kind == "closed"
-    fg = "#ffffff" if dark else "#1b1b1b"
-    idp = Paragraph(
-        f'<a name="card-{fid}"/><font name="PlexM-SB" size="11" color="{fg}">{fid}</font>', style("cid", leading=13)
-    )
-    tp = Paragraph(f'<font name="Plex-SB" size="9.4" color="{fg}">{escape(title)}</font>', style("ctt", leading=12))
-    labels = ("INFO" if kind == "info" else "LOW", "CLOSED" if dark else "OPEN")
+def card(f: Finding) -> KeepTogether:
+    """Return a finding card: ID, title, chips, meta line, evidence, lines, counts, explanation, notes, action."""
+    labels = [f.severity, *(["MITIGATED"] if any("mitigation" in n for n in f.notes) else [])]
     widths = [chip_width(t) + 4 for t in labels]
     chips = Table([[chip(t) for t in labels]], colWidths=widths, hAlign="RIGHT")
-    pad = [("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2), *ZERO_PAD[2:]]
-    chips.setStyle(TableStyle(pad))
+    chips.setStyle(
+        TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2), *ZERO_PAD[2:]])
+    )
+    idp = Paragraph(f'<a name="card-{f.fid}"/><font name="PlexM-SB" size="11">{f.fid}</font>', style("cid", leading=13))
+    tp = Paragraph(f'<font name="Plex-SB" size="9.4">{escape(f.title)}</font>', style("ctt", leading=12))
     header = Table([[idp, tp, chips]], colWidths=[46, FW - 46 - sum(widths) - 14, sum(widths) + 6])
     header.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), *ZERO_PAD]))
-    return header
-
-
-def card(
-    fid: str,
-    title: str,
-    kind: str,
-    area: str,
-    ev: Sequence[str],
-    lines: str,
-    rows: Sequence[tuple[str, str]],
-    *,
-    bullets: Sequence[str] = (),
-    extra_meta: str = "",
-    closed: str = "",
-    outline_level: int = 1,
-) -> KeepTogether:
-    """Return a finding card: header, meta line, evidence, lines, explanation bullets, then labelled rows."""
-    dark = kind == "closed"
-    meta = ["INFO" if kind == "info" else "LOW", f"CLOSED {closed}" if dark else "OPEN", area]
-    if extra_meta:
-        meta.append(extra_meta)
-    meta.append("Register, " + pref("sub-10.1" if dark else "sec-4"))
-    meta_style = style("meta", fontName="PlexC", fontSize=7.4, leading=9.4, textColor=MUTE)
+    meta = escape(f"{f.severity} · {f.area} · Register, ") + pref("sub-1.2")
+    quotes = [m.text for m in f.matches if m.text]
+    shown = [Paragraph(escape(q), sty_td_mono) for q in quotes[:EVIDENCE_LINES]]
+    if len(quotes) > EVIDENCE_LINES:
+        shown.append(Paragraph(f"… and {len(quotes) - EVIDENCE_LINES} more (Lines row)", sty_label))
+    counts = ", ".join(
+        f"{n} {label}"
+        for n, label in (
+            (f.count("journal", "current"), "current-boot journal"),
+            (f.count("journal", "previous"), "previous-boot journal"),
+            (f.count("dmesg"), "dmesg"),
+            (f.count("inxi"), "inxi"),
+            (f.count("verify"), "ry-verify"),
+        )
+        if n
+    )
     data: list[list[object]] = [
-        [card_header(fid, title, kind), ""],
-        [Paragraph(" \u00b7 ".join(meta), meta_style), ""],
-        [Paragraph("Evidence", sty_label), [Paragraph(escape(e), sty_td_mono) for e in ev]],
-        [Paragraph("Lines", sty_label), Paragraph(escape(lines), style("ln", parent=sty_td, fontName="PlexC"))],
+        [header, ""],
+        [Paragraph(meta, style("meta", fontName="PlexC", fontSize=7.4, leading=9.4, textColor=MUTE)), ""],
     ]
-    if bullets:
-        bullet_style = style("cb", parent=sty_td, fontSize=8.0, leading=10.6, leftIndent=8, bulletIndent=0)
-        items = [Paragraph(fmt(b, sty_td), bullet_style, bulletText="•") for b in bullets]
-        data.append([Paragraph(EXPLANATION, sty_label), items])
+    if shown:
+        data.append([Paragraph("Evidence", sty_label), shown])
+    data.append([Paragraph("Lines", sty_label), Paragraph(escape(f.lines()), style("ln", parent=sty_td))])
+    if counts:
+        data.append([Paragraph("Counts", sty_label), Paragraph(counts, style("cn", parent=sty_td))])
+    rows = [("Explanation", f.explanation), *(("Note", n) for n in f.notes), ("Action", f.action)]
     data += [[Paragraph(k, sty_label), Paragraph(fmt(v, sty_td), sty_card_value)] for k, v in rows]
     body = Table(data, colWidths=[62, FW - 62])
-    body.setStyle(TableStyle(card_style(kind)))
-    return KeepTogether([Anchor(f"card-{fid}", f"{fid}  {title}", outline_level), body, Spacer(1, 9)])
+    body.setStyle(TableStyle(card_style(f.severity, has_evidence=bool(shown))))
+    return KeepTogether([Anchor(f"card-{f.fid}", f"{f.fid}  {f.title}", 1), body, Spacer(1, 9)])
 
 
-def card_style(kind: str) -> list[tuple[object, ...]]:
-    """Return a card's table commands: header fill by kind, evidence shading, rules, padding, LOW side bar."""
-    dark = kind == "closed"
+def card_style(severity: str, *, has_evidence: bool) -> list[tuple[object, ...]]:
+    """Return a card's table commands: header fill by severity, evidence shading, rules, padding."""
     commands: list[tuple[object, ...]] = [
         ("SPAN", (0, 0), (-1, 0)),
         ("SPAN", (0, 1), (-1, 1)),
-        ("BOX", (0, 0), (-1, -1), 1.0 if kind == "low" else 0.7, INK),
+        ("BOX", (0, 0), (-1, -1), 1.0 if severity in ("HIGH", "MED") else 0.7, INK),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("BACKGROUND", (0, 0), (-1, 0), DARK if dark else (colors.white if kind == "low" else LIGHT)),
+        ("BACKGROUND", (0, 0), (-1, 0), LIGHT if severity == "INFO" else colors.white),
         ("LINEBELOW", (0, 0), (-1, 0), 0.7, INK),
-        ("BACKGROUND", (1, 2), (1, 2), ZEBRA),
         ("LINEBELOW", (0, 1), (-1, -2), 0.25, RULE),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
@@ -2577,21 +1884,17 @@ def card_style(kind: str) -> list[tuple[object, ...]]:
         ("TOPPADDING", (0, 0), (-1, 0), 4.5),
         ("BOTTOMPADDING", (0, 0), (-1, 0), 4.5),
     ]
-    if kind == "low":
-        commands.append(("LINEBEFORE", (0, 0), (0, -1), 3.2, INK))
+    if has_evidence:
+        commands.append(("BACKGROUND", (1, 2), (1, 2), ZEBRA))
+    if severity in ("HIGH", "MED", "LOW"):
+        commands.append(("LINEBEFORE", (0, 0), (0, -1), 3.2 if severity != "LOW" else 1.6, INK))
     return commands
 
 
-def figure_caption(num: int) -> Paragraph:
-    """Return the caption paragraph of figure num."""
-    return Paragraph(
-        f'<font name="Plex-SBIt" color="#3a3a3a">Figure {num}</font>\u2002' + fmt(CAPTIONS[num], sty_caption),
-        sty_caption,
-    )
-
-
-def svgfig(num: int, name: str) -> KeepTogether:
-    """Return a rendered SVG figure, scaled to the frame width, with its anchor and caption."""
+def svgfig(name: str | None, title: str, caption: str) -> list[Flowable]:
+    """Return a numbered figure from a rendered SVG (scaled to the frame width) with its caption, or nothing."""
+    if name is None:
+        return []
     from svglib.svglib import svg2rlg
 
     drawing = svg2rlg(str(STATE.chart_dir / f"{name}.svg"))
@@ -2601,16 +1904,14 @@ def svgfig(num: int, name: str) -> KeepTogether:
     scale = FW / drawing.width
     drawing.width, drawing.height = drawing.width * scale, drawing.height * scale
     drawing.scale(scale, scale)
-    return KeepTogether([Anchor(f"fig-{num}"), Spacer(1, 2), drawing, figure_caption(num)])
-
-
-def rasterfig(num: int, name: str) -> KeepTogether:
-    """Return a raster figure from the assets at frame width, keeping its aspect ratio, with its caption."""
-    path = str(STATE.asset_dir / name)
-    w, h = ImageReader(path).getSize()
-    return KeepTogether(
-        [Anchor(f"fig-{num}"), Spacer(1, 2), Image(path, width=FW, height=FW * h / w), figure_caption(num)]
-    )
+    num = len(STATE.figures) + 1
+    STATE.figures.append((num, title))
+    head = f'<font name="Plex-SBIt" color="#3a3a3a">Figure {num}</font>\u2002'
+    return [
+        KeepTogether(
+            [Anchor(f"fig-{num}"), Spacer(1, 2), drawing, Paragraph(head + fmt(caption, sty_caption), sty_caption)]
+        )
+    ]
 
 
 def code_block(label: str, lines: Sequence[str]) -> list[Flowable]:
@@ -2638,156 +1939,144 @@ def code_block(label: str, lines: Sequence[str]) -> list[Flowable]:
     return [block, Spacer(1, 4)]
 
 
-BOARD_NEW = ("I-17", "I-18", "I-19", "I-20")  # INFO findings first seen in the 2026-10-02 previous boot
-BOARD_WATCH = ("Wi-Fi TX cap 30 dBm", "10 GbE ports down")  # Table 10 items, shortened for the board
+def sha16(raw: bytes) -> str:
+    """Return the first 16 hex digits of a SHA256."""
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
-class Board(Flowable):
-    """Figure 1: open and closed items as a status board (vector)."""
-
-    def wrap(self, availWidth: float, availHeight: float) -> tuple[float, float]:  # noqa: ARG002, N803
-        """Take the frame width and 182 pt."""
-        return FW, 182
-
-    def box(
-        self,
-        x: float,
-        y: float,
-        w: float,
-        h: float,
-        *,
-        fill: Color | None = None,
-        lw: float = 0.8,
-        dash: tuple[float, float] | None = None,
-        stroke: Color = INK,
-    ) -> None:
-        """Draw a rectangle with an optional fill and dash."""
-        canvas = self.canv
-        canvas.setLineWidth(lw)
-        canvas.setStrokeColor(stroke)
-        if dash:
-            canvas.setDash(*dash)
-        else:
-            canvas.setDash()
-        if fill is not None:
-            canvas.setFillColor(fill)
-        canvas.rect(x, y, w, h, stroke=1, fill=1 if fill is not None else 0)
-        canvas.setDash()
-
-    def txt(
-        self, x: float, y: float, s: str, font: str = "Plex", size: float = 7.4, color: Color = INK, align: str = "l"
-    ) -> None:
-        """Draw a string left-, center-, or right-aligned at (x, y)."""
-        canvas = self.canv
-        canvas.setFont(font, size)
-        canvas.setFillColor(color)
-        draw = {"l": canvas.drawString, "c": canvas.drawCentredString}.get(align, canvas.drawRightString)
-        draw(x, y, s)
-
-    def draw(self) -> None:
-        """Draw the OPEN panel (L-3, INFO grid, watch items) and the CLOSED panel (fixed findings)."""
-        self.draw_open(334)
-        self.draw_closed(334 + 10)
-
-    def draw_open(self, width: float) -> None:
-        """Draw the OPEN panel: the LOW finding, the INFO grid, the watch items, and the open unknowns."""
-        counts = dict(KPI_OPEN)
-        info_ids = [r[0] for r in T8 if r[1] == "INFO"]
-        self.box(0, 0, width, 182, lw=1.2)
-        self.txt(10, 162, "OPEN", "Plex-SB", 13)
-        summary = f"{counts['LOW']} LOW with an action · {counts['INFO']} INFO, no action · {counts['WATCH']} WATCH"
-        self.txt(56, 164, summary, "Plex", 7.4, MUTE)
-        self.box(10, 82, 90, 66, lw=2.4)
-        self.txt(55, 122, L3["id"], "Plex-SB", 15, align="c")
-        self.txt(55, 106, "LOW · redact the", "Plex", 7, align="c")
-        self.txt(55, 96, f"{CAP} pair", "Plex", 7, align="c")
-        cw, chh = 21.2, 21
-        for i, fid in enumerate(info_ids):
-            col, row = i % 10, i // 10
-            x, y = 110 + col * cw, 127 - row * chh
-            new = fid in BOARD_NEW
-            self.box(x, y, cw, chh, lw=1.5 if new else 0.6)
-            self.txt(x + cw / 2, y + 7.4, fid, "PlexC-SB" if new else "PlexC", 6.6, align="c")
-        note = f"INFO findings; {BOARD_NEW[0]} to {BOARD_NEW[-1]} (bold) are new on {CAP}"
-        self.txt(110, 74, note, "Plex", 6.6, MUTE)
-        for x, label in zip((10, 132), BOARD_WATCH, strict=True):
-            self.box(x, 14, 112, 44, lw=0.9, dash=(3, 2))
-            self.txt(x + 56, 40, "WATCH", "Plex-SB", 7.6, align="c")
-            self.txt(x + 56, 27, label, "Plex", 7, align="c")
-        self.txt(256, 38, f"+ {counts['UNKNOWNS']} open unknowns", "Plex", 7.2)
-        self.txt(256, 28, "Section 9", "Plex", 7.2, MUTE)
-
-    def draw_closed(self, x0: float) -> None:
-        """Draw the CLOSED panel from x0: one tile per closed finding (Table 17), then the answered unknowns."""
-        counts = dict(KPI_CLOSED)
-        self.box(x0, 0, FW - x0, 182, fill=HexColor("#ececec"), lw=1.2)
-        self.txt(x0 + 10, 162, "CLOSED", "Plex-SB", 13)
-        self.txt(x0 + 74, 164, "fixed and confirmed", "Plex", 7.4, MUTE)
-        tiles = [(fid, f"accepted {day_[5:]}" if owner == "none needed" else day_) for fid, _, day_, _, owner in T17]
-        tiles.append((f"{counts['UNKNOWNS']} unknowns", "answered"))
-        tw, tg = 47, 6
-        for i, (head, sub) in enumerate(tiles):
-            last = i == len(tiles) - 1
-            col, row = i % 3, i // 3
-            x, y = x0 + 10 + col * (tw + tg), 98 - row * 52
-            self.box(x, y, tw, 46, fill=MID if last else DARK, lw=0.6, stroke=DARK)
-            self.txt(x + tw / 2, y + 24, head, "Plex-SB", 7.2 if last else 10.5, colors.white, "c")
-            self.txt(x + tw / 2, y + 11, sub, "Plex", 6.1, colors.white, "c")
-        events = counts["EVENTS"]
-        self.txt(x0 + 10, 26, f"+ {events} normal event{'s' if events != 1 else ''}", "Plex", 7.2)
-        self.txt(x0 + 10, 16, "(the 18:19:28 reboot)", "Plex", 7.2, MUTE)
+def severity_counts(m: Model) -> dict[str, int]:
+    """Return the number of findings per severity."""
+    return {s: sum(1 for f in m.findings if f.severity == s) for s in FINDING_LEVELS}
 
 
-def kpi_strip() -> Table:
-    """Return the open and closed counts as a two-group strip."""
-    opened, closed = KPI_OPEN, KPI_CLOSED
-    items = (*opened, *closed)
+def verdict(m: Model) -> tuple[str, str]:
+    """Return the cover verdict: a head line and a summary sentence, both from the model."""
+    c = severity_counts(m)
+    if c["HIGH"] or c["MED"]:
+        n = c["HIGH"] + c["MED"]
+        head = (
+            "Attention — "
+            + " and ".join(f"{c[k]} {k}" for k in ("HIGH", "MED") if c[k])
+            + f" finding{'s' if n != 1 else ''}."
+        )
+    elif c["LOW"]:
+        head = f"Healthy, with {c['LOW']} LOW finding{'s' if c['LOW'] != 1 else ''} to act on."
+    else:
+        head = "Healthy — no HIGH, MED, or LOW findings."
+    foot = m.vj.footer
+    splats = any(f.key in ("kernel-splat", "kernel-taint") for f in m.findings)
+    body = (
+        f"{len(m.findings)} findings: " + ", ".join(f"{v} {k}" for k, v in c.items()) + ". "
+        f"ry-verify {m.vj.header.get('version', '')} reports {foot.get('pass', 0)} OK, {foot.get('fail', 0)} FAIL, "
+        f"{foot.get('warn', 0)} WARN, and {foot.get('gen_fail', 0)} GEN_FAIL (exit {foot.get('exit_code', '?')}); "
+        f"the kernel ring {'has a splat or taint' if splats else 'shows no taint, oops, or splat'}; "
+        f"{len(m.unclassified)} log lines match no rule."
+    )
+    return head, body
+
+
+def verdict_panel(m: Model) -> Table:
+    """Return the cover's verdict box: a black bar beside the verdict head and summary."""
+    head, text = verdict(m)
+    summary = style("vb", fontSize=8.6, leading=11.8)
+    body = [
+        Paragraph('<font name="PlexC-SB" size="7" color="#5a5a5a">VERDICT</font>', style("vk", leading=9)),
+        Paragraph(fmt(head), style("vh", fontName="Plex-SB", fontSize=12.5, leading=16, spaceAfter=2)),
+        Paragraph(fmt(text, summary), summary),
+    ]
+    panel = Table([["", body]], colWidths=[6, FW - 6])
+    panel.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, 0), INK),
+                ("BACKGROUND", (1, 0), (1, 0), ZEBRA),
+                ("LEFTPADDING", (1, 0), (1, 0), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return panel
+
+
+def kpi_strip(m: Model) -> Table:
+    """Return the cover's count strip: findings, signals, and ry-verify results."""
+    c = severity_counts(m)
+    groups = (
+        ("FINDINGS", [("HIGH", c["HIGH"]), ("MED", c["MED"]), ("LOW", c["LOW"]), ("INFO", c["INFO"])]),
+        (
+            "SIGNALS",
+            [
+                ("WATCH", sum(1 for f in m.others if f.severity == "WATCH")),
+                ("ID LINES", sum(len(b) + len(v) for _, b, v in m.identifiers)),
+                ("UNCLASSIFIED", len(m.unclassified)),
+            ],
+        ),
+        ("RY-VERIFY", [("FAIL", int(m.vj.footer.get("fail", 0))), ("WARN", int(m.vj.footer.get("warn", 0)))]),
+    )
+    items = [i for _, g in groups for i in g]
 
     def text(markup: str, name: str, leading: float) -> Paragraph:
         """Return a centred paragraph."""
         return Paragraph(markup, style(name, alignment=TA_CENTER, leading=leading))
 
+    row0: list[object] = []
+    for name, g in groups:
+        row0 += [text(f'<font name="Plex-SB" size="7.2">{name}</font>', "kg", 9), *[""] * (len(g) - 1)]
     data = [
-        [
-            text('<font name="Plex-SB" size="7.2">OPEN</font>', "kg", 9),
-            *[""] * (len(opened) - 1),
-            text('<font name="Plex-SB" size="7.2">CLOSED</font>', "kg", 9),
-            *[""] * (len(closed) - 1),
-        ],
+        row0,
         [text(f'<font name="Plex-SB" size="17">{v}</font>', "kb", 19) for _, v in items],
-        [text(f'<font name="PlexC-SB" size="6.6" color="#5a5a5a">{k}</font>', "ks", 8) for k, _ in items],
+        [text(f'<font name="PlexC-SB" size="6.4" color="#5a5a5a">{k}</font>', "ks", 8) for k, _ in items],
     ]
     strip = Table(data, colWidths=[FW / len(items)] * len(items), rowHeights=[13, 22, 12])
-    n = len(opened)
-    strip.setStyle(
-        TableStyle(
-            [
-                ("SPAN", (0, 0), (n - 1, 0)),
-                ("SPAN", (n, 0), (-1, 0)),
-                ("LINEBELOW", (0, 0), (-1, 0), 0.5, RULE),
-                ("BOX", (0, 0), (n - 1, -1), 0.9, INK),
-                ("BOX", (n, 0), (-1, -1), 0.9, INK),
-                ("BACKGROUND", (n, 0), (-1, -1), HexColor("#ececec")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING", (0, 0), (-1, -1), 1),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-            ]
-        )
-    )
+    commands: list[tuple[object, ...]] = [
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, RULE),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+    ]
+    col = 0
+    for i, (_, g) in enumerate(groups):
+        end = col + len(g) - 1
+        commands += [("SPAN", (col, 0), (end, 0)), ("BOX", (col, 0), (end, -1), 0.9, INK)]
+        if i == 1:
+            commands.append(("BACKGROUND", (col, 0), (end, -1), HexColor("#ececec")))
+        col = end + 1
+    strip.setStyle(TableStyle(commands))
     return strip
 
 
-def health_tiles() -> Table:
-    """Return the six health tiles under the status board."""
+def health_tiles(m: Model) -> Table:
+    """Return up to six health tiles taken from the health table."""
+    rows = {r[0].split(" ")[0] if r[0].startswith("ry-verify") else r[0]: r for r in m.health}
+    pick = [
+        rows[k]
+        for k in (
+            "ry-verify",
+            "Kernel ring buffer",
+            "Boot to root mount",
+            "Unit failures, current boot",
+            "GPU memory",
+            "Temperatures",
+        )
+        if k in rows
+    ]
+    pick += [r for r in m.health if r not in pick][: max(0, 6 - len(pick))]
     cells = [
         [
-            Paragraph(f'<font name="PlexC-SB" size="6.4" color="#5a5a5a">{escape(k)}</font>', style("hk", leading=8)),
-            Paragraph(f'<font name="Plex-SB" size="11.5">{escape(v)}</font>', style("hv", leading=14)),
-            Paragraph(f'<font name="PlexC" size="6.7" color="#3a3a3a">{escape(s)}</font>', style("hs", leading=8.4)),
+            Paragraph(
+                f'<font name="PlexC-SB" size="6.4" color="#5a5a5a">{escape(c.upper())}</font>', style("hk", leading=8)
+            ),
+            Paragraph(f'<font name="Plex-SB" size="10.5">{escape(clip(r, 22))}</font>', style("hv", leading=13)),
+            Paragraph(
+                f'<font name="PlexC" size="6.6" color="#3a3a3a">{escape(clip(e, 56))}</font>', style("hs", leading=8.2)
+            ),
         ]
-        for k, v, s in HEALTH
+        for c, r, e in pick[:6]
     ]
-    tiles = Table([cells], colWidths=[FW / 6] * 6)
+    if not cells:
+        return Table([[""]])
+    tiles = Table([cells], colWidths=[FW / len(cells)] * len(cells))
     tiles.setStyle(
         TableStyle(
             [
@@ -2803,6 +2092,60 @@ def health_tiles() -> Table:
     return tiles
 
 
+def clip(text: str, limit: int) -> str:
+    """Return text cut at a word boundary to at most limit characters, with an ellipsis when cut."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
+
+def doc_control(m: Model) -> Table:
+    """Return the cover's document-control table."""
+    rows = [
+        (
+            "Bug report",
+            f"`{m.br.path.name}` · {len(m.br.raw):,} bytes · {len(m.br.lines):,} lines · SHA256 {sha16(m.br.raw)}…",
+        ),
+        (
+            "ry-verify log",
+            f"`{m.vj.path.name}` · {len(m.vj.raw):,} bytes · {len(m.vj.records):,} records · SHA256 {sha16(m.vj.raw)}…",
+        ),
+        ("Captured", m.br.date_text or "not stated in the bug report"),
+        ("Generated by", f"build_report.py {__version__}; every value in this report comes from the two inputs"),
+        ("Masking", "Identifiers in quoted lines are replaced by placeholders such as [root UUID] and [serial]"),
+    ]
+    key = style("dk", fontName="PlexC-SB", fontSize=7.6, leading=9.8)
+    table_ = Table(
+        [[Paragraph(f"<b>{k}</b>", key), Paragraph(fmt(v, sty_td), style("dv", parent=sty_td))] for k, v in rows],
+        colWidths=[80, FW - 80],
+    )
+    table_.setStyle(
+        TableStyle(
+            [
+                ("LINEABOVE", (0, 0), (-1, 0), 0.8, INK),
+                ("LINEBELOW", (0, 0), (-1, -1), 0.25, RULE),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
+            ]
+        )
+    )
+    return table_
+
+
+def machine_line(m: Model) -> str:
+    """Return the cover's machine line from inxi and the ry-verify header."""
+    f = m.facts
+    parts = [
+        f.get("machine", "Unknown machine"),
+        f.get("distro", ""),
+        f"Linux {f['kernel']}" if "kernel" in f else "",
+        f"ry-verify {m.vj.header.get('version', '')}",
+    ]
+    return " · ".join(p for p in parts if p)
+
+
 def toc_sections() -> Table:
     """Return the sections column of the contents page, with page numbers."""
     rows = []
@@ -2812,18 +2155,25 @@ def toc_sections() -> Table:
         else:
             st = style("tc1", fontSize=8.2, leading=10.6, leftIndent=16)
         link = f'<a href="#{key}" color="#1b1b1b">'
-        rows.append(
-            [
-                Paragraph(f"{link}{number}\u2002{escape(title)}</a>", st),
-                Paragraph(f"{link}{page_of(key)}</a>", style("tp", parent=st, leftIndent=0, alignment=TA_RIGHT)),
-            ]
-        )
+        page = Paragraph(f"{link}{page_of(key)}</a>", style("tp", parent=st, leftIndent=0, alignment=TA_RIGHT))
+        rows.append([Paragraph(f"{link}{number}\u2002{escape(title)}</a>", st), page])
     sections = Table(rows, colWidths=[FW * 0.62 - 40, 40], hAlign="LEFT")
-    commands: list[tuple[object, ...]] = [*ZERO_PAD[:2], ("TOPPADDING", (0, 0), (-1, -1), 1.2)]
-    commands.append(("BOTTOMPADDING", (0, 0), (-1, -1), 1.2))
-    commands += [("LINEABOVE", (0, i), (-1, i), 0.3, RULE) for i, s in enumerate(STRUCT) if s[1] == 0 and i]
-    sections.setStyle(TableStyle(commands))
+    rules = [("LINEABOVE", (0, i), (-1, i), 0.3, RULE) for i, s in enumerate(STRUCT) if s[1] == 0 and i]
+    padding = [("TOPPADDING", (0, 0), (-1, -1), 1.2), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.2)]
+    sections.setStyle(TableStyle([*ZERO_PAD[:2], *padding, *rules]))
     return sections
+
+
+READING_GUIDE = (
+    "**IDs** — H, M, L, and I mark HIGH, MED, LOW, and INFO findings, numbered by severity and first line.",
+    "**Lines** — BR is a line of the bug report, VJ a record of the ry-verify log; quoted lines are masked.",
+    (
+        "**Coverage** — every journal entry and every dmesg line a rule knows is attributed; anything else that "
+        "matches "
+        "the failure keywords is listed in Section 7.4."
+    ),
+    "**Actions** — Section 9 holds the commands, one per line, ready to type in fish.",
+)
 
 
 def toc_side() -> list[Flowable]:
@@ -2831,28 +2181,26 @@ def toc_side() -> list[Flowable]:
     figs = [
         [
             Paragraph(
-                f'<a href="#fig-{i}" color="#1b1b1b"><font color="#5a5a5a">Figure {i}</font>\u2002{escape(x)}</a>',
+                f'<a href="#fig-{n}" color="#1b1b1b"><font color="#5a5a5a">Figure {n}</font>\u2002{escape(t)}</a>',
                 style("tf", fontSize=7.6, leading=9.8),
             ),
             Paragraph(
-                f'<a href="#fig-{i}" color="#1b1b1b">{page_of(f"fig-{i}")}</a>',
+                f'<a href="#fig-{n}" color="#1b1b1b">{page_of(f"fig-{n}")}</a>',
                 style("tfp", fontSize=7.6, leading=9.8, alignment=TA_RIGHT),
             ),
         ]
-        for i, x in enumerate(FIGURE_TITLES, 1)
+        for n, t in STATE.fig_ref
     ]
-    fig_list = Table(figs, colWidths=[FW * 0.38 - 30, 22])
-    padding = [*ZERO_PAD[:2], ("TOPPADDING", (0, 0), (-1, -1), 1.3), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.3)]
-    fig_list.setStyle(TableStyle([*padding, ("LINEBELOW", (0, 0), (-1, -2), 0.25, RULE)]))
     head = style("fh", fontName="Plex-SB", fontSize=9.5, leading=12, spaceAfter=4)
-    guide = [
-        Paragraph(fmt(g, style("g", fontSize=7.6, leading=10.2)), style("g", fontSize=7.6, leading=10.2, spaceAfter=4))
-        for g in GUIDE
-    ]
-    reading = Paragraph(
-        "How to read this report", style("gh", fontName="Plex-SB", fontSize=9.5, leading=12, spaceAfter=4)
-    )
-    return [Paragraph("Figures", head), fig_list, Spacer(1, 14), reading, *guide]
+    side: list[Flowable] = [Paragraph("Figures", head)]
+    if figs:
+        fig_list = Table(figs, colWidths=[FW * 0.38 - 30, 22])
+        padding = [("TOPPADDING", (0, 0), (-1, -1), 1.3), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.3)]
+        fig_list.setStyle(TableStyle([*ZERO_PAD[:2], *padding, ("LINEBELOW", (0, 0), (-1, -2), 0.25, RULE)]))
+        side.append(fig_list)
+    guide = style("g", fontSize=7.6, leading=10.2, spaceAfter=4)
+    side += [Spacer(1, 14), Paragraph("How to read this report", style("gh", parent=head))]
+    return side + [Paragraph(fmt(g, guide), guide) for g in READING_GUIDE]
 
 
 def toc() -> Table:
@@ -2872,100 +2220,28 @@ def toc() -> Table:
     return outer
 
 
-def checklist() -> list[Flowable]:
-    """Return the tick-box checklist for the open actions and unknowns (Section 11.5)."""
-
-    def box() -> Table:
-        """Return an empty tick box."""
-        return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
-
-    rows = [
-        [
-            box(),
-            Paragraph(f"<b>{a}</b>", sty_td),
-            Paragraph(fmt(b, sty_td), sty_td),
-            Paragraph(fmt(c, sty_td), sty_td),
-            "",
-        ]
-        for a, b, c in CHECKLIST
-    ]
-    return table(["", "ID", "Action", "Done when", "Date / initials"], rows, [18, 28, 196, 190, 80])
-
-
-def verdict_panel() -> Table:
-    """Return the cover's verdict box: a black bar beside the verdict head and summary."""
-    summary_style = style("vb", fontSize=8.6, leading=11.8)
-    body = [
-        Paragraph('<font name="PlexC-SB" size="7" color="#5a5a5a">VERDICT</font>', style("vk", leading=9)),
-        Paragraph(fmt(VERDICT_HEAD), style("vh", fontName="Plex-SB", fontSize=12.5, leading=16, spaceAfter=2)),
-        Paragraph(fmt(VERDICT_BODY, summary_style), summary_style),
-    ]
-    panel = Table([["", body]], colWidths=[6, FW - 6])
-    panel.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (0, 0), INK),
-                ("BACKGROUND", (1, 0), (1, 0), ZEBRA),
-                ("LEFTPADDING", (1, 0), (1, 0), 10),
-                ("TOPPADDING", (0, 0), (-1, -1), 7),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
-    return panel
-
-
-def doc_control() -> Table:
-    """Return the document-control table of the cover."""
-    key_style = style("dk", fontName="PlexC-SB", fontSize=7.6, leading=9.8)
-    rows = [
-        [Paragraph(f"<b>{k}</b>", key_style), Paragraph(fmt(v, sty_td), style("dv", parent=sty_td))]
-        for k, v in DOC_CONTROL
-    ]
-    control = Table(rows, colWidths=[80, FW - 80])
-    control.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (0, 0), (-1, 0), 0.8, INK),
-                ("LINEBELOW", (0, 0), (-1, -1), 0.25, RULE),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                ("TOPPADDING", (0, 0), (-1, -1), 2.2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
-            ]
-        )
-    )
-    return control
-
-
-def _story_cover() -> list[Flowable]:
+def _story_cover(m: Model) -> list[Flowable]:
     """Return the cover page and the contents page."""
+    mute = style("cs", fontSize=10.2, leading=13.5, textColor=MUTE)
     return [
         Spacer(1, 16),
-        Paragraph(
-            "GTR9 Pro Post-Boot Log Analysis", style("ct", fontName="Plex-SB", fontSize=25, leading=29, spaceAfter=6)
-        ),
+        Paragraph("Post-Boot Log Analysis", style("ct", fontName="Plex-SB", fontSize=25, leading=29, spaceAfter=6)),
+        para(machine_line(m), mute),
         para(
-            "Beelink GTR9 Pro · CachyOS · Linux 7.2.8-2-cachyos · ry-verify 7.219.0",
-            style("cs1", fontSize=10.2, leading=13.5, textColor=MUTE),
+            f"Captured {m.br.date_text or 'at an unstated time'} · print edition",
+            style("cs2", parent=mute, spaceAfter=12),
         ),
-        para(
-            f"Captures of 2026-10-02, 18:20 PDT · print edition, revision {REV}",
-            style("cs2", fontSize=10.2, leading=13.5, textColor=MUTE, spaceAfter=12),
-        ),
-        verdict_panel(),
+        verdict_panel(m),
         Spacer(1, 10),
-        kpi_strip(),
+        kpi_strip(m),
         para(
-            "Open items: Sections 4–9 and 11. Closed items: Section 10. "
-            "Watch and by-design items are not counted as findings.",
-            style("kn", fontName="Plex-It", fontSize=7.4, leading=10, textColor=MUTE, spaceBefore=3, spaceAfter=9),
+            "Findings: Section 4. Identifiers: Section 5. Watch items and settings are not counted as findings.",
+            style("kn", fontName="Plex-It", fontSize=7.4, leading=10, textColor=MUTE, spaceBefore=3, spaceAfter=12),
         ),
-        KeepTogether([Anchor("fig-1"), Board(), figure_caption(1)]),
-        health_tiles(),
-        Spacer(1, 10),
+        health_tiles(m),
+        Spacer(1, 12),
         Paragraph("Document control", style("dch", fontName="Plex-SB", fontSize=8.4, leading=11, spaceAfter=3)),
-        doc_control(),
+        doc_control(m),
         NextPageTemplate("body"),
         PageBreak(),
         Paragraph("Contents", style("cth", fontName="Plex-SB", fontSize=15.5, leading=19, spaceAfter=10)),
@@ -2974,211 +2250,493 @@ def _story_cover() -> list[Flowable]:
     ]
 
 
-def bullet_paragraphs(texts: Sequence[str]) -> list[Flowable]:
-    """Return bulleted body paragraphs."""
-    return [Paragraph(fmt(t), sty_bullet, bulletText="•") for t in texts]
-
-
-def _story_sec1() -> list[Flowable]:
-    """Return Section 1: executive summary, key facts, changes since 2026-09-27, and open actions."""
-    out: list[Flowable] = [
-        HPara("sec-1"),
-        *[para(x) for x in EXEC_INTRO],
-        HPara("sub-1.1"),
-        *bullet_paragraphs(KEY_FACTS),
-    ]
-    out += [HPara("sub-1.2"), para(CHANGED_INTRO), *table(*T1, [120, 124, 128, 140], num=1, title="Before and after")]
-    out += [svgfig(2, "fig02_boot"), HPara("sub-1.3"), para(ACTIONS_INTRO)]
-    out += table(*T2, [26, 150, 150, 142, 44], num=2, title="Open actions")
-    return out
-
-
-def _story_sec2() -> list[Flowable]:
-    """Return Section 2: inputs, capture window, method, keyword set, and severity scale."""
-    out: list[Flowable] = [CondPageBreak(240), HPara("sec-2"), HPara("sub-2.1")]
-    rows: list[list[object]] = []
-    spans: list[tuple[Cell, Cell]] = []
-    for name, size, n_lines, content, sha in T3[1]:
-        rows.append([f"`{name}`", size, n_lines, content])
-        rows.append([Paragraph("SHA256", sty_label), Paragraph(sha, sty_td_mono), "", ""])
-        spans.append(((1, len(rows)), (3, len(rows))))
-    out += table(T3[0], rows, [150, 46, 38, 278], num=3, title="Inputs", right=(1, 2), spans=spans)
-    out += [HPara("sub-2.2"), *table(*T4, [196, 176, 140], num=4, title="Capture window"), para(T4_NOTE, sty_note)]
-    out += [HPara("sub-2.3"), *bullet_paragraphs(METHOD)]
-    ncol = 5
-    terms = [[f"`{w}`" for w in KEYWORDS[i : i + ncol]] for i in range(0, len(KEYWORDS), ncol)]
-    terms = [row + [""] * (ncol - len(row)) for row in terms]
-    title = f"Failure keyword set ({len(KEYWORDS)} terms, case-insensitive, whole words)"
-    out += table(
-        ["Terms"] + [""] * (ncol - 1), terms, [FW / ncol] * ncol, num=5, title=title, spans=[((0, 0), (-1, 0))]
+def key_facts(m: Model) -> list[str]:
+    """Return the key-fact bullets, each built from the inputs."""
+    f, foot = m.facts, m.vj.footer
+    cur = sum(1 for e in m.br.journal if e.boot == "current")
+    prev = [e for e in m.br.journal if e.boot == "previous"]
+    hw = ", ".join(x for x in (f.get("machine"), f.get("cpu"), f.get("gpu")) if x)
+    out = [f"Hardware: {hw}." if hw else "Hardware: inxi block not found."]
+    out.append(
+        f"Software: kernel {f.get('kernel', '?')}, {f.get('desktop', 'desktop not stated')}, Mesa "
+        f"{f.get('mesa', '?')}, "
+        f"PipeWire {f.get('pipewire', '?')}."
     )
-    out += [HPara("sub-2.4"), *table(*T6, [78, 434], num=6, title="Severity and status")]
+    out.append(
+        f"ry-verify {m.vj.header.get('version', '?')} (profile {m.vj.header.get('profile', '?')}, mode "
+        f"{m.vj.header.get('mode', '?')}): {foot.get('pass', 0)} OK, {foot.get('fail', 0)} FAIL, "
+        f"{foot.get('warn', 0)} WARN, "
+        f"exit {foot.get('exit_code', '?')}."
+    )
+    span = f" ({prev[0].when:%H:%M:%S}–{prev[-1].when:%H:%M:%S})" if prev else ""
+    out.append(
+        f"Logs: {len(m.br.dmesg):,} dmesg lines; {cur} journal entries in the current boot and {len(prev)} in the "
+        f"previous boot{span}; {len(m.unclassified)} lines match no rule."
+    )
+    if "root mounted" in m.milestones:
+        gap = f", after {m.quiet_gap[1] - m.quiet_gap[0]:.2f} s without output" if m.quiet_gap else ""
+        wifi = (
+            f"; Wi-Fi associated at {m.milestones['Wi-Fi associated']:.2f} s"
+            if "Wi-Fi associated" in m.milestones
+            else ""
+        )
+        out.append(f"Boot: root mounted at {m.milestones['root mounted']:.2f} s{gap}{wifi}.")
+    if m.identifiers:
+        b, v = (sum(len(x[i]) for x in m.identifiers) for i in (1, 2))
+        out.append(f"Identifiers: {b} bug-report lines and {v} ry-verify records (Section 5).")
     return out
 
 
-def _story_sec3() -> list[Flowable]:
-    """Return Section 3: system health checks and Figures 3 and 4."""
-    out: list[Flowable] = [CondPageBreak(260), HPara("sec-3")]
-    out += table(*T7, [116, 166, 230], num=7, title="System health checks")
-    return [*out, rasterfig(3, "fig03_dmesg.png"), svgfig(4, "fig04_verify")]
-
-
-def _story_sec4() -> list[Flowable]:
-    """Return Section 4: the open findings register and Figure 5."""
+def _story_sec1(m: Model) -> list[Flowable]:
+    """Return Section 1: key facts, the findings register, and the actions."""
+    out: list[Flowable] = [HPara("sec-1"), HPara("sub-1.1"), *bullet_paragraphs(key_facts(m)), HPara("sub-1.2")]
     rows = [
-        [fid, sev, finding, area, line, action, f"{{p:card-{fid}}}"] for fid, sev, finding, area, line, action in T8
+        [
+            f.fid,
+            f.severity,
+            f.title,
+            f.area,
+            f.lines().split(",")[0].split(" ·")[0],
+            f.count("journal", "current"),
+            f.count("journal", "previous"),
+            f"{{p:card-{f.fid}}}",
+        ]
+        for f in m.findings
     ]
-    head = ["ID", "Sev.", "Finding", "Area", "Line", "Action", "Page"]
-    out: list[Flowable] = [PageBreak(), HPara("sec-4"), para(REGISTER_INTRO + " Every row is OPEN.")]
-    out += table(head, rows, [30, 30, 162, 98, 46, 108, 38], num=8, title="Open findings register", shade=(1,))
-    return [*out, svgfig(5, "fig05_areas")]
-
-
-def _story_sec5() -> list[Flowable]:
-    """Return Section 5: the L-3 card, Table 9, and Figure 6."""
-    l3 = L3
-    key = l3["cmds"]
-    commands = f"Commands: Section {SD[key][1]}, {pref(key)}"
-    out: list[Flowable] = [CondPageBreak(300), HPara("sec-5")]
-    out.append(card(l3["id"], l3["title"], "low", l3["area"], l3["ev"], l3["lines"], l3["rows"], extra_meta=commands))
-    out.append(para("Table 9 lists the identifier lines to remove before posting (Section 11.1)."))
-    title = "Identifier classes in the 2026-10-02 captures"
-    out += table(
-        ["Identifier class", "Lines", "Count"], T9, [172, 292, 48], num=9, title=title, right=(2,), bold_last=True
-    )
-    return [*out, svgfig(6, "fig06_ident")]
-
-
-def _story_sec6() -> list[Flowable]:
-    """Return Section 6: the twenty INFO cards."""
-    out: list[Flowable] = [PageBreak(), HPara("sec-6"), para(INFO_INTRO)]
-    register = {r[0]: r for r in T8}
-    for d in INFO:
-        r = register[str(d["id"])]
-        rows = [*d["rows"], ("Action", r[5])]
-        out.append(card(r[0], r[2], "info", r[3], d["ev"], d["lines"], rows, bullets=d.get("bullets", ())))
+    head = ["ID", "Sev.", "Finding", "Area", "First line", "Cur.", "Prev.", "Page"]
+    out += table(head, rows, [30, 32, 160, 108, 56, 28, 28, 70], title="Findings register", right=(5, 6))
+    out.append(HPara("sub-1.3"))
+    if m.actions:
+        rows = [[a.aid, a.title, a.why, "{p:sec-9}"] for a in m.actions]
+        out += table(["ID", "Action", "Why", "Page"], rows, [32, 170, 250, 60], title="Actions")
+    else:
+        out.append(para("The findings call for no action."))
     return out
 
 
-def _story_sec7() -> list[Flowable]:
-    """Return Section 7: watch and by-design items."""
-    out: list[Flowable] = [CondPageBreak(260), HPara("sec-7"), para(WATCH_INTRO)]
-    out += table(*T10, [92, 142, 136, 142], num=10, title="Watch items (open)")
-    return out + table(*T11, [118, 150, 54, 190], num=11, title="By-design items")
+def inputs_table(m: Model) -> list[Flowable]:
+    """Return the inputs table: sizes, line counts, content, and full SHA256 of both files."""
+    br_secs = ", ".join(n for n in SECTION_TITLES.values() if n in m.br.sections)
+    phases = ", ".join(sorted({i.phase for i in m.vj.items} - {"preamble"}))
+    h = m.vj.header
+    rows: list[list[object]] = [
+        [f"`{m.br.path.name}`", f"{len(m.br.raw):,}", f"{len(m.br.lines):,}", f"Sections found: {br_secs}"],
+        [Paragraph("SHA256", sty_label), hashlib.sha256(m.br.raw).hexdigest(), "", ""],
+        [
+            f"`{m.vj.path.name}`",
+            f"{len(m.vj.raw):,}",
+            f"{len(m.vj.records):,}",
+            (
+                f"ry-verify {h.get('version', '?')}, profile {h.get('profile', '?')}, mode {h.get('mode', '?')}; "
+                f"phases: {phases or 'none'}"
+            ),
+        ],
+        [Paragraph("SHA256", sty_label), hashlib.sha256(m.vj.raw).hexdigest(), "", ""],
+    ]
+    spans = [((1, 2), (3, 2)), ((1, 4), (3, 4))]
+    return table(
+        ["File", "Bytes", "Lines", "Content"], rows, [150, 46, 38, 278], title="Inputs", right=(1, 2), spans=spans
+    )
 
 
-def _story_sec8() -> list[Flowable]:
-    """Return Section 8: coverage tables, Figures 7 to 9, and journal attribution."""
-    out: list[Flowable] = [PageBreak(), HPara("sec-8"), para(COVERAGE_INTRO)]
-    out += table(*T12, [112, 58, 150, 192], num=12, title="Coverage by stream")
-    out += table(*T13, [178, 34, 48, 252], num=13, title="dmesg notice lines by family", right=(1,))
-    out += [svgfig(7, "fig07_families"), *table(*T14, [26, 256, 230], num=14, title="ry-verify INFO notes")]
-    out += [HPara("sub-8.1"), para(ATTR_INTRO)]
-    rows: list[list[object]] = [[i, f, s, str(a), str(b)] for i, f, s, a, b in T15]
-    rows.append(["Total", "All journal entries", "", str(sum(r[3] for r in T15)), str(sum(r[4] for r in T15))])
-    head = ["ID", "Finding", "Status", "Current boot", "Previous boot"]
-    title = "Journal attribution by finding"
-    out += table(head, rows, [32, 300, 56, 62, 62], num=15, title=title, right=(3, 4), shade=(1, 2, 3), bold_last=True)
-    return [*out, svgfig(8, "fig08_journal"), rasterfig(9, "fig09_prevboot.png")]
+def method_bullets(m: Model) -> list[Flowable]:
+    """Return the method bullets; the keyword table follows them, so its number is the next one."""
+    return bullet_paragraphs(
+        (
+            (
+                f"The bug report is split at its separator lines into {len(m.br.sections)} sections; dmesg, both "
+                "journal "
+                "boots, inxi, and the package list are parsed line by line, and every quote keeps its line number (BR)."
+            ),
+            (
+                f"{len(RULES)} rules recognise known message classes; the first matching rule claims a line. Every "
+                "journal "
+                "entry is attributed or listed as unclassified, and dmesg lines matching the failure keywords (Table "
+                f"{STATE.tables + 1}) but no rule are listed too."
+            ),
+            (
+                f"Journal entries of the previous boot within {SHUTDOWN_WINDOW} s of its last entry count as shutdown "
+                "noise."
+            ),
+            (
+                "A ry-verify OK record that shows a finding's mitigation in place lowers that finding to INFO and is "
+                "cited."
+            ),
+            "Severity follows the observed impact on this host, not the log level.",
+        )
+    )
 
 
-def _story_sec9() -> list[Flowable]:
-    """Return Section 9: open unknowns and risks."""
-    out: list[Flowable] = [CondPageBreak(240), HPara("sec-9"), para(UNKNOWN_INTRO)]
-    return out + table(*T16, [112, 210, 190], num=16, title="Open unknowns")
+def keyword_table() -> list[Flowable]:
+    """Return the failure keyword set as a five-column grid."""
+    kw = list(KEYWORDS)
+    grid = [[f"`{w}`" for w in kw[i : i + 5]] + [""] * (5 - len(kw[i : i + 5])) for i in range(0, len(kw), 5)]
+    title = f"Failure keyword set ({len(kw)} terms, case-insensitive)"
+    return table(["Terms", "", "", "", ""], grid, [FW / 5] * 5, title=title, spans=[((0, 0), (-1, 0))])
 
 
-def _story_sec10() -> list[Flowable]:
-    """Return Section 10: closed register, Figure 10, closed cards, answered unknowns, events, and record."""
-    out: list[Flowable] = [PageBreak(), HPara("sec-10"), para(CLOSED_INTRO), HPara("sub-10.1")]
-    rows = [[i, f, cl, ev, ow, f"{{p:card-{i}}}"] for i, f, cl, ev, ow in T17]
-    head = ["ID", "Finding", "Closed", "Evidence on 2026-10-02", "Owner", "Page"]
-    out += table(head, rows, [30, 150, 54, 174, 66, 38], num=17, title="Closed findings register")
-    out += [svgfig(10, "fig10_fixes"), HPara("sub-10.2")]
-    titles = {r[0]: r[1] for r in T17}
-    for d in CLOSED:
-        fid = str(d["id"])
+def _story_sec2(m: Model) -> list[Flowable]:
+    """Return Section 2: inputs, capture window, method, and severity scale."""
+    out: list[Flowable] = [CondPageBreak(240), HPara("sec-2"), HPara("sub-2.1"), *inputs_table(m), HPara("sub-2.2")]
+    out += table(
+        ["Event", "Wall clock", "Since kernel start"], capture_rows(m), [196, 176, 140], title="Capture window"
+    )
+    out += [HPara("sub-2.3"), *method_bullets(m), *keyword_table(), HPara("sub-2.4")]
+    return out + table(["Level", "Meaning"], SEVERITY_SCALE, [78, 434], title="Severity scale")
+
+
+SEVERITY_SCALE = (
+    ("HIGH", "Data loss, crashes, hardware at risk, or a broken function."),
+    ("MED", "Degraded function, a failed ry-verify check, or a kernel taint."),
+    ("LOW", "Limited or conditional impact; the action is optional or quick."),
+    ("INFO", "Explained and harmless; no action required."),
+    ("WATCH", "A limit kept under observation; not counted as a finding."),
+    ("SETTING", "A configuration choice visible in the logs; not counted."),
+    ("NOTE", "Boilerplate printed on every boot; counted in the coverage tables only."),
+)
+
+
+def capture_rows(m: Model) -> list[list[str]]:
+    """Return the capture-window rows: previous boot, kernel start, ry-verify run, and bug report."""
+    rows = []
+    prev = [e for e in m.br.journal if e.boot == "previous"]
+    if prev:
+        rows.append(
+            ["Previous boot (journal span)", f"{prev[0].when:%Y-%m-%d %H:%M:%S} → {prev[-1].when:%H:%M:%S}", "—"]
+        )
+    if m.kernel_start:
+        rows.append(
+            [
+                "Kernel start (estimate)",
+                f"{m.kernel_start[0]:%Y-%m-%d %H:%M:%S.%f}"[:-4] + f" (±{m.kernel_start[1]:.2f} s)",
+                "0 s",
+            ]
+        )
+    points = capture_points(m)
+    if m.vj.started:
+        since = f"{points['ry-verify starts']:.1f} s" if "ry-verify starts" in points else "—"
+        rows.append(["ry-verify run starts", f"{m.vj.started:%Y-%m-%d %H:%M:%S %z}", since])
+    if m.vj.finished:
+        since = f"{points['ry-verify ends']:.1f} s" if "ry-verify ends" in points else "—"
+        rows.append(["ry-verify run ends", f"{m.vj.finished:%Y-%m-%d %H:%M:%S %z}", since])
+    if m.br.captured:
+        since = f"{points['bug report']:.1f} s" if "bug report" in points else "—"
+        rows.append(["Bug report captured", m.br.date_text, since])
+    return rows
+
+
+def _story_sec3(m: Model) -> list[Flowable]:
+    """Return Section 3: health checks, the boot timeline, and ry-verify results by section."""
+    out: list[Flowable] = [CondPageBreak(260), HPara("sec-3")]
+    out += table(["Check", "Result", "Evidence"], m.health, [130, 160, 222], title="System health checks")
+    gap = (
+        f" The shaded stretch is {m.quiet_gap[1] - m.quiet_gap[0]:.2f} s without output before the root mount."
+        if m.quiet_gap
+        else ""
+    )
+    cap = f" Capture points use the kernel-start estimate (±{m.kernel_start[1]:.2f} s)." if m.kernel_start else ""
+    out += svgfig(
+        STATE_FIGS.get("boot"),
+        "Boot timeline",
+        f"dmesg lines per 0.5 s on a log scale, with the milestones the kernel logged.{gap}{cap}",
+    )
+    out += svgfig(
+        STATE_FIGS.get("verify"),
+        "ry-verify results by section",
+        "Records per section and status, static phase left and runtime right; summary lines are excluded.",
+    )
+    return out
+
+
+def _story_sec4(m: Model) -> list[Flowable]:
+    """Return Section 4: findings by area and one card per finding."""
+    out: list[Flowable] = [PageBreak(), HPara("sec-4")]
+    if not m.findings:
+        return [*out, para("No rule produced a finding.")]
+    c = severity_counts(m)
+    out.append(
+        para(
+            f"{len(m.findings)} findings, ordered by severity and first line: "
+            + ", ".join(f"{v} {k}" for k, v in c.items())
+            + "."
+        )
+    )
+    out += svgfig(
+        STATE_FIGS.get("areas"),
+        "Findings by area",
+        "Findings per area beside the journal entries they explain in both boots.",
+    )
+    return out + [card(f) for f in m.findings]
+
+
+def _story_sec5(m: Model) -> list[Flowable]:
+    """Return Section 5: identifier classes with their lines, and the chart."""
+    out: list[Flowable] = [CondPageBreak(260), HPara("sec-5")]
+    if not m.identifiers:
+        return [*out, para("Neither input carries an identifier the patterns recognise.")]
+    out.append(
+        para(
+            "Lines that tie the logs to this machine or a paired device. The report itself masks them; remove "
+            "them from copies before posting (Section 9)."
+        )
+    )
+    rows: list[list[object]] = [
+        [
+            name,
+            " · ".join(x for x in (f"BR {ranges(b)}" if b else "", f"VJ {ranges(v)}" if v else "") if x),
+            len(b) + len(v),
+        ]
+        for name, b, v in m.identifiers
+    ]
+    b_all, v_all = (sum(len(x[i]) for x in m.identifiers) for i in (1, 2))
+    rows.append(["Identifier lines in total", f"BR {b_all} · VJ {v_all}", b_all + v_all])
+    out += table(
+        ["Identifier class", "Lines", "Count"],
+        rows,
+        [172, 292, 48],
+        title="Identifier classes",
+        right=(2,),
+        bold_last=True,
+    )
+    return out + svgfig(
+        STATE_FIGS.get("identifiers"),
+        "Identifier lines by class",
+        "Lines to redact per class, bug report and ry-verify log stacked.",
+    )
+
+
+def _story_sec6(m: Model) -> list[Flowable]:
+    """Return Section 6: watch items and settings visible in the logs."""
+    out: list[Flowable] = [CondPageBreak(240), HPara("sec-6")]
+    shown = [f for f in m.others if f.severity in ("WATCH", "SETTING")]
+    if not shown:
+        return [*out, para("No watch item or setting appears in the logs.")]
+    rows = [
+        [
+            f.severity,
+            f.title,
+            f.matches[0].text if f.matches else "",
+            f.lines(),
+            f"{f.explanation} {f.action if f.action != 'None' else ''}".strip(),
+        ]
+        for f in shown
+    ]
+    return out + table(
+        ["Kind", "Item", "First line", "Lines", "Meaning"],
+        rows,
+        [52, 100, 150, 70, 140],
+        title="Watch items and settings",
+        mono=(2,),
+    )
+
+
+def _story_sec7(m: Model) -> list[Flowable]:
+    """Return Section 7: streams, cross-checks, notice families, journal attribution, and unclassified lines."""
+    out: list[Flowable] = [PageBreak(), HPara("sec-7"), HPara("sub-7.1")]
+    out += table(
+        ["Stream", "Size", "Attributed", "Unclassified"],
+        stream_rows(m),
+        [150, 90, 150, 122],
+        title="Coverage by stream",
+    )
+    out += table(["Cross-check", "Result"], cross_checks(m), [372, 140], title="Parser cross-checks")
+    out.append(HPara("sub-7.2"))
+    fams = [[name, n, sev.lower()] for name, n, sev in family_rows(m)]
+    out += table(["Family", "Lines", "Disposition"], fams, [300, 60, 152], title="dmesg lines by family", right=(1,))
+    out += svgfig(
+        STATE_FIGS.get("families"),
+        "dmesg lines by family",
+        "Lines per rule family, styled by disposition; unclassified keyword lines last.",
+    )
+    out.append(HPara("sub-7.3"))
+    rows: list[list[object]] = [[label, cur, prev] for label, cur, prev in journal_rows(m)]
+    cur_all = sum(1 for e in m.br.journal if e.boot == "current")
+    prev_all = sum(1 for e in m.br.journal if e.boot == "previous")
+    rows.append(["All journal entries", cur_all, prev_all])
+    out += table(
+        ["Finding", "Current boot", "Previous boot"],
+        rows,
+        [312, 100, 100],
+        title="Journal attribution",
+        right=(1, 2),
+        bold_last=True,
+    )
+    out += svgfig(
+        STATE_FIGS.get("journal"),
+        "Journal entries per finding",
+        "Entries per finding, current boot beside previous boot.",
+    )
+    out += svgfig(
+        STATE_FIGS.get("prevboot"),
+        "Previous boot timeline",
+        "One tick per journal entry of the previous boot, per finding.",
+    )
+    out.append(HPara("sub-7.4"))
+    if not m.unclassified:
+        return [*out, para("None: every journal entry and every keyword-matching dmesg line was attributed.")]
+    rows = [[u.stream + (f" ({u.boot})" if u.boot else ""), f"BR {u.no}", u.text] for u in m.unclassified]
+    return out + table(["Stream", "Line", "Text"], rows, [76, 46, 390], title="Unclassified lines", mono=(2,))
+
+
+def stream_rows(m: Model) -> list[list[object]]:
+    """Return per-stream sizes and how many lines rules attributed."""
+    found = [*m.findings, *m.others]
+    rows: list[list[object]] = []
+    for label, stream, boot, total in (
+        ("dmesg", "dmesg", "", len(m.br.dmesg)),
+        ("Journal, current boot", "journal", "current", sum(1 for e in m.br.journal if e.boot == "current")),
+        ("Journal, previous boot", "journal", "previous", sum(1 for e in m.br.journal if e.boot == "previous")),
+        ("inxi", "inxi", "", len(m.br.inxi)),
+    ):
+        attributed = sum(f.count(stream, boot) for f in found)
+        unc = sum(1 for u in m.unclassified if u.stream == stream and (not boot or u.boot == boot))
+        rows.append([label, f"{total:,} lines", attributed, unc])
+    rows.append(["ry-verify records", f"{len(m.vj.records):,} records", f"{len(m.vj.items)} results", "—"])
+    rows.append(["Installed packages", f"{len(m.br.packages)} packages", "versions only", "—"])
+    return rows
+
+
+def cross_checks(m: Model) -> list[list[str]]:
+    """Return checks of the parse against the inputs' own totals."""
+    out = []
+    for phase in ("static", "runtime"):
+        res = m.vj.phase_results.get(phase)
+        if res is None:
+            continue
+        counts = {k: sum(s[2][k] for s in m.verify_sections if s[0] == phase) for k in ("OK", "WARN", "FAIL")}
+        ok = (counts["OK"], counts["WARN"], counts["FAIL"]) == (res.get("ok"), res.get("warn"), res.get("fail"))
         out.append(
-            card(
-                fid,
-                titles[fid],
-                "closed",
-                d["area"],
-                d["ev"],
-                d["lines"],
-                d["rows"],
-                closed=d["closed"],
-                outline_level=2,
+            [
+                (
+                    f"ry-verify {phase} records match its VERIFY_RESULT ({res.get('ok')} OK, {res.get('warn')} WARN, "
+                    f"{res.get('fail')} FAIL)"
+                ),
+                "match" if ok else f"differs: {counts}",
+            ]
+        )
+    if m.vj.combined and m.vj.footer:
+        same = (m.vj.combined.get("ok"), m.vj.combined.get("fail")) == (
+            m.vj.footer.get("pass"),
+            m.vj.footer.get("fail"),
+        )
+        out.append(["ry-verify combined totals match the footer", "match" if same else "differs"])
+    journal = sum(f.count("journal") for f in [*m.findings, *m.others]) + sum(
+        1 for u in m.unclassified if u.stream == "journal"
+    )
+    out.append(
+        [
+            f"Every journal entry is attributed or listed ({len(m.br.journal)} entries)",
+            "match" if journal == len(m.br.journal) else f"differs: {journal}",
+        ]
+    )
+    out.append(["Sections found in the bug report", f"{len(m.br.sections)} of {len(SECTION_TITLES)}"])
+    return out
+
+
+def _story_sec8(m: Model) -> list[Flowable]:
+    """Return Section 8: ry-verify section counts and its non-OK records."""
+    out: list[Flowable] = [CondPageBreak(260), HPara("sec-8"), HPara("sub-8.1")]
+    rows: list[list[object]] = [
+        [p, section_title(s), c["OK"], c["INFO"], c["WARN"], c["FAIL"]] for p, s, c in m.verify_sections
+    ]
+    out += table(
+        ["Phase", "Section", "OK", "INFO", "WARN", "FAIL"],
+        rows,
+        [60, 212, 60, 60, 60, 60],
+        title="ry-verify sections",
+        right=(2, 3, 4, 5),
+    )
+    out.append(HPara("sub-8.2"))
+    items = [[f"VJ {i.no}", section_title(i.section), i.status, mask(i.text)] for i in m.vj.items if i.status != "OK"]
+    return out + table(
+        ["Record", "Section", "Status", "Text"],
+        items,
+        [50, 110, 44, 308],
+        title="ry-verify notes, warnings, and failures",
+        mono=(3,),
+    )
+
+
+def _story_sec9(m: Model) -> list[Flowable]:
+    """Return Section 9: commands for each action, then a checklist."""
+    out: list[Flowable] = [PageBreak(), HPara("sec-9")]
+    if not m.actions:
+        return [*out, para("The findings call for no action.")]
+    out.append(para("Commands for each action, one per line; tick the checklist as each completion test passes."))
+    for a in m.actions:
+        out.append(
+            KeepTogether(
+                [
+                    para(f"**{a.aid}** — {a.title}: {a.why}."),
+                    *code_block(f"{a.aid} COMMANDS", a.commands),
+                    para(f"Done when: {a.done_when}."),
+                ]
             )
         )
-    out += [HPara("sub-10.3"), *table(*T18, [128, 196, 110, 78], num=18, title="Unknowns answered since revision 19")]
-    out += [HPara("sub-10.4"), *table(*T19, [120, 172, 48, 172], num=19, title="Normal events in the logs")]
-    out += [HPara("sub-10.5"), para(IMPL_INTRO)]
-    return out + table(*T20, [28, 36, 142, 108, 54, 144], num=20, title="Implementation record")
 
+    def box() -> Table:
+        """Return an empty tick box."""
+        return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
 
-def _story_sec11() -> list[Flowable]:
-    """Return Section 11: commands for the open actions and unknowns, then the checklist."""
-    intro = (
-        "Commands for the three open actions and the open unknowns, one per line. "
-        "Section 11.5 is a checklist to tick as each expected result appears."
+    rows = [[box(), a.aid, a.title, a.done_when, ""] for a in m.actions]
+    return out + table(
+        ["", "ID", "Action", "Done when", "Date / initials"], rows, [18, 34, 190, 190, 80], title="Checklist"
     )
-    out: list[Flowable] = [PageBreak(), HPara("sec-11"), para(intro)]
-    for key, (lead, label, cmds, expected) in (
-        ("sub-11.1", S111),
-        ("sub-11.2", S112),
-        ("sub-11.3", S113),
-        ("sub-11.4", S114),
-    ):
-        group: list[Flowable] = [HPara(key), *([para(lead)] if lead else []), *code_block(label, cmds), para(expected)]
-        out.append(KeepTogether(group))
-    out.append(KeepTogether([HPara("sub-11.5"), *checklist()]))
-    return out
 
 
-def _story_appendices() -> list[Flowable]:
-    """Return Appendix A (environment snapshot) and Appendix B (abbreviations in two columns)."""
-    out: list[Flowable] = [CondPageBreak(320), HPara("sec-A")]
-    out += table(["Item", "Value"], TA1, [70, 442], num="A-1", title="Environment snapshot")
+def _story_appendices(m: Model) -> list[Flowable]:
+    """Return Appendix A (inxi as captured, masked) and Appendix B (rules and keywords)."""
+    out: list[Flowable] = [CondPageBreak(300), HPara("sec-A")]
+    rows = [[f"BR {n}", mask(line.rstrip())] for n, line in m.br.inxi]
+    out += table(["Line", "inxi output"], rows, [50, 462], title="Environment snapshot (inxi -Farz, masked)", mono=(1,))
     out += [CondPageBreak(200), HPara("sec-B")]
-    half = (len(TB1) + 1) // 2
-    left, right = TB1[:half], TB1[half:] + [("", "")] * (half - len(TB1[half:]))
-    rows = [[a, b, c, d] for (a, b), (c, d) in zip(left, right, strict=True)]
-    title = "Abbreviations and conventions"
-    return out + table(["Term", "Meaning", "Term", "Meaning"], rows, [50, 206, 50, 206], num="B-1", title=title)
+    rules = [[r.key, r.severity, r.area, ", ".join(r.streams), len(r.patterns)] for r in RULES]
+    return out + table(
+        ["Rule", "Severity", "Area", "Streams", "Patterns"],
+        rules,
+        [96, 52, 196, 112, 56],
+        title="Analysis rules",
+        right=(4,),
+    )
 
 
-def story() -> list[Flowable]:
-    """Return all flowables in reading order."""
-    parts = (_story_cover, _story_sec1, _story_sec2, _story_sec3, _story_sec4, _story_sec5, _story_sec6)
-    parts += (_story_sec7, _story_sec8, _story_sec9, _story_sec10, _story_sec11, _story_appendices)
-    return [flowable for part in parts for flowable in part()]
+STATE_FIGS: dict[str, str | None] = {}
+
+
+def story(m: Model) -> list[Flowable]:
+    """Return all flowables in reading order; figure and table numbers restart each pass."""
+    STATE.figures.clear()
+    STATE.tables = 0
+    parts = (
+        _story_cover,
+        _story_sec1,
+        _story_sec2,
+        _story_sec3,
+        _story_sec4,
+        _story_sec5,
+        _story_sec6,
+        _story_sec7,
+        _story_sec8,
+        _story_sec9,
+        _story_appendices,
+    )
+    return [flowable for part in parts for flowable in part(m)]
 
 
 class Doc(BaseDocTemplate):
     """US Letter document with cover and body page templates and the report metadata."""
 
-    def __init__(self, filename: str) -> None:
+    def __init__(self, filename: str, m: Model) -> None:
         """Set the metadata, frames, and page templates."""
+        when = capture_day(m)
         super().__init__(
-            filename,
-            pagesize=letter,
-            leftMargin=LM,
-            rightMargin=RM,
-            topMargin=TOPM,
-            bottomMargin=BOTM,
-            title=f"GTR9 Pro Post-Boot Log Analysis (2026-10-02), print edition, revision {REV}",
-            author="GTR9 Pro log review",
-            subject=(
-                "Findings from cachyos-bugreport.log, the ry-verify 7.219.0 JSONL and the gtr9-postboot-fix log "
-                "of 2026-10-02; open and closed items kept apart"
-            ),
-            keywords=(
-                "CachyOS, GTR9 Pro, Strix Halo, ry-verify, gtr9-postboot-fix, dmesg, journal, log analysis, "
-                "print edition"
-            ),
+            filename, pagesize=letter, leftMargin=LM, rightMargin=RM, topMargin=TOPM, bottomMargin=BOTM,
+            title=f"Post-Boot Log Analysis ({when}), print edition",
+            author="build_report.py",
+            subject=f"Findings from {m.br.path.name} and {m.vj.path.name}",
+            keywords="CachyOS, cachyos-bugreport, ry-verify, dmesg, journal, log analysis, print edition",
             creator=f"build_report.py {__version__} (ReportLab)",
-        )
+        )  # fmt: skip
         pad = {"leftPadding": 0, "rightPadding": 0, "topPadding": 0, "bottomPadding": 0}
         body = Frame(LM, BOTM, FW, PH - TOPM - BOTM, id="f", **pad)
         cover = Frame(LM, BOTM, FW, PH - 44 - BOTM, id="fc", **pad)
@@ -3196,27 +2754,35 @@ class Doc(BaseDocTemplate):
             STATE.h1pos.setdefault(self.page, (heading, (top - frame._y) < HEADING_TOP_BAND))
 
 
+def capture_day(m: Model) -> str:
+    """Return the capture date (bug report first, then ry-verify) as YYYY-MM-DD."""
+    if m.br.captured:
+        return f"{m.br.captured:%Y-%m-%d}"
+    return f"{m.vj.started:%Y-%m-%d}" if m.vj.started else "undated"
+
+
 def footer(canvas: Canvas, doc: BaseDocTemplate) -> None:
-    """Draw the footer rule with revision and issue date, edition, and page X of Y."""
+    """Draw the footer rule with generator and capture date, edition, and page X of Y."""
+    m = model()
     canvas.setStrokeColor(RULE)
     canvas.setLineWidth(0.4)
     canvas.line(LM, 40, PW - RM, 40)
     canvas.setFont("Plex", 7)
     canvas.setFillColor(MUTE)
-    canvas.drawString(LM, 29, f"Revision {REV} · issued {ISSUED} · captures of {CAP}")
+    canvas.drawString(LM, 29, f"build_report.py {__version__} · captured {capture_day(m)}")
     canvas.drawCentredString(PW / 2, 29, "Print edition")
     canvas.drawRightString(PW - RM, 29, f"Page {doc.page} of {STATE.total or '?'}")
 
 
 def on_cover(canvas: Canvas, doc: BaseDocTemplate) -> None:
-    """Decorate the cover: black band with edition and revision, plus the footer."""
+    """Decorate the cover: black band with the edition and capture date, plus the footer."""
     canvas.saveState()
     canvas.setFillColor(INK)
     canvas.rect(0, PH - 30, PW, 30, stroke=0, fill=1)
     canvas.setFillColor(colors.white)
     canvas.setFont("Plex-SB", 7.8)
-    canvas.drawString(LM, PH - 19, "SYSTEM LOG ANALYSIS REPORT · PRINT EDITION")
-    canvas.drawRightString(PW - RM, PH - 19, f"REVISION {REV} · CAPTURES OF {CAP}")
+    canvas.drawString(LM, PH - 19, "POST-BOOT LOG ANALYSIS · PRINT EDITION")
+    canvas.drawRightString(PW - RM, PH - 19, f"CAPTURED {capture_day(model())}")
     footer(canvas, doc)
     canvas.restoreState()
 
@@ -3226,7 +2792,7 @@ def on_body(canvas: Canvas, doc: BaseDocTemplate) -> None:
     canvas.saveState()
     canvas.setFont("Plex", 7)
     canvas.setFillColor(MUTE)
-    canvas.drawString(LM, PH - 34, "GTR9 Pro Post-Boot Log Analysis · captures of 2026-10-02")
+    canvas.drawString(LM, PH - 34, f"Post-Boot Log Analysis · {model().facts.get('machine', 'unknown machine')}")
     canvas.setFont("Plex-SB", 7)
     canvas.setFillColor(INK)
     canvas.drawRightString(PW - RM, PH - 34, STATE.page_section.get(doc.page, "Contents"))
@@ -3238,88 +2804,6 @@ def on_body(canvas: Canvas, doc: BaseDocTemplate) -> None:
 
 
 # ── BUILD ─────────────────────────────────────────────────────────────
-ISSUED_EPOCH = int(dt.datetime.fromisoformat(f"{ISSUED}T00:00:00+00:00").timestamp())
-
-
-def content_checks() -> dict[str, bool]:
-    """Return the cross-checks between counts the report states in more than one place."""
-    open_rows = [r for r in T8 if r[1] == "INFO"]
-    kpi_open, kpi_closed = dict(KPI_OPEN), dict(KPI_CLOSED)
-    t1 = {r[0]: r for r in T1[1]}
-    br, vj = sum(r[1] for r in FIG_IDENT), sum(r[2] for r in FIG_IDENT)
-    _ids, r19, cur, prev = journal_series()
-    t17_closed = {r[0]: r[2] for r in T17}
-    return {
-        "INFO cards follow the register": [d["id"] for d in INFO] == [r[0] for r in open_rows],
-        "closed cards follow Table 17": [d["id"] for d in CLOSED] == [r[0] for r in T17],
-        "open counts match Tables 8, 10, and 16": (
-            kpi_open["LOW"],
-            kpi_open["INFO"],
-            kpi_open["WATCH"],
-            kpi_open["UNKNOWNS"],
-        )
-        == (sum(r[1] == "LOW" for r in T8), len(open_rows), len(T10[1]), len(T16[1])),
-        "closed counts match Tables 17 to 19": (kpi_closed["LOW"], kpi_closed["UNKNOWNS"], kpi_closed["EVENTS"])
-        == (len(T17), len(T18[1]), len(T19[1])),
-        "Table 9 rows sum to its total": sum(int(r[2]) for r in T9[:-1]) == int(T9[-1][2]),
-        "Figure 6 matches Table 9": sorted(b + v for _, b, v in FIG_IDENT) == sorted(int(r[2]) for r in T9[:-1])
-        and T9[-1][1] == f"BR {br} · VJ {vj}",
-        "Figure 7 matches Table 13": {(r[0], r[1]) for r in FIG_FAMILIES} == {(r[0], int(r[1])) for r in T13[1]},
-        "Figure 8 matches Table 1": (str(sum(r19)), str(sum(cur))) == tuple(t1["Journal entries, current boot"][1:3])
-        and t1["Journal entries, previous boot"][2].startswith(f"{sum(prev)} "),
-        "Figure 10 matches Table 17": all(t17_closed.get(fid) == closed for fid, _, closed, _ in FIG_FIXES if closed),
-        "Figure 1 matches the counts and Table 10": len(BOARD_WATCH) == len(T10[1])
-        and set(BOARD_NEW) <= {r[0] for r in open_rows}
-        and f"{BOARD_NEW[0]} to {BOARD_NEW[-1]}" in INFO_INTRO
-        and len(open_rows) <= 20,  # the board grid holds two rows of ten
-        "cover tiles match Tables 1 and 7": health_checks(t1),
-        "prose counts match Tables 8 and 9": f"{br + vj} lines" in EXEC_INTRO[1]
-        and f"{len(open_rows)} INFO findings" in VERDICT_BODY
-        and f"{br} bug-report and {vj} JSONL lines" in T2[1][0][2]
-        and f"{br} bug-report and {vj} JSONL lines" in dict(L3["rows"])["Status"],
-        "Figure 4 matches Table 7": T7[1][0][2].startswith(
-            f"{sum(r[1] for r in FIG_VERIFY_STATIC) + sum(r[1] for r in FIG_VERIFY_RUNTIME)} OK = "
-            f"{sum(r[1] for r in FIG_VERIFY_STATIC)} static + {sum(r[1] for r in FIG_VERIFY_RUNTIME)} runtime; "
-            f"{len(T14[1])} INFO notes"
-        ),
-        "abbreviations are sorted": [a.lower() for a, _ in TB1] == sorted(a.lower() for a, _ in TB1),
-        "every figure has a caption and a title": sorted(CAPTIONS) == list(range(1, len(FIGURE_TITLES) + 1)),
-    }
-
-
-def health_checks(t1: Mapping[str, Sequence[str]]) -> bool:
-    """Return True when the cover's health tiles restate Tables 1 and 7 correctly."""
-    tile = {k: (v, sub) for k, v, sub in HEALTH}
-    t7 = {r[0]: r for r in T7[1]}
-    mes = re.search(r"MES (0x[0-9A-Fa-f]+)", t7["amdgpu firmware"][2])
-    return all(
-        (
-            tile["RY-VERIFY 7.219.0"][0] in t7["ry-verify 7.219.0"][2],
-            tile["BOOT TO ROOT MOUNT"][0] == t1["Root mounted"][2]
-            and t1["Root mounted"][3] in tile["BOOT TO ROOT MOUNT"][1],
-            re.findall(r"\d+", tile["FAILED UNITS"][0]) == re.findall(r"\d+", t7["Failed units"][1]),
-            tile["KERNEL RING"][1].lower() == t7["Kernel ring buffer"][1].lower(),
-            tile["NVME (P310 2 TB)"][0] in t7["NVMe (Crucial P310 2 TB)"][1]
-            and all(
-                part in " ".join(t7["NVMe (Crucial P310 2 TB)"][1:])
-                for part in tile["NVME (P310 2 TB)"][1].split(" · ")
-            ),
-            mes is not None and int(tile["GPU FIRMWARE"][0].split()[-1], 16) == int(mes.group(1), 16),
-            tile["GPU FIRMWARE"][1].split(" · ")[1] in t7["amdgpu firmware"][2],
-        )
-    )
-
-
-def validate_content() -> int:
-    """Run the content cross-checks; return how many ran, or raise ValueError naming every failure."""
-    checks = content_checks()
-    failed = [name for name, ok in checks.items() if not ok]
-    if failed:
-        msg = "content cross-check failed: " + "; ".join(failed)
-        raise ValueError(msg)
-    return len(checks)
-
-
 def register_fonts(font_dir: Path) -> None:
     """Register the IBM Plex faces; make them the defaults for the page, plain table cells, and drawings."""
     for name, stem in FONT_FILES.items():
@@ -3344,18 +2828,44 @@ def page_sections(total: int) -> dict[int, str]:
     return sections
 
 
-def layout(path: Path, log: Callable[[str], None]) -> None:
+def render_figures(m: Model) -> int:
+    """Render every figure the model supports; return how many were drawn."""
+    STATE_FIGS.clear()
+    for key, draw in (
+        ("boot", fig_boot),
+        ("verify", fig_verify),
+        ("areas", fig_areas),
+        ("identifiers", fig_identifiers),
+        ("families", fig_families),
+        ("journal", fig_journal),
+        ("prevboot", fig_prevboot),
+    ):
+        STATE_FIGS[key] = draw(m)
+    return sum(1 for v in STATE_FIGS.values() if v)
+
+
+def layout(path: Path, m: Model, log: Callable[[str], None]) -> None:
     """Lay the story out until anchors, page count, and headers repeat; raise on drift or unresolved references."""
     for n in range(1, MAX_PASSES + 1):
         STATE.anchors.clear()
         STATE.h1pos.clear()
         STATE.unresolved.clear()
-        doc = Doc(str(path))
-        doc.build(story())
+        doc = Doc(str(path), m)
+        doc.build(story(m))
         total = doc.page
         sections = page_sections(total)
-        stable = STATE.anchors == STATE.ref and total == STATE.total and sections == STATE.page_section
-        STATE.ref, STATE.total, STATE.page_section = dict(STATE.anchors), total, sections
+        stable = (
+            STATE.anchors == STATE.ref
+            and total == STATE.total
+            and sections == STATE.page_section
+            and STATE.figures == STATE.fig_ref
+        )
+        STATE.ref, STATE.total, STATE.page_section, STATE.fig_ref = (
+            dict(STATE.anchors),
+            total,
+            sections,
+            list(STATE.figures),
+        )
         log(f"pass {n}: pages={total} anchors={len(STATE.anchors)} stable={stable}")
         if stable and n > 1:
             break
@@ -3367,8 +2877,15 @@ def layout(path: Path, log: Callable[[str], None]) -> None:
         raise RuntimeError(msg)
 
 
-def build(out: Path, font_dir: Path, asset_dir: Path, *, verbose: bool = False) -> int:
-    """Check the content, render the figures, lay out the report, and write the PDF atomically; return pages."""
+def source_epoch(m: Model) -> int:
+    """Return the embedded PDF date: the capture time (treated as UTC), else the ry-verify start, else 0."""
+    if m.br.captured:
+        return int(m.br.captured.replace(tzinfo=dt.UTC).timestamp())
+    return int(m.vj.started.timestamp()) if m.vj.started else 0
+
+
+def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) -> Path:
+    """Parse and analyse the inputs, render the figures, lay out the report, and write the PDF atomically."""
 
     def log(message: str) -> None:
         """Report a build step on stderr when verbose; stop logging if stderr's reader goes away."""
@@ -3380,25 +2897,29 @@ def build(out: Path, font_dir: Path, asset_dir: Path, *, verbose: bool = False) 
                 verbose = False
                 silence(sys.stderr)
 
-    log(f"{validate_content()} content checks passed")
-    os.environ.setdefault("SOURCE_DATE_EPOCH", str(ISSUED_EPOCH))
-    STATE.font_dir, STATE.asset_dir = font_dir, asset_dir
+    br, vj = parse_bugreport(args.bugreport), parse_verify(args.verify)
+    log(
+        f"bug report: {len(br.lines)} lines, {len(br.dmesg)} dmesg, {len(br.journal)} journal; ry-verify: "
+        f"{len(vj.records)} records"
+    )
+    m = analyze(br, vj)
+    STATE.model = m
+    log(f"analysis: {len(m.findings)} findings, {len(m.others)} other matches, {len(m.unclassified)} unclassified")
+    os.environ.setdefault("SOURCE_DATE_EPOCH", str(source_epoch(m)))
+    STATE.font_dir = font_dir
     register_fonts(font_dir)
-    log(f"fonts {font_dir}; assets {asset_dir}")
-    out = out.resolve()
+    out = (args.out or Path(f"post-boot-log-analysis-{capture_day(m)}.pdf")).resolve()
     tmp = out.with_name(f".{out.name}.tmp-{os.getpid()}")
     try:
-        with tempfile.TemporaryDirectory(prefix="gtr9-report-") as tmp_dir:
+        with tempfile.TemporaryDirectory(prefix="postboot-report-") as tmp_dir:
             STATE.chart_dir = Path(tmp_dir)
-            for draw in FIGURES:
-                draw()
-            log(f"{len(FIGURES)} figures rendered")
-            layout(tmp, log)
+            log(f"{render_figures(m)} figures rendered")
+            layout(tmp, m, log)
         tmp.replace(out)
     finally:
         tmp.unlink(missing_ok=True)
     log(f"wrote {out} ({STATE.total} pages, {out.stat().st_size} bytes)")
-    return STATE.total
+    return out
 
 
 def silence(stream: TextIO) -> None:
@@ -3412,7 +2933,7 @@ def main(argv: list[str] | None = None) -> int:
     """Validate the arguments and the environment, then run; Ctrl-C at any point exits 130."""
     parser = build_parser()
     args = _ARGS if argv is None and _ARGS is not None else parser.parse_args(argv)
-    if args.out.is_dir():
+    if args.out is not None and args.out.is_dir():
         parser.error(f"--out names a directory: {args.out}")
     epoch = os.environ.get("SOURCE_DATE_EPOCH")
     if epoch is not None and not epoch.strip().isdigit():
@@ -3425,22 +2946,28 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
-    """Run the preflight and the build; the written path goes to stdout."""
+    """Run the preflight, then the check or the build; the written path goes to stdout."""
     try:
-        font_dir, asset_dir = preflight(args.fonts, args.assets)
+        font_dir = preflight(args.fonts, (args.bugreport, args.verify))
     except PreflightError as exc:
         print(f"build_report.py: {exc}", file=sys.stderr)
         return EXIT_PREFLIGHT
-    if args.check:
-        print(f"build_report.py: preflight ok (fonts {font_dir}, assets {asset_dir})", file=sys.stderr)
-        return EXIT_OK
     try:
-        build(args.out, font_dir, asset_dir, verbose=args.verbose)
-    except (OSError, ValueError, RuntimeError, LayoutError) as exc:
+        if args.check:
+            br, vj = parse_bugreport(args.bugreport), parse_verify(args.verify)
+            print(
+                f"build_report.py: inputs ok ({len(br.sections)} bug-report sections, {len(br.dmesg)} dmesg lines, "
+                f"{len(br.journal)} journal entries; ry-verify {vj.header.get('version')} with {len(vj.items)} "
+                "results)",
+                file=sys.stderr,
+            )
+            return EXIT_OK
+        out = build(args, font_dir, verbose=args.verbose)
+    except (OSError, ValueError, RuntimeError, LayoutError, InputError) as exc:
         print(f"build_report.py: build failed: {exc}", file=sys.stderr)
         return EXIT_FAIL
     try:
-        print(args.out.resolve(), flush=True)
+        print(out, flush=True)
     except BrokenPipeError:  # the PDF is written; a closed stdout only loses the path line
         silence(sys.stdout)
     return EXIT_OK

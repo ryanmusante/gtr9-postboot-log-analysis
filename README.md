@@ -1,75 +1,75 @@
 # gtr9-postboot-log-analysis
 
-**Version 5.0.0** · [Changelog](CHANGELOG.md)
+**Version 6.0.0** · [Changelog](CHANGELOG.md)
 
-The GTR9 Pro post-boot log analysis — revision 32, covering the CachyOS captures of 2026-10-02 — as a 27-page print-edition PDF, with the script that builds it. `build_report.py` holds the report text and tables, draws seven vector figures with matplotlib, adds two raster figures from `assets/`, and lays out the pages with ReportLab.
+Analyses a `cachyos-bugreport.log` and a ry-verify JSONL log and writes a print-edition PDF: findings with their evidence, system health, identifiers to redact before posting, coverage of every journal entry, ry-verify results, and the commands each finding calls for. Every number, line reference, table row, figure, and finding comes from the two inputs on each run; the script holds only analysis rules.
 
 ## Quick Start
 
 ```fish
 sudo pacman -S --needed python-reportlab python-matplotlib python-svglib python-pillow ttf-ibm-plex
-chmod +x build_report.py
-./build_report.py
+sudo cachyos-bugreport.sh
+~/ry-install/ry-verify.fish --verify
+./build_report.py --bugreport cachyos-bugreport.log --verify (ls -t ~/ry-install/logs/*/verify-*.jsonl | head -n 1)
 ```
 
-The PDF is written to `gtr9-postboot-log-analysis-2026-10-02-print.pdf` in the current directory, and its absolute path is printed on stdout. Instead of the Python packages, `uv run build_report.py` installs the dependencies listed at the top of the script; the fonts still come from `ttf-ibm-plex`.
+`cachyos-bugreport.sh` must run as root, writes `cachyos-bugreport.log` to the current directory, and then offers to upload it; answer no. The PDF lands in the current directory as `post-boot-log-analysis-<capture date>.pdf`, and its absolute path is printed on stdout. Instead of the Python packages, `uv run build_report.py …` installs the dependencies listed at the top of the script; the fonts still come from `ttf-ibm-plex`.
+
+## Inputs
+
+- `--bugreport PATH` — required; the log `cachyos-bugreport.sh` (CachyOS-Settings) writes, with its header, inxi, dmesg, both journal boots, and package list
+- `--verify PATH` — required; a ry-verify JSONL log, `verify-*.jsonl` or the `report-*.jsonl` that `--report` writes, under `~/ry-install/logs/<date>/`
 
 ## Usage
 
-- `--out PATH` — output PDF; default `./gtr9-postboot-log-analysis-2026-10-02-print.pdf`
+- `--out PATH` — output PDF; default `./post-boot-log-analysis-<capture date>.pdf`
 - `--fonts DIR` — directory with the 9 IBM Plex TTF files; default search `/usr/share/fonts/TTF`, `/usr/share/fonts/truetype/ibm-plex`, `~/.local/share/fonts`
-- `--assets DIR` — directory with `fig03_dmesg.png` and `fig09_prevboot.png`; default `assets/` beside the script
-- `--check` — run the preflight only and build nothing
-- `--verbose` — report the content checks, fonts, figures, each layout pass, and the result on stderr
+- `--check` — run the preflight and parse both inputs, then stop
+- `--verbose` — report the parse, the analysis, each layout pass, and the result on stderr
 - `--version`, `--help` — version and usage; both work before the Python dependencies are loaded
 
 ## Exit Codes
 
-- `0` — built, or the preflight passed under `--check`
-- `1` — build failed: a content cross-check, an unsettled layout, an unresolved page reference, or an unwritable output path
-- `2` — usage error: an unknown option, `--out` naming a directory, or a `SOURCE_DATE_EPOCH` that is not a whole number
-- `3` — preflight failed: a Python module, font file, or asset is missing; the message names the package
+- `0` — built, or the inputs parsed under `--check`
+- `1` — build failed: an input in the wrong format, an unsettled layout, an unresolved page reference, or an unwritable output path
+- `2` — usage error: a missing `--bugreport` or `--verify`, an unknown option, `--out` naming a directory, or a `SOURCE_DATE_EPOCH` that is not a whole number
+- `3` — preflight failed: a Python module, a font file, or an input file is missing or unreadable
 - `130` — interrupted with Ctrl-C; nothing is written
 
-## Output
+## The Report
 
-- **Pages** — 27 US Letter pages: cover dashboard, contents, Sections 1–11, and Appendices A and B.
-- **Type** — IBM Plex Sans, Sans Condensed, and Mono; all 9 faces are embedded.
-- **Print** — pure grayscale; figures tell series apart by gray level, outline, and marker shape.
-- **Navigation** — 57 bookmarks and 138 internal links from the contents, page references, and finding cards.
-- **Reproducible** — the same inputs, fonts, and library versions give a byte-identical PDF, dated by the issue date (2026-10-04) unless `SOURCE_DATE_EPOCH` is set.
-- **Safe writes** — the PDF goes to a temporary file beside the target and is renamed into place; a failed or interrupted build leaves nothing behind.
+- **Cover** — verdict, counts (findings by severity, watch items, identifier lines, unclassified lines, ry-verify FAIL and WARN), health tiles, and document control with both inputs' SHA256.
+- **Sections** — summary with the findings register and actions; inputs and method; system health with the boot timeline and ry-verify results by section; one card per finding; identifiers; watch items and settings; coverage; ry-verify details; actions with commands and a checklist.
+- **Appendices** — the inxi block as captured, masked, and the rule catalogue.
+- **Evidence** — quotes keep their line numbers (BR for the bug report, VJ for the ry-verify log), and identifiers in them are replaced by placeholders such as `[root UUID]` and `[serial]`.
 
 ## How It Works
 
-- **Content** — report text, tables, finding cards, and captions are constants in the CONTENT section of `build_report.py`.
-- **Checks** — before any layout, cross-checks compare the counts the report states more than once: register and cards, cover and tables, figures and tables, prose and tables. Every table must also fill the page width. Any mismatch fails the build.
-- **Figures** — matplotlib draws seven charts with text as paths, and svglib embeds them as vector drawings; Figures 1, 5, and 8 are computed from the tables. Figures 3 and 9 are the revision-28 images in `assets/`, because their per-line data is not in the report.
-- **Layout** — ReportLab repeats the layout until page references, contents, and running headers stop changing: two passes in practice, six at most.
+- **Parsing** — the bug report is split at the separator lines `cachyos-bugreport.sh` writes; dmesg, both journal boots, inxi, and the package list are read line by line. The ry-verify log yields its header, footer, phases, sections, and every OK, INFO, WARN, and FAIL record.
+- **Rules** — each rule names a message class: where it appears, the patterns that recognise it, its severity, what it means, and what to do. The first matching rule claims a line. A ry-verify OK record that shows a finding's mitigation lowers it to INFO and is cited.
+- **Coverage** — every journal entry is attributed to a rule or listed as unclassified; dmesg lines that match the failure keywords but no rule are listed too.
+- **Cross-checks** — ry-verify's per-phase counts are reconciled with its own result records, and its combined totals with its footer.
+- **Reproducible** — the same inputs, fonts, and library versions give a byte-identical PDF, dated by the capture time unless `SOURCE_DATE_EPOCH` is set.
 
-## Editing
+## Adding Rules
 
-- Change text in the CONTENT section, then rebuild; page references and the contents follow.
-- For a new revision, raise `REV` and set `ISSUED`, which is also the embedded PDF date.
-- Figure data sits in the FIGURES section beside the function that draws it; a check names any table it no longer matches.
+Add an entry to `RULES`: key, title, area, severity (HIGH, MED, LOW, INFO, WATCH, SETTING, or NOTE), streams, patterns, explanation, and action. Optional fields limit a rule to the previous boot's shutdown window, to certain processes, to hardware named in the bug report, or let a ry-verify record mark it mitigated. The unclassified lines in Section 7.4 show what no rule covers yet.
 
 ## Verify
 
 ```fish
-./build_report.py --check
-./build_report.py --out /tmp/a.pdf; and cmp /tmp/a.pdf gtr9-postboot-log-analysis-2026-10-02-print.pdf; and echo matches
-pdfinfo /tmp/a.pdf
+./build_report.py --bugreport cachyos-bugreport.log --verify verify.jsonl --check
+./build_report.py --bugreport cachyos-bugreport.log --verify verify.jsonl --out /tmp/a.pdf
+./build_report.py --bugreport cachyos-bugreport.log --verify verify.jsonl --out /tmp/b.pdf; and cmp /tmp/a.pdf /tmp/b.pdf; and echo reproducible
 pdffonts /tmp/a.pdf
-qpdf --check /tmp/a.pdf
 ruff check build_report.py; and ruff format --check build_report.py; and ty check build_report.py
 ```
 
-The `cmp` line matches only with the library versions listed under Requirements. `pdfinfo` reports 27 pages and revision 32 in the title, and every `pdffonts` row reads `emb yes`. `pdfinfo` and `pdffonts` come from `poppler`, `qpdf` from `qpdf`; `ruff` reads `ruff.toml`.
+Every `pdffonts` row reads `emb yes`. `pdffonts` comes from `poppler`; `ruff` reads `ruff.toml`, and `ty` needs no settings.
 
 ## Files
 
-- `build_report.py` — content, figures, layout, checks, and command line in one script
-- `assets/fig03_dmesg.png`, `assets/fig09_prevboot.png` — Figures 3 and 9
+- `build_report.py` — parsing, rules, analysis, figures, layout, and command line in one script
 - `ruff.toml` — lint and format settings
 - `CHANGELOG.md`, `LICENSE`
 
@@ -78,6 +78,7 @@ The `cmp` line matches only with the library versions listed under Requirements.
 - Python 3.12 or newer; tested on 3.14.7
 - ReportLab 5.0.1, matplotlib 3.11.2, svglib 2.2.0, and Pillow 12.3.0 as tested; the script requires at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12
 - IBM Plex 6.4.0 TTF files (`ttf-ibm-plex`)
+- Inputs from `cachyos-bugreport.sh` (CachyOS-Settings, script of 2026-10-04 as tested) and ry-verify 7.226.0 as tested
 - To lint: ruff 0.16 and ty 0.0.84 as tested
 
 ## License
