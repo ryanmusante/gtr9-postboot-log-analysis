@@ -68,7 +68,6 @@ The `cmp` line matches only with the library versions listed under Requirements.
 
 ## Files
 
-- `gtr9-postboot-log-analysis-2026-10-02-print.pdf` — the report built by this version, revision 32
 - `build_report.py` — content, figures, layout, checks, and command line in one script
 - `assets/fig03_dmesg.png`, `assets/fig09_prevboot.png` — Figures 3 and 9
 - `ruff.toml` — lint and format settings
