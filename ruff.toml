@@ -1,9 +1,13 @@
-# Lint and format settings for build_report.py: `ruff check build_report.py`, `ruff format build_report.py`.
+# Lint and format settings for build_report.py:
+# `ruff check build_report.py`, `ruff format build_report.py`.
 line-length = 120
 target-version = "py312"
 
 [lint]
-select = ["E", "W", "F", "I", "B", "UP", "N", "D", "ANN", "ARG", "C4", "SIM", "RUF", "PTH", "FBT", "EM", "S", "PL", "RET", "PIE", "ISC"]
+select = [
+    "E", "W", "F", "I", "B", "UP", "N", "D", "ANN", "ARG", "C4", "SIM", "RUF", "PTH", "FBT",
+    "EM", "S", "PL", "RET", "PIE", "ISC",
+]
 ignore = [
     "D203",     # docstring layout follows D211 (no blank line before a class docstring)
     "D213",     # and D212 (summary on the first line)
@@ -12,9 +16,14 @@ ignore = [
     "RUF001",   # the report text uses typographic dashes, minus signs, and multiplication signs
     "ISC001",   # single-line implicit concatenation is the formatter's call
 ]
+# Left out of `select` on purpose; with the ignores above, `ruff check --select ALL` adds only
+# COM812 (trailing commas are the formatter's call), T201 (print is the command-line output),
+# SLF001 (ReportLab frame internals in the page callbacks), and DTZ001 and DTZ007 (journal and
+# capture times are naive wall-clock, as the logs print them).
 
 [lint.per-file-ignores]
-"build_report.py" = ["E402"]  # ReportLab loads after the early argument parse, so --help works without it
+# ReportLab loads after the early argument parse, so --help works without it
+"build_report.py" = ["E402"]
 
 [lint.pylint]
 # the table and card builders take one keyword per layout option
