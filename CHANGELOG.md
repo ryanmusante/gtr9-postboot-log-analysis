@@ -28,6 +28,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - actions: one rg check per identifier class in Section 5, IPv4 and
     email included; file and unit names are quoted for fish, not POSIX sh
   - cli: Ctrl-C during start-up exits 130 without a Python traceback
+  - docs: Quick Start runs chmod +x first and finds the newest ry-verify log
+    with fish's path sort; ls -t fails where ls is CachyOS's eza alias
 
 
 6.1.0

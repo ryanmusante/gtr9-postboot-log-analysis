@@ -8,12 +8,13 @@ Analyzes a `cachyos-bugreport.log` and a ry-verify JSONL log and writes a print-
 
 ```fish
 sudo pacman -S --needed python-reportlab python-matplotlib python-svglib python-pillow ttf-ibm-plex
+chmod +x build_report.py
 sudo cachyos-bugreport.sh
 ~/ry-install/ry-verify.fish --verify
-./build_report.py --bugreport cachyos-bugreport.log --verify (ls -t ~/ry-install/logs/*/verify-*.jsonl | head -n 1)
+./build_report.py --bugreport cachyos-bugreport.log --verify (path sort ~/ry-install/logs/*/verify-*.jsonl)[-1]
 ```
 
-`cachyos-bugreport.sh` must run as root, writes `cachyos-bugreport.log` to the current directory, and then offers to upload it; answer no. The PDF lands in the current directory as `post-boot-log-analysis-<capture date>.pdf`, a later run on the same capture overwrites it, and its absolute path is printed on stdout. Instead of the Python packages, `uv run build_report.py …` installs the dependencies listed at the top of the script; the fonts still come from `ttf-ibm-plex`.
+Run the steps in the directory that holds `build_report.py`. `chmod +x` restores the executable bit that a download or a copy can drop; without it fish answers "exists but is not an executable file". `cachyos-bugreport.sh` must run as root, writes `cachyos-bugreport.log` to the current directory, and then offers to upload it; answer no. `path sort` picks the newest ry-verify log by its timestamped name; `ls -t` does not work there, because CachyOS's fish config makes `ls` an alias for `eza`, which reads `-t` as `--time`. The PDF lands in the current directory as `post-boot-log-analysis-<capture date>.pdf`, a later run on the same capture overwrites it, and its absolute path is printed on stdout. Instead of the Python packages, `uv run build_report.py …` (pacman: `uv`) installs the dependencies listed at the top of the script and needs no executable bit; the fonts still come from `ttf-ibm-plex`.
 
 ## Inputs
 
