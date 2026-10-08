@@ -68,6 +68,7 @@ FONT_FILES = {
 # reportlab is imported at start-up; the preflight covers the modules loaded later
 MODULES = {"matplotlib": "python-matplotlib", "svglib": "python-svglib", "PIL": "python-pillow"}
 MAX_PASSES = 6  # layout passes allowed before the page references must have settled
+EPOCH_MAX = 253402300799  # 9999-12-31 23:59:59 UTC, the last second a PDF date can hold
 HEADING_TOP_BAND = 70.0  # pt below the frame top within which a section heading opens its page
 
 
@@ -97,10 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Ctrl-C during start-up ends the process quietly (nothing is written yet); main() restores KeyboardInterrupt.
-signal.signal(signal.SIGINT, signal.SIG_DFL)
-# Parse before importing ReportLab, so --help, --version, and usage errors work without the dependencies.
-_ARGS = build_parser().parse_args() if __name__ == "__main__" else None
+_ARGS: argparse.Namespace | None = None
+if __name__ == "__main__":
+    # Ctrl-C during start-up ends the process quietly (nothing is written yet); main() restores KeyboardInterrupt.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    # Parse before importing ReportLab, so --help, --version, and usage errors work without the dependencies.
+    _ARGS = build_parser().parse_args()
 
 try:
     from reportlab import rl_config
@@ -305,7 +308,7 @@ class VerifyLog:
         """
         keys = ("ok", "fail", "warn", "gen_fail")
         if self.footer:
-            return {k: int(self.footer.get("pass" if k == "ok" else k, 0)) for k in keys}
+            return {k: self.footer.get("pass" if k == "ok" else k, 0) for k in keys}  # integers, checked on parse
         if self.combined:
             return {k: self.combined.get(k, 0) for k in keys}
         if self.phase_results:
@@ -314,15 +317,19 @@ class VerifyLog:
 
     @property
     def status(self) -> tuple[str, str]:
-        """Return the run's verdict and exit text: (PASS, exit 0), (FAIL, exit N), or (unknown, no footer)."""
+        """Return the run's verdict and exit text: (PASS, exit 0), (FAIL, exit N), or unknown without a footer."""
         if not self.footer:
             return "unknown", "no footer"
         code = self.footer.get("exit_code")
+        if code is None:
+            return "unknown", "no exit code"
         return ("PASS" if code == 0 else "FAIL"), f"exit {code}"
 
 
-def parse_iso(text: str) -> dt.datetime | None:
-    """Return a datetime from ry-verify's ISO stamp (YYYY-MM-DDTHH:MM:SS.fff±hhmm), or None."""
+def parse_iso(text: object) -> dt.datetime | None:
+    """Return a datetime from ry-verify's ISO stamp (YYYY-MM-DDTHH:MM:SS.fff±hhmm), or None for anything else."""
+    if not isinstance(text, str):
+        return None
     try:
         return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%f%z")
     except ValueError:
@@ -355,13 +362,29 @@ def section_slice(lines: Sequence[str], sections: dict[str, tuple[int, int]], na
     return [(n, lines[n - 1]) for n in range(first, last + 1)]
 
 
+CAPTURE_FORMATS = (  # glibc's `date` layouts in the C and English locales, once the zone and commas are dropped
+    "%a %b %d %H:%M:%S %Y",  # C, POSIX
+    "%a %b %d %I:%M:%S %p %Y",  # en_US
+    "%a %d %b %H:%M:%S %Y",  # en_GB, en_AG, en_SC, en_ZM
+    "%a %d %b %Y %H:%M:%S",  # en_AU, en_BW, en_IE, en_IL, en_NG, en_NZ, en_ZA, en_ZW
+    "%a %d %b %Y %I:%M:%S %p",  # en_CA, en_SG
+    "%A %d %B %Y %I:%M:%S %p",  # en_IN, en_PH
+    "%A %B %d %Y %p%I:%M:%S",  # en_HK
+    "%Y-%m-%dT%H:%M:%S",  # en_DK, en_SE
+)
+ZONE_WORD = re.compile(r"[A-Z]{3,5}|[+-]\d{2}(?::?\d{2})?|UTC[+-]?\d*")  # BST, AEDT, +04, +0545, -03:00
+
+
 def parse_capture_date(text: str) -> dt.datetime | None:
-    """Return the capture time from the report's `date` line (C or en_US locale), or None."""
-    cleaned = " ".join(w for w in text.split() if not re.fullmatch(r"[A-Z]{3,5}|[+-]\d{4}|UTC[+-]?\d*", w))
-    formats = ("%a %b %d %H:%M:%S %Y", "%a %b %d %I:%M:%S %p %Y", "%a %d %b %Y %H:%M:%S", "%a %d %b %Y %I:%M:%S %p")
-    for layout_ in formats:
+    """Return the capture time from the report's `date` line, or None when no English layout fits.
+
+    The zone is dropped, as a word or as an offset after the time: journal times are local wall-clock too.
+    """
+    text = re.sub(r"(?<=:\d\d)[+-]\d\d(?::?\d\d)?\b", "", text.replace(",", " "))
+    cleaned = " ".join(w for w in text.split() if not ZONE_WORD.fullmatch(w))
+    for layout_ in CAPTURE_FORMATS:
         try:
-            return dt.datetime.strptime(cleaned, layout_)  # the zone name is dropped above
+            return dt.datetime.strptime(cleaned, layout_)
         except ValueError:
             continue
     return None
@@ -397,7 +420,7 @@ def parse_journal(
     return entries, unparsed
 
 
-IRC_KEY = re.compile(r"\x03\d{1,2}(?:,\d{1,2})?([^\x03]*)\x03")  # inxi's IRC key: colour code, key text, reset
+IRC_KEY = re.compile(r"\x03\d{1,2}(?:,\d{1,2})?([^\x03]*)\x03")  # inxi's IRC key: color code, key text, reset
 IRC_CODE = re.compile(r"\x03(?:\d{1,2}(?:,\d{1,2})?)?|[\x02\x0f\x16\x1d\x1f]")  # any other IRC formatting byte
 
 
@@ -405,7 +428,7 @@ def normalize_inxi(text: str) -> str:
     """Return one inxi output line in its terminal form.
 
     inxi prints IRC formatting when its stdin is not a terminal (cachyos-bugreport.sh run from a launcher or with
-    redirected input): keys become colour runs without their colons. They get the colons back; codes are dropped.
+    redirected input): keys become color runs without their colons. They get the colons back; codes are dropped.
     """
     text = IRC_KEY.sub(lambda m: m.group(1) if m.group(1).endswith(":") else f"{m.group(1)}:", text)
     return IRC_CODE.sub("", text)
@@ -429,10 +452,22 @@ def inxi_logical_lines(lines: Iterable[tuple[int, str]]) -> list[tuple[int, str]
     return out
 
 
+def text_lines(raw: bytes) -> list[str]:
+    """Return UTF-8 text (byte order mark optional) split at newlines only, numbered as rg -n and editors number it.
+
+    str.splitlines() also breaks at form feeds, vertical tabs, U+0085, U+2028, and other separators a log line can
+    hold, which would shift every later line number.
+    """
+    lines = raw.decode("utf-8-sig", errors="replace").split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return [line.removesuffix("\r") for line in lines]
+
+
 def parse_bugreport(path: Path) -> BugReport:
     """Parse cachyos-bugreport.log; raise InputError when it does not look like one."""
     raw = path.read_bytes()
-    lines = raw.decode("utf-8-sig", errors="replace").splitlines()
+    lines = text_lines(raw)
     sections = parse_sections(lines)
     if "header" not in sections or "dmesg" not in sections:
         msg = f"{path.name}: not a cachyos-bugreport.log (no report header or dmesg section)"
@@ -462,7 +497,7 @@ def parse_bugreport(path: Path) -> BugReport:
         raw,
         lines,
         sections,
-        head.get("Date", ""),
+        sanitize(head.get("Date", "")),
         captured,
         head.get("uname", ""),
         head.get("cmdline", ""),
@@ -474,16 +509,16 @@ def parse_bugreport(path: Path) -> BugReport:
     )
 
 
-RESULT_LINE = re.compile(
-    r"^(OK|INFO|WARN|FAIL|ERR):\s+(.*)$"
-)  # ERR is ry-verify's fatal-check level; it counts as FAIL
+# ERR is ry-verify's fatal-check level; it counts as FAIL
+RESULT_LINE = re.compile(r"^(OK|INFO|WARN|FAIL|ERR):\s+(.*)$")
 COUNTS = re.compile(r"\b(ok|fail|warn|gen_fail)=(\d+)")
+FOOTER_NUMBERS = ("pass", "fail", "warn", "gen_fail", "exit_code")  # footer fields the report reads as integers
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """Return the JSON objects of a JSONL file, skipping blank lines; raise InputError on anything else."""
     records: list[dict[str, Any]] = []
-    for n, line in enumerate(path.read_bytes().decode("utf-8-sig", errors="replace").splitlines(), 1):
+    for n, line in enumerate(text_lines(path.read_bytes()), 1):
         if not line.strip():
             continue
         try:
@@ -527,6 +562,10 @@ def parse_verify(path: Path) -> VerifyLog:
         msg = f"{path.name}: not a ry-verify log (no header record)"
         raise InputError(msg)
     foot = next((r for r in reversed(records) if r.get("event") == "footer"), {})
+    for key in FOOTER_NUMBERS:
+        if key in foot and (isinstance(foot[key], bool) or not isinstance(foot[key], int)):
+            msg = f"{path.name}: footer field {key} is not a whole number ({foot[key]!r})"
+            raise InputError(msg)
     items, phase_results, combined = [], {}, {}
     texts = [(n, " ".join(record_strings(rec))) for n, rec in enumerate(records, 1)]
     at = VerifyCursor()
@@ -630,7 +669,8 @@ RULES = (
       (r"<email-address-redacted>: Failed with result",),
       "systemd reported a failed unit, but cachyos-bugreport.sh replaced its name: unit names containing @ look "
       "like email addresses to its filter. Template and D-Bus-activated units are affected.",
-      "Name it with `journalctl -b -o cat -p warning | rg 'Failed with result'` (add `--user` for user units)."),
+      "Name it with `journalctl -b -o cat -p warning | rg 'Failed with result'` (`-b -1` for the previous boot, "
+      "`--user` for user units)."),
     R("kwallet-off", "KWallet services fail because KWallet is disabled", "Session / KWallet", "INFO", ("journal",),
       (r"Lacking a socket, pipe", r"kwallet.*Failed with result"),
       "With the KDE wallet disabled, ksecretd and the KWallet secret portal exit on start and systemd records the "
@@ -768,7 +808,8 @@ RULES = (
       ((r"was skipped because (?:no trigger condition checks were met|of an unmet condition check|all trigger "
        r"condition checks failed)"),),
       "Units skipped by design on this system (no TPM measurement, no hibernation, and similar)."),
-    R("audit", "Audit subsystem", "Kernel / audit", "NOTE", ("dmesg",), (r"\baudit[:(]",),
+    R("audit", "Audit subsystem", "Kernel / audit", "NOTE", ("dmesg",),
+      (r"\baudit[:(](?!.*(?:DENIED|denied|res=failed))",),  # a denial or a failed result is no boilerplate
       "Boilerplate printed on every boot."),
     R("reset-reason", "Previous reset reason", "Boot", "NOTE", ("dmesg",),
       (r"(?i)reset reason|wrote 0x\w+ to reset control register",),
@@ -776,7 +817,8 @@ RULES = (
     R("unit-failed", "systemd units failed", "Services", "LOW", ("journal",),
       (r"Failed with result '", r"Failed to start "),
       "systemd reports units that ended in failure; the evidence names each unit.",
-      "Inspect each unit with `systemctl status` and `journalctl -b -u <unit>`."),
+      "Inspect each unit with `systemctl status` and `journalctl -u`; Section 9 lists the commands for each "
+      "unit, boot, and manager."),
 )  # fmt: skip
 del R
 COMPILED = {r.key: [re.compile(p) for p in r.patterns] for r in RULES}
@@ -805,7 +847,8 @@ IDENTIFIERS = (
 
 QUOTE_LIMIT = 400  # characters of a log line quoted in the report; the rest is cut with an ellipsis
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")  # CSI sequences a program may have written into a log
-CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # C0 controls other than tab and newline
+# C0 and C1 controls other than tab and newline, and the Unicode line and paragraph separators
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 def mask(text: str) -> str:
@@ -827,10 +870,15 @@ def quote(text: str) -> str:
 
 
 def clip(text: str, limit: int) -> str:
-    """Return text cut at a word boundary to at most limit characters, with an ellipsis when cut."""
+    """Return text cut to at most limit characters, with an ellipsis when cut.
+
+    The cut falls at a word boundary unless that drops more than half the text, as a long path would.
+    """
     if len(text) <= limit:
         return text
-    return text[: limit - 1].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    cut = text[: limit - 1]
+    word = cut.rsplit(" ", 1)[0].rstrip(",;:")
+    return (word if len(word) >= limit // 2 else cut) + "…"
 
 
 # ── ANALYSIS ──────────────────────────────────────────────────────────
@@ -916,19 +964,31 @@ class Model:
         return len(br), len(vj)
 
 
-def ranges(numbers: Sequence[int]) -> str:
-    """Return sorted numbers as compact ranges: 1, 3 to 5, 9 reads 1, 3-5, 9 (the dash is an en dash)."""
-    out, streak = [], []
-    for n in numbers:
-        if streak and n == streak[-1] + 1:
-            streak.append(n)
-            continue
-        if streak:
-            out.append(f"{streak[0]}–{streak[-1]}" if len(streak) > 1 else str(streak[0]))
-        streak = [n]
-    if streak:
-        out.append(f"{streak[0]}–{streak[-1]}" if len(streak) > 1 else str(streak[0]))
-    return ", ".join(out)
+def consecutive_runs(numbers: Iterable[int]) -> list[tuple[int, int]]:
+    """Return the distinct numbers as (first, last) runs of consecutive values, in ascending order."""
+    out: list[tuple[int, int]] = []
+    for n in sorted(set(numbers)):
+        if out and n == out[-1][1] + 1:
+            out[-1] = (out[-1][0], n)
+        else:
+            out.append((n, n))
+    return out
+
+
+def ranges(numbers: Iterable[int]) -> str:
+    """Return numbers as compact ranges: 1, 3 to 5, 9 reads 1, 3-5, 9 (the dash is an en dash)."""
+    return ", ".join(f"{a}–{b}" if b > a else str(a) for a, b in consecutive_runs(numbers))
+
+
+def plural(n: int, noun: str, nouns: str = "") -> str:
+    """Return a count with its noun in the right number: 1 line, 2 lines; nouns gives an irregular plural."""
+    return f"{n:,} {noun if n == 1 else nouns or noun + 's'}"
+
+
+def no_rule(m: Model) -> str:
+    """Return the unclassified count as a clause: 1 line matches no rule, 2 lines match no rule."""
+    n = len(m.unclassified)
+    return f"{plural(n, 'line')} {'matches' if n == 1 else 'match'} no rule"
 
 
 def applicable_rules(br: BugReport) -> list[Rule]:
@@ -1070,7 +1130,8 @@ def privacy_finding(ids: Sequence[tuple[str, list[int], list[int]]]) -> Finding 
         "Post only copies with these identifiers removed (Section 9).",
     )
     f.matches = [Match("bugreport", n, "") for n in br] + [Match("verify", n, "") for n in vj]
-    f.notes.append(f"{len(br)} bug-report lines and {len(vj)} ry-verify records carry identifiers (Section 5).")
+    counted = f"{plural(len(br), 'bug-report line')} and {plural(len(vj), 'ry-verify record')}"
+    f.notes.append(f"{counted} carry identifiers (Section 5).")
     return f
 
 
@@ -1141,7 +1202,12 @@ def verify_sections(vj: VerifyLog) -> list[tuple[str, str, dict[str, int]]]:
 
 INXI_FACTS = (  # (key, inxi block, pattern, template); patterns run on the block's logical lines joined by newlines
     ("machine", "Machine", r"System:\s*(.+?)\s+product:\s*(.+?)\s+(?:v:|serial:)", "{0} {1}"),
-    ("firmware", "Machine", r"UEFI:\s*(.+?)\s+v:\s*(\S+)\s+date:\s*(\S+)", "{0} {1} ({2})"),
+    (  # inxi 3.3 prints "Firmware: UEFI vendor: … v: … date: …", older releases "UEFI: … v: … date: …"
+        "firmware",
+        "Machine",
+        r"\b(UEFI-\[Legacy\]|UEFI|BIOS)(?:\s+vendor)?:\s*(.+?)\s+v:\s*(.+?)(?:\s+rev:\s*\S+)?\s+date:\s*(\S+)",
+        "{0}: {1} {2} ({3})",
+    ),
     ("cpu", "CPU", r"\bmodel:\s*(.+?)\s+bits:", "{0}"),
     ("kernel", "System", r"Kernel:\s*(\S+)", "{0}"),
     ("distro", "System", r"Distro:\s*(.+?)(?:\s+base:.*)?$", "{0}"),
@@ -1156,7 +1222,7 @@ INXI_FACTS = (  # (key, inxi block, pattern, template); patterns run on the bloc
     ("drive", "Drives", r"ID-1:\s*/dev/(\w+)\s.*?model:\s*(\S+)", "{0} {1}"),
     ("smart", "Drives", r"health:\s*(\w+)", "{0}"),
     ("drive-temp", "Drives", r"\btemp:\s*([\d.]+ C)", "{0}"),
-    ("written", "Drives", r"written:\s*([\d.]+ \w+)", "{0}"),
+    ("written", "Drives", r"written(?:-units)?:\s*(?:[\d,]+\s+\[)?([\d.]+ \w+)", "{0} written"),  # NVMe: units [size]
 )
 
 
@@ -1236,16 +1302,17 @@ def verify_health(m: Model) -> list[tuple[str, str, str]]:
     static, runtime = vj.phase_results.get("static", {}), vj.phase_results.get("runtime", {})
     info = sum(1 for i in vj.items if i.status == "INFO")
     verdict_, exit_ = vj.status
+    by_phase = (static.get("ok", 0), runtime.get("ok", 0))  # an interrupted run can lack a phase record
+    split = f" = {by_phase[0]} static + {by_phase[1]} runtime" if sum(by_phase) == totals["ok"] else ""
     evidence = (
-        f"{totals['ok']} OK = {static.get('ok', 0)} static + {runtime.get('ok', 0)} runtime; {totals['fail']} FAIL, "
-        f"{totals['warn']} WARN, {totals['gen_fail']} GEN_FAIL; {info} INFO"
+        f"{totals['ok']} OK{split}; {totals['fail']} FAIL, {totals['warn']} WARN, {totals['gen_fail']} GEN_FAIL; "
+        f"{info} INFO"
     )
     rows = [(f"ry-verify {vj.header.get('version', '')}", f"{verdict_}, {exit_}", evidence)]
     splats = [x for x in m.findings if x.key in ("kernel-splat", "kernel-taint")]
-    ring = "No taint, oops, or splat" if not splats else f"{len(splats)} splat findings"
-    rows.append(
-        ("Kernel ring buffer", ring, f"{len(m.br.dmesg)} lines; {m.keyword_lines.get('dmesg', 0)} keyword lines")
-    )
+    ring = "No taint, oops, or splat" if not splats else plural(len(splats), "splat finding")
+    ring_lines = f"{plural(len(m.br.dmesg), 'line')}; {plural(m.keyword_lines.get('dmesg', 0), 'keyword line')}"
+    rows.append(("Kernel ring buffer", ring, ring_lines))
     failed = unit_failures(m)
     rows.append(
         ("Unit failures, current boot", "no journal entries", "journal section empty")
@@ -1256,11 +1323,14 @@ def verify_health(m: Model) -> list[tuple[str, str, str]]:
 
 
 def unit_failures(m: Model) -> int | None:
-    """Return the current boot's failed-unit entries, or None when its journal section holds no entries."""
+    """Return the current boot's unit failures, or None when its journal section holds no entries.
+
+    systemd logs one "Failed with result" line per failure; the "Failed to start" line beside it is not counted.
+    """
     current = [e for e in m.br.journal if e.boot == "current"]
     if not current:
         return None
-    return sum(1 for e in current if re.search(r"Failed with result '|Failed to start ", e.text))
+    return sum(1 for e in current if "Failed with result '" in e.text)
 
 
 def boot_health(m: Model) -> list[tuple[str, str, str]]:
@@ -1282,13 +1352,15 @@ def boot_health(m: Model) -> list[tuple[str, str, str]]:
 
 
 def hardware_health(m: Model) -> list[tuple[str, str, str]]:
-    """Return the CPU, sensor, swap, Secure Boot, and drive health rows."""
+    """Return the firmware, CPU, sensor, memory, swap, Secure Boot, and drive health rows."""
     f, rows = m.facts, []
     for key, label in (
+        ("firmware", "Firmware"),
         ("microcode", "CPU microcode"),
         ("vulnerabilities", "CPU vulnerabilities"),
         ("temperatures", "Temperatures"),
         ("fans", "Fan speeds"),
+        ("memory", "Memory"),
         ("swap", "Swap"),
         ("secure-boot", "Secure Boot"),
     ):
@@ -1324,6 +1396,15 @@ def fish_quote(text: str) -> str:
     return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def fish_path(path: Path) -> str:
+    """Return an input's full path as one fish word that works from any directory; ~/… under the home directory."""
+    full = path.resolve()
+    try:
+        return "~/" + fish_quote(str(full.relative_to(Path.home().resolve())))
+    except (RuntimeError, ValueError):  # no home directory is known, or the file lies outside it
+        return fish_quote(str(full))
+
+
 # The rg check for each identifier class: the same matches as IDENTIFIERS, written for ripgrep (-P is PCRE2).
 REDACTION_CHECKS = (
     (("Root UUID, root=UUID= form", "Root UUID, bare", "DMI system UUID", "Other UUID"),
@@ -1347,7 +1428,7 @@ def redaction_action(m: Model) -> Action | None:
     """
     if not m.identifiers:
         return None
-    bug, ver = fish_quote(m.br.path.name), fish_quote(m.vj.path.name)
+    bug, ver = fish_path(m.br.path), fish_path(m.vj.path)
     pub_bug = fish_quote(f"{m.br.path.stem}-public{m.br.path.suffix}")
     pub_ver = fish_quote(f"{m.vj.path.stem}-public{m.vj.path.suffix}")
     found = {name for name, _, _ in m.identifiers}
@@ -1355,17 +1436,64 @@ def redaction_action(m: Model) -> Action | None:
         f"set -l pub {pub_bug} {pub_ver}",
         f"cp {bug} $pub[1]",
         f"cp {ver} $pub[2]",
-        "# edit both copies: remove every line class listed in Section 5, then:",
+        "# edit both copies: replace each identifier Section 5 lists, then:",
         *[f"rg -c {args} $pub" for classes, args in REDACTION_CHECKS if found.intersection(classes)],
     ]
     total = sum(m.identifier_lines)
     return Action(
         "",
         "Redact the identifiers before posting",
-        f"{total} identifier lines across both logs",
+        f"{plural(total, 'identifier line')} across both logs",
         cmds,
         "Every rg check prints nothing (rg exits 1)",
     )
+
+
+FAILED_UNIT = re.compile(r"\bsystemd\[(\d+)\]: (.+?): Failed with result '")  # PID 1 is the system manager
+MAX_UNIT_COMMANDS = 6  # journalctl commands listed for failed units; the rest are counted in a comment
+SED_RUNS = 6  # line runs per sed command, so each command fits the frame on one line
+MAX_SED_COMMANDS = 8  # sed commands listed for unclassified lines; the rest are counted in a comment
+
+
+def failed_units(m: Model) -> list[tuple[str, str, bool]]:
+    """Return (unit, boot, user manager) for each failure the unit-failed finding quotes, current boot first."""
+    found = {
+        (hit.group(2), mt.boot, hit.group(1) != "1")
+        for f in m.findings
+        if f.key == "unit-failed"
+        for mt in f.matches
+        if (hit := FAILED_UNIT.search(mt.text))
+    }
+    return sorted(found, key=lambda u: (u[1] != "current", u[2], u[0]))
+
+
+def unit_commands(units: Sequence[tuple[str, str, bool]]) -> list[str]:
+    """Return systemctl for the current boot's failures, then journalctl for each unit in its boot and manager."""
+    cmds = [
+        *(["systemctl --failed"] if any(b == "current" and not u for _, b, u in units) else []),
+        *(["systemctl --user --failed"] if any(b == "current" and u for _, b, u in units) else []),
+    ]
+    for name, boot, user in units[:MAX_UNIT_COMMANDS]:
+        which = "-b -1" if boot == "previous" else "-b"
+        cmds.append(f"journalctl {which} {'--user-unit' if user else '-u'} {fish_quote(name)}")
+    if len(units) > MAX_UNIT_COMMANDS:
+        cmds.append(f"# {len(units) - MAX_UNIT_COMMANDS} more: Section 4")
+    return cmds
+
+
+def line_commands(path: Path, numbers: Iterable[int]) -> list[str]:
+    """Return sed commands that print the given lines of a file, each after its line number."""
+    runs = consecutive_runs(numbers)
+    chunks = [runs[i : i + SED_RUNS] for i in range(0, len(runs), SED_RUNS)]
+    target = fish_path(path)
+    cmds = [
+        "sed -n '" + ";".join(f"{a}{{=;p}}" if a == b else f"{a},{b}{{=;p}}" for a, b in chunk) + f"' {target}"
+        for chunk in chunks[:MAX_SED_COMMANDS]
+    ]
+    if len(chunks) > MAX_SED_COMMANDS:
+        rest = sum(b - a + 1 for chunk in chunks[MAX_SED_COMMANDS:] for a, b in chunk)
+        cmds.append(f"# {plural(rest, 'more line')}: Section 7.4")
+    return cmds
 
 
 def failure_actions(m: Model) -> list[Action]:
@@ -1377,7 +1505,7 @@ def failure_actions(m: Model) -> list[Action]:
             Action(
                 "",
                 "Fix the failing ry-verify checks",
-                f"{len(fails)} ry-verify sections with FAIL or WARN",
+                f"{plural(len(fails), 'ry-verify section')} with FAIL or WARN",
                 ["~/ry-install/ry-verify.fish --verify"],
                 "ry-verify exits 0 with no FAIL or WARN",
             )
@@ -1392,25 +1520,10 @@ def failure_actions(m: Model) -> list[Action]:
                 "The cause is identified",
             )
         )
-    units = sorted(
-        {
-            re.sub(r"^.*?: (.+?): Failed with result.*$", r"\1", mt.text)
-            for f in m.findings
-            if f.key == "unit-failed"
-            for mt in f.matches
-            if "Failed with result" in mt.text
-        }
-    )
+    units = failed_units(m)
     if units:
-        acts.append(
-            Action(
-                "",
-                "Inspect the failed units",
-                f"{len(units)} units ended in failure",
-                ["systemctl --failed", *[f"journalctl -b -u {fish_quote(u)}" for u in units[:6]]],
-                "No unit stays failed",
-            )
-        )
+        why = f"{plural(len({u[0] for u in units}), 'unit')} ended in failure"
+        acts.append(Action("", "Inspect the failed units", why, unit_commands(units), "No unit stays failed"))
     return acts
 
 
@@ -1422,8 +1535,8 @@ def plan_actions(m: Model) -> list[Action]:
             Action(
                 "",
                 "Review the unclassified lines",
-                f"{len(m.unclassified)} lines match no rule (Section 7.4)",
-                [f"rg -n -i 'warn|error|fail' {fish_quote(m.br.path.name)}"],
+                f"{no_rule(m)} (Section 7.4)",
+                line_commands(m.br.path, [u.no for u in m.unclassified]),
                 "Each line is explained or a rule is added",
             )
         )
@@ -1463,6 +1576,7 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
     facts = {**inxi_facts(br), **dmesg_facts(br)}
     if "kernel" not in facts and (release := re.match(r"Linux \S+ (\S+)", br.uname)):
         facts["kernel"] = release.group(1)  # the report header's uname line stands in for a missing inxi block
+    facts = {k: sanitize(v) for k, v in facts.items()}  # shown on the cover and in every running header
     m = Model(
         br,
         vj,
@@ -2205,6 +2319,7 @@ def card(f: Finding) -> KeepTogether:
             (f.count("journal", "previous"), "previous-boot journal"),
             (f.count("dmesg"), "dmesg"),
             (f.count("inxi"), "inxi"),
+            (f.count("bugreport"), "bug report"),
             (f.count("verify"), "ry-verify"),
         )
         if n
@@ -2218,8 +2333,10 @@ def card(f: Finding) -> KeepTogether:
     data.append([Paragraph("Lines", sty_label), Paragraph(escape(f.lines()), style("ln", parent=sty_td))])
     if counts:
         data.append([Paragraph("Counts", sty_label), Paragraph(counts, style("cn", parent=sty_td))])
-    rows = [("Explanation", f.explanation), *(("Note", n) for n in f.notes), ("Action", f.action)]
-    data += [[Paragraph(k, sty_label), Paragraph(fmt(v, sty_td), sty_card_value)] for k, v in rows]
+    # rule text carries house markup; notes quote ry-verify records, so they are escaped and take none
+    rows = [("Explanation", fmt(f.explanation, sty_td)), *(("Note", escape(n)) for n in f.notes)]
+    rows.append(("Action", fmt(f.action, sty_td)))
+    data += [[Paragraph(k, sty_label), Paragraph(v, sty_card_value)] for k, v in rows]
     body = Table(data, colWidths=[62, FW - 62])
     body.setStyle(TableStyle(card_style(f.severity, has_evidence=bool(shown))))
     return KeepTogether([Anchor(f"card-{f.fid}", f"{f.fid}  {f.title}", 1), body, Spacer(1, 9)])
@@ -2330,11 +2447,11 @@ def verdict(m: Model) -> tuple[str, str]:
     t, exit_ = m.vj.totals, m.vj.status[1]
     splats = any(f.key in ("kernel-splat", "kernel-taint") for f in m.findings)
     body = (
-        f"{len(m.findings)} findings: " + ", ".join(f"{v} {k}" for k, v in c.items()) + ". "
+        f"{plural(len(m.findings), 'finding')}: " + ", ".join(f"{v} {k}" for k, v in c.items()) + ". "
         f"ry-verify {m.vj.header.get('version', '')} reports {t['ok']} OK, {t['fail']} FAIL, {t['warn']} WARN, "
         f"and {t['gen_fail']} GEN_FAIL ({exit_}); "
         f"the kernel ring {'has a splat or taint' if splats else 'shows no taint, oops, or splat'}; "
-        f"{len(m.unclassified)} log lines match no rule."
+        f"{no_rule(m)}."
     )
     return head, body
 
@@ -2425,8 +2542,8 @@ def tile_rows(m: Model) -> list[tuple[str, str, str]]:
     tiles.append(
         (
             "kernel ring",
-            "Clean" if not splats else "Splat",
-            f"{len(m.br.dmesg)} lines · {m.keyword_lines.get('dmesg', 0)} keyword",
+            "No splat" if not splats else "Splat",
+            f"{plural(len(m.br.dmesg), 'line')} · {m.keyword_lines.get('dmesg', 0)} keyword",
         )
     )
     if "root mounted" in m.milestones:
@@ -2482,15 +2599,11 @@ def health_tiles(m: Model) -> Table:
 
 def doc_control(m: Model) -> Table:
     """Return the cover's document-control table."""
+    br_size = f"{plural(len(m.br.raw), 'byte')} · {plural(len(m.br.lines), 'line')}"
+    vj_size = f"{plural(len(m.vj.raw), 'byte')} · {plural(len(m.vj.records), 'record')}"
     rows = [
-        (
-            "Bug report",
-            f"`{m.br.path.name}` · {len(m.br.raw):,} bytes · {len(m.br.lines):,} lines · SHA256 {sha16(m.br.raw)}…",
-        ),
-        (
-            "ry-verify log",
-            f"`{m.vj.path.name}` · {len(m.vj.raw):,} bytes · {len(m.vj.records):,} records · SHA256 {sha16(m.vj.raw)}…",
-        ),
+        ("Bug report", f"`{m.br.path.name}` · {br_size} · SHA256 {sha16(m.br.raw)}…"),
+        ("ry-verify log", f"`{m.vj.path.name}` · {vj_size} · SHA256 {sha16(m.vj.raw)}…"),
         ("Captured", m.br.date_text or "not stated in the bug report"),
         ("Generated by", f"build_report.py {__version__}; every value in this report comes from the two inputs"),
         ("Masking", "Identifiers in quoted lines are replaced by placeholders such as [root UUID] and [serial]"),
@@ -2651,8 +2764,8 @@ def key_facts(m: Model) -> list[str]:
     )
     span = f" ({prev[0].when:%H:%M:%S}–{prev[-1].when:%H:%M:%S})" if prev else ""
     out.append(
-        f"Logs: {len(m.br.dmesg):,} dmesg lines; {cur} journal entries in the current boot and {len(prev)} in the "
-        f"previous boot{span}; {len(m.unclassified)} lines match no rule."
+        f"Logs: {plural(len(m.br.dmesg), 'dmesg line')}; {plural(cur, 'journal entry', 'journal entries')} in the "
+        f"current boot and {len(prev)} in the previous boot{span}; {no_rule(m)}."
     )
     if "root mounted" in m.milestones:
         gap = f", after {m.quiet_gap[1] - m.quiet_gap[0]:.2f} s without output" if m.quiet_gap else ""
@@ -2664,7 +2777,7 @@ def key_facts(m: Model) -> list[str]:
         out.append(f"Boot: root mounted at {m.milestones['root mounted']:.2f} s{gap}{wifi}.")
     if m.identifiers:
         b, v = m.identifier_lines
-        out.append(f"Identifiers: {b} bug-report lines and {v} ry-verify records (Section 5).")
+        out.append(f"Identifiers: {plural(b, 'bug-report line')} and {plural(v, 'ry-verify record')} (Section 5).")
     return out
 
 
@@ -2840,7 +2953,7 @@ def _story_sec4(m: Model) -> list[Flowable]:
     c = severity_counts(m)
     out.append(
         para(
-            f"{len(m.findings)} findings, ordered by severity and first line: "
+            f"{plural(len(m.findings), 'finding')}, ordered by severity and first line: "
             + ", ".join(f"{v} {k}" for k, v in c.items())
             + "."
         )
@@ -2966,17 +3079,18 @@ def stream_rows(m: Model) -> list[list[object]]:
     """Return per-stream sizes and how many lines rules attributed."""
     found = [*m.findings, *m.others]
     rows: list[list[object]] = []
-    for label, stream, boot, total in (
-        ("dmesg", "dmesg", "", len(m.br.dmesg)),
-        ("Journal, current boot", "journal", "current", sum(1 for e in m.br.journal if e.boot == "current")),
-        ("Journal, previous boot", "journal", "previous", sum(1 for e in m.br.journal if e.boot == "previous")),
-        ("inxi", "inxi", "", len(m.br.inxi)),
+    journal = {b: sum(1 for e in m.br.journal if e.boot == b) for b in ("current", "previous")}
+    for label, stream, boot, size in (
+        ("dmesg", "dmesg", "", plural(len(m.br.dmesg), "line")),
+        ("Journal, current boot", "journal", "current", plural(journal["current"], "entry", "entries")),
+        ("Journal, previous boot", "journal", "previous", plural(journal["previous"], "entry", "entries")),
+        ("inxi", "inxi", "", plural(len(m.br.inxi), "line")),
     ):
         attributed = sum(f.count(stream, boot) for f in found)
         unc = sum(1 for u in m.unclassified if u.stream == stream and (not boot or u.boot == boot))
-        rows.append([label, f"{total:,} lines", attributed, unc if stream != "inxi" else "—"])
-    rows.append(["ry-verify records", f"{len(m.vj.records):,} records", f"{len(m.vj.items)} results", "—"])
-    rows.append(["Installed packages", f"{len(m.br.packages)} packages", "versions only", "—"])
+        rows.append([label, size, attributed, unc if stream != "inxi" else "—"])
+    rows.append(["ry-verify records", plural(len(m.vj.records), "record"), plural(len(m.vj.items), "result"), "—"])
+    rows.append(["Installed packages", plural(len(m.br.packages), "package"), "versions only", "—"])
     return rows
 
 
@@ -3009,7 +3123,7 @@ def cross_checks(m: Model) -> list[list[str]]:
     )
     out.append(
         [
-            f"Every journal entry is attributed or listed ({len(m.br.journal)} entries)",
+            f"Every journal entry is attributed or listed ({plural(len(m.br.journal), 'entry', 'entries')})",
             "match" if journal == len(m.br.journal) else f"differs: {journal}",
         ]
     )
@@ -3053,7 +3167,12 @@ def _story_sec9(m: Model) -> list[Flowable]:
     out: list[Flowable] = [PageBreak(), HPara("sec-9")]
     if not m.actions:
         return [*out, para("The findings call for no action.")]
-    out.append(para("Commands for each action, one per line; tick the checklist as each completion test passes."))
+    out.append(
+        para(
+            "Commands for each action, one per line; they name the inputs by full path, so they run from any "
+            "directory. Tick the checklist as each completion test passes."
+        )
+    )
     out.extend(
         KeepTogether(
             [
@@ -3196,6 +3315,7 @@ def on_body(canvas: Canvas, doc: BaseDocTemplate) -> None:
 
 
 # ── BUILD ─────────────────────────────────────────────────────────────
+# Fonts, figure rendering, layout passes, the PDF date, the atomic write, and the command line.
 def register_fonts(font_dir: Path) -> None:
     """Register the IBM Plex faces; make them the defaults for the page, plain table cells, and drawings."""
     for name, stem in FONT_FILES.items():
@@ -3296,15 +3416,15 @@ def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) ->
 
     br, vj = parse_bugreport(args.bugreport), parse_verify(args.verify)
     log(
-        f"bug report: {len(br.lines)} lines, {len(br.dmesg)} dmesg, {len(br.journal)} journal, "
-        f"{len(br.journal_unparsed)} journal lines unread; ry-verify: {len(vj.records)} records"
+        f"bug report: {plural(len(br.lines), 'line')}, {len(br.dmesg)} dmesg, {len(br.journal)} journal, "
+        f"{plural(len(br.journal_unparsed), 'journal line')} unread; ry-verify: {plural(len(vj.records), 'record')}"
     )
     m = analyze(br, vj)
     STATE.model = m
     ids = sum(m.identifier_lines)
     log(
-        f"analysis: {len(m.findings)} findings, {len(m.others)} other matches, {len(m.unclassified)} unclassified, "
-        f"{ids} identifier lines, {len(m.actions)} actions"
+        f"analysis: {plural(len(m.findings), 'finding')}, {plural(len(m.others), 'other match', 'other matches')}, "
+        f"{len(m.unclassified)} unclassified, {plural(ids, 'identifier line')}, {plural(len(m.actions), 'action')}"
     )
     os.environ.setdefault("SOURCE_DATE_EPOCH", str(source_epoch(m)))
     STATE.font_dir = font_dir
@@ -3317,7 +3437,7 @@ def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) ->
     try:
         with tempfile.TemporaryDirectory(prefix="postboot-report-") as tmp_dir:
             STATE.chart_dir = Path(tmp_dir)
-            log(f"{render_figures(m)} figures rendered")
+            log(f"{plural(render_figures(m), 'figure')} rendered")
             layout(tmp, m, log)
         tmp.replace(out)
     finally:
@@ -3340,8 +3460,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.out is not None and args.out.is_dir():
         parser.error(f"--out names a directory: {args.out}")
     epoch = os.environ.get("SOURCE_DATE_EPOCH")
-    if epoch is not None and not epoch.strip().isdigit():
-        parser.error(f"SOURCE_DATE_EPOCH must be a whole number of seconds, not {epoch!r}")
+    if epoch is not None and not (re.fullmatch(r"\s*\d+\s*", epoch, re.ASCII) and int(epoch) <= EPOCH_MAX):
+        parser.error(f"SOURCE_DATE_EPOCH must be a whole number of seconds up to {EPOCH_MAX}, not {epoch!r}")
     signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         return run(args)
@@ -3355,11 +3475,14 @@ def check(args: argparse.Namespace) -> int:
     br, vj = parse_bugreport(args.bugreport), parse_verify(args.verify)
     checks = [row for row in cross_checks(analyze(br, vj)) if row[1] == "match" or row[1].startswith("differs")]
     differing = [row for row in checks if row[1] != "match"]
-    unread = f", {len(br.journal_unparsed)} journal lines unread" if br.journal_unparsed else ""
+    unread = f", {plural(len(br.journal_unparsed), 'journal line')} unread" if br.journal_unparsed else ""
+    counts = (
+        f"{len(br.sections)} bug-report sections, {plural(len(br.dmesg), 'dmesg line')}, "
+        f"{plural(len(br.journal), 'journal entry', 'journal entries')}{unread}"
+    )
     print(
-        f"build_report.py: inputs ok ({len(br.sections)} bug-report sections, {len(br.dmesg)} dmesg lines, "
-        f"{len(br.journal)} journal entries{unread}; ry-verify {vj.header.get('version')} with {len(vj.items)} "
-        f"results; cross-checks: {len(checks) - len(differing)} of {len(checks)} match)",
+        f"build_report.py: inputs ok ({counts}; ry-verify {vj.header.get('version')} with "
+        f"{plural(len(vj.items), 'result')}; cross-checks: {len(checks) - len(differing)} of {len(checks)} match)",
         file=sys.stderr,
     )
     for name, result in differing:
