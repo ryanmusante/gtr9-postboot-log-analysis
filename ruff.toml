@@ -13,11 +13,11 @@ ignore = [
     "D213",     # and D212 (summary on the first line)
     "PLR2004",  # page geometry and chart coordinates are numeric by nature
     "PLC0415",  # matplotlib and svglib load inside functions, after the preflight
-    "RUF001",   # the report text uses typographic dashes, minus signs, and multiplication signs
+    "RUF001",   # the report text uses en dashes in number and time ranges
     "ISC001",   # single-line implicit concatenation is the formatter's call
 ]
-# Left out of `select` on purpose; with the ignores above, `ruff check --select ALL` adds only
-# COM812 (trailing commas are the formatter's call), T201 (print is the command-line output),
+# Left out of `select` on purpose: `ruff check --select ALL --ignore D203,D213,PLR2004,PLC0415,RUF001,ISC001`
+# adds only COM812 (trailing commas are the formatter's call), T201 (print is the command-line output),
 # SLF001 (ReportLab frame internals in the page callbacks), and DTZ001 and DTZ007 (journal and
 # capture times are naive wall-clock, as the logs print them).
 
@@ -26,6 +26,5 @@ ignore = [
 "build_report.py" = ["E402"]
 
 [lint.pylint]
-# the table and card builders take one keyword per layout option
-max-args = 12
-max-positional-args = 8
+# table() takes one keyword per layout option: 9 arguments, 3 of them positional
+max-args = 9
