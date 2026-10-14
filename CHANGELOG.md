@@ -3,6 +3,116 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.2.1
+-----
+
+  - report: a Lines cell lists at most 40 line ranges per log and counts
+    the rest, so a message repeated thousands of times still builds
+  - report: GEN_FAIL records count in the verdict, the cover counts, the
+    ry-verify action, and its completion test
+  - report: the cover groups its counts as FINDINGS, WATCH, LOGS, and
+    RY-VERIFY; its ry-verify line says interrupted, as the key facts do
+  - report: Section 5.5 says when no journal entry matches a rule; 5.1
+    counts unread journal lines beside the entries
+  - report: the pause table stays inside the boot's burst of dmesg lines;
+    a pause or quiet gap is the difference of its printed ends
+  - report: the timeline step after the ry-verify run counts from its end
+    and stays an estimate; a capture hours later keeps its kernel time
+  - report: counts are of messages, a continuation with its entry and a
+    wrapped inxi line once; Method says so and covers indented lines
+  - report: "Matched by" replaces "Explained by", and Section 5.3 and
+    Figure 4 read "dmesg by rule family"
+  - report: the reading guide puts dmesg over time in Section 2.2; the LOW,
+    WATCH, and NOTE legend lines match how the report uses them
+  - report: captions and titles drop fragments, say "in time order" for
+    the pauses, and mention Other or milestones only when drawn
+  - report: the process table's last row lists its findings in the body
+    font; a cross-check no longer differs over an absent warn= count
+  - report: one failed unit gets "Inspect the failed unit"; unit-failure
+    owners print in ID order; a clipped quote keeps a word ending at the limit
+  - layout: a group's last record or an inxi block label no longer opens or
+    ends a page alone; monospace text breaks after its indentation
+  - layout: the failure-keyword list never starts a line with a dot; large
+    overflow counts take thousands separators
+  - figures: milestone labels closer than 12 percent of the axis stack;
+    a boot timeline without milestones draws no empty lane
+  - figures: the boot timeline labels whole decades only, draws a marker
+    at the axis edge whole, and labels a run without an end "from"
+  - figures: the journal timeline's seconds axis spans 2 s at least and
+    keeps edge ticks inside; section names cannot open math text
+  - analysis: the kernel-start estimate pairs a message journald read late
+    as an upper bound only, and skips messages after a suspend
+  - analysis: dmesg errors without a prefix take their subsystem from the
+    wording: DRM errors, I/O errors, OOM kills, and kernel splats
+  - analysis: acpiphp, acpi_cpufreq, zswap, CPU mitigations, sp5100-tco,
+    usb-storage, ACP devices, and partition lines sort to their subsystems
+  - analysis: subsystems that start at the same time follow their first
+    line; keyword counts agree between Sections 5.1 and 5.2
+  - rules: storage errors add the block layer's medium, transport, and
+    timeout errors and NVMe I/O timeouts that abort
+  - rules: the ksecretd message no longer claims a disabled wallet; KDE
+    startup noise names what it covers
+  - rules: the OOM explanation covers memory cgroup limits; an undetermined
+    Secure Boot state is recognized
+  - rules: amdgpu errors and kfd notices no longer pass as optional-feature
+    boilerplate, so their failure keywords count
+  - rules: failure keywords add aborted, aborting, critical temperature,
+    and hardware protection; unknown kernel parameters are boilerplate
+  - rules: redacted units read "failed under a redacted name", and their
+    actions filter with journalctl -g, so no command needs ripgrep
+  - rules: the unit-failed card points to systemctl --failed and each
+    unit's own boot, as Section 6 does; error lists say "kernel splat"
+  - actions: past six failed units, the overflow comment points to
+    Section 5.6, which lists every unit
+  - privacy: the root UUID in an escaped unit name and machine IDs under
+    /run/log/journal are masked; the USB4 placeholder spells ID in caps
+  - parsing: ry-verify's "Caught SIG..." cleanup notice is no result; ANSI
+    escapes with colon parameters are removed
+  - parsing: an IRC inxi value starting with digits stays a value; package
+    lines are counted under a redacted repository name
+  - cli: an interrupt during a callback, a module load, or the teardown
+    exits 130, writes nothing, and reports only the interrupt
+  - cli: SIGINT takes its default action before the standard library
+    loads, and Ctrl-C at launch no longer reads as a SyntaxError
+  - cli: with stderr closed, nothing goes to stdout; a missing module
+    names its own package
+  - cli: --help says --check exits 0 once the inputs parse; --verbose
+    counts message classes
+  - code: comments and docstrings match the code; limits are named and
+    explained; an unknown section key fails the build
+  - code: dead code goes: the card's Note row, table totals, the bugreport
+    count, the unused chart faces, and a section reader
+  - docs: README installs the Verify block's tools, covers GEN_FAIL and the
+    40-range cap, and drops the same-path condition for byte identity
+
+
+7.2.0
+-----
+
+  - report: Section 5 Identifiers, the identifiers finding, and the
+    redaction action are gone; quotes stay masked
+  - report: unclassified lines are no longer listed, counted, or given an
+    action; Section 6.4 and its sed commands are gone
+  - report: Coverage becomes Section 5 Logs and Actions becomes Section 6;
+    the cover counts dmesg lines and journal entries instead
+  - report: the timeline table gives the step between events, and a new
+    table lists the five longest pauses in dmesg during the boot
+  - report: Section 5 adds dmesg lines by subsystem, journal entries by
+    process, and every unit failure systemd logged in either boot
+  - figures: new Figure 2 draws boot activity by subsystem, one tick per
+    dmesg line, aligned under the boot timeline; later figures renumber
+  - figures: new Figure 5 compares journal entries per process across the
+    two boots; process names cannot open matplotlib math text
+  - figures: the journal timeline draws the entries a rule explains
+  - figures: charts use the IBM Plex files the report text uses, even where
+    another copy of the family is installed
+  - actions: no command names an input file, so sed is no longer needed
+  - cross-checks: the journal attribution check leaves with the
+    unclassified list
+  - docs: README describes Section 5 Logs, the six figures, and the pause
+    table; the identifier and unclassified-line texts are gone
+
+
 7.1.0
 -----
 
