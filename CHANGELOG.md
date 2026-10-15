@@ -3,6 +3,37 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+
+7.5.1
+-----
+
+  - actions: a failed unit is looked up by its logged name, masked
+    identifiers as * patterns, and every command fits one line
+  - cli: --out may not name an input; the path prints as its bytes; a
+    signal after the write or the run ends cleanly, never a traceback
+  - journal: an entry logged just after the capture across a month or
+    year end takes the right year
+  - rules: a ry-verify mitigation lowers a USB device's finding only when
+    the record names that device; gpu-hang covers soft recovery
+  - masking: IPv6 addresses, invisible format characters, ry-verify
+    section names, and file names that are not UTF-8
+  - boot: milestones past 600 s extend the burst; phases keep their
+    measured spans, and a cut userspace reads as a lower bound
+  - boot: the chart names later milestones, states a cut burst, draws
+    the ry-verify run as a bar, and shows short phases on long axes
+  - report: a journal boot that could not be read counts as not read
+  - report: the verdict adds only what its head line and tiles omit
+  - report: the quiet gap reads as the longest silence, with its span
+  - report: templates keep placeholders; counts and section numbers
+    stay with their labels; six tables have clearer titles
+  - report: long ry-verify and unit-failure tables list their first
+    rows and count the rest; crowded charts draw fewer labels
+  - parsing: continuation lines join in linear time; absurd dmesg
+    stamps, dates, and zone offsets no longer stop a build
+  - ry-verify: a footer count outside 0 to 999,999,999 is an input error
+  - docs: README follows the new behavior
+
+
 7.5.0
 -----
 
