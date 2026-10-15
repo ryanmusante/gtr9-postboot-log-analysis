@@ -3,6 +3,115 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.4.0
+-----
+
+  - report: the explained (INFO) messages move to Appendix A, after the
+    logs; Inputs and method become Appendix B
+  - report: System health splits into its checks and an Error classes
+    table: the lines each class matched in dmesg and in each journal boot
+  - report: the verdict names GEN_FAIL only when ry-verify counted one and
+    leaves the preamble detail to the health table
+  - report: a health fact inxi gives as N/A is left out; the error-class
+    row points at its table instead of listing the classes
+  - report: the parser cross-checks test that dmesg and the journal agree
+    on the kernel start, and Method says how it is estimated
+  - dmesg: a chart of the lines after the boot, one tick per line and row
+    per subsystem, in seconds, minutes, or hours by the span shown
+  - dmesg: the chart marks each suspend and names a burst the 600 s window
+    cut; when the chart is absent, the section says why
+  - dmesg: a table quotes the messages after the boot in order of their
+    first line, numbers and hex values aside, the first 10
+  - dmesg: a table of repeated warnings: lines with a failure keyword that
+    repeat with other numbers, boilerplate aside, the 10 most frequent
+  - dmesg: common boot lines (keyrings, taskstats, serial ports, NUMA,
+    XFRM, traffic control, cache drops) leave Other for their subsystems
+  - journal: a table of repeated warnings per process, with entries per
+    boot and the rules they match
+  - journal: the process table counts entries with failure keywords
+  - journal: the current boot's timeline counts in seconds, minutes, or
+    hours by its span; a long uptime no longer reads as an offset
+  - cli: an interrupt while the PDF replaces its target waits for the
+    step to end, so the message names the PDF as written
+  - layout: a paragraph never leaves its last line alone atop a page, and
+    a number in prose or a caption stays on the line of its time unit
+  - rules: the inxi mislabel rule goes with the inxi dump it explained;
+    the jack2 explanation no longer narrates inxi
+  - text: rule explanations, watch-item meanings, captions, and Method say
+    the same in fewer words; the key facts name the bug report, not inxi
+  - docs: README describes the new order, repeated warnings, the kernel
+    start, and the eight figures
+
+
+7.3.0
+-----
+
+  - report: sections run Summary, Findings, Actions, System health, Boot,
+    dmesg, Journal, ry-verify, then Appendix A Inputs and method
+  - report: watch items and settings join the findings, and the health
+    checks get a section of their own
+  - report: the inxi dump appendix and the Log streams table are gone; the
+    inxi block still feeds the key facts, the tiles, and the health checks
+  - report: a log section without content is one sentence; its empty
+    subsections leave the section and the contents
+  - report: the boot key fact gives the kernel and initrd phases; the
+    verdict drops the error-class list the health table holds
+  - report: a timeline row inside the ry-verify run steps from its start,
+    so no step reads negative
+  - report: a unit failure's result is printed as logged, never as markup
+  - boot: the boot chart draws a band of the phases: the kernel until init,
+    the initrd until the switch to the root file system, then userspace
+  - boot: a phases table gives each phase's span, duration, and dmesg lines;
+    init without an initramfs ends the kernel phase too
+  - boot: a switch of the root file system shows an initrd whatever its
+    init is called; only userspace counts the line at its end
+  - boot: dmesg that lost the boot draws no boot chart and says where it
+    starts; a report without dmesg says that instead
+  - figures: a ry-verify run past the boot chart reaches its edge, a
+    capture before the boot is named so, and no lane is drawn empty
+  - figures: paired value labels no longer overlap, long process names are
+    cut in the middle, and minute ticks date their midnight
+  - dmesg: an overview table counts lines during and after the boot,
+    subsystems, rule matches, and lines with failure keywords
+  - dmesg: a splat's banner, task, taint, and register lines count under
+    Kernel core, hardware errors under CPU and memory
+  - journal: an overview table per boot gives the span, entries, processes,
+    rule matches, entries with failure keywords, and unit failures
+  - journal: the timeline draws entries per bar above the matched ticks,
+    on a log scale once a bar holds 20
+  - journal: a new chart compares each finding's entries in the two boots,
+    drawn when both boots have entries a rule matches
+  - journal: a boot of which no line could be read shows dashes, and the
+    key facts and the health table name the unread lines
+  - ry-verify: a generator failure, logged as FAIL, counts as GEN_FAIL in
+    the chart, the tables, the cross-checks, and a finding of its own
+  - ry-verify: a runtime phase stopped for want of sudo is named beside
+    the totals that leave it out
+  - rules: a mitigation that lists devices lowers a finding only when it
+    names every device the evidence shows
+  - rules: the shutdown window holds only with a line that only a stop
+    sequence logs, so a quiet shutdown keeps the session's failures
+  - actions: a unit named only by "Failed to start" gets its journalctl
+    command; extra core dumps point at coredumpctl list
+  - parsing: inxi's numeric keys in IRC form, per-core speeds and
+    repository lists, read as in terminal output
+  - text: the reading guide keeps IDs, lines, and the boot columns; Method
+    is shorter and leaves inxi parsing to the README
+  - text: the captions of the subsystem, process, and ry-verify charts say
+    what is drawn and where the rest is listed
+  - cli: --out must name a regular file or a new one, and a path Python
+    cannot stat fails the build instead of raising a traceback
+  - cli: font files that do not parse fail the preflight with exit 3
+  - cli: Ctrl-C, SIGTERM, and SIGHUP exit 130 from the script's first line;
+    an interrupt after the PDF has replaced its target names it
+  - cli: the temporary file has a short name, so any output name fits;
+    SOURCE_DATE_EPOCH takes at most 20 digits
+  - code: table() loses the hold option with its last caller, and ruff's
+    max-args returns to 8
+  - docs: README describes the new order, the boot phases, and the seven
+    figures
+
+
 7.2.1
 -----
 

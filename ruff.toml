@@ -18,13 +18,13 @@ ignore = [
 ]
 # Left out of `select` on purpose: `ruff check --select ALL --ignore D203,D213,PLR2004,PLC0415,RUF001,ISC001`
 # adds only COM812 (trailing commas are the formatter's call), T201 (print is the command-line output),
-# SLF001 (ReportLab frame internals in the page callbacks), and DTZ001 and DTZ007 (journal and
-# capture times are naive wall-clock, as the logs print them).
+# SLF001 (ReportLab internals: the frame position, table cells, and grouped flowables), and DTZ001 and
+# DTZ007 (journal and capture times are naive wall-clock, as the logs print them).
 
 [lint.per-file-ignores]
 # ReportLab loads after the early argument parse, so --help works without it
 "build_report.py" = ["E402"]
 
 [lint.pylint]
-# table() takes one keyword per layout option: 9 arguments, 3 of them positional
-max-args = 9
+# table() takes one keyword per layout option: 8 arguments, 3 of them positional
+max-args = 8
