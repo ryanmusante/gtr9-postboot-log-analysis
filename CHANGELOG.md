@@ -3,6 +3,24 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.5.0
+-----
+
+  - boot: a table counts each subsystem's dmesg lines in each boot phase
+  - dmesg: a table lists the sources with failure keywords (a device such
+    as usb 1-4, a subsystem), findings that call for action first
+  - journal: a boot comparison lists the current boot's messages that the
+    previous boot did not log, numbers aside, the 10 most frequent
+  - report: system health gives each check's result, detail, and source
+    in columns; ry-verify's totals name GEN_FAIL only when counted
+  - report: a message logged once is quoted as logged; only repeats read
+    as their template
+  - report: 6.2 is now By subsystem and source, 7.5 Boot comparison
+  - text: the verdict, key facts, reading guide, severity levels, leads,
+    captions, Method, and rule explanations are shorter
+  - docs: README describes the new tables and the source of a dmesg line
+
+
 7.4.0
 -----
 
