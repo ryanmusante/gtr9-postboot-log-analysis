@@ -4,6 +4,26 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.6.0
+-----
+
+  - figures: journal entries by process and by finding are no longer
+    drawn; the process table and the Cur. and Prev. columns hold them
+  - boot: the boot phases table folds into the subsystem table: each phase
+    heads its column with its span, and a last row totals the lines
+  - boot: the During boot column appears only when the phases leave lines
+    of the burst out; otherwise it repeats each row's sum
+  - report: system health keeps the ry-verify result and the hardware
+    checks; error classes, dmesg, and unit failures have their own tables
+  - report: the verdict no longer repeats the error classes its tile names
+  - actions: the ry-verify rerun calls the script by the path the log's
+    header records, a home directory as ~
+  - code: ty 0.0.90 passes; four functions over 50 lines are split, and a
+    local no longer shadows run()
+  - docs: README follows the new layout and names the versions tested;
+    ruff.toml lists DTZ901 among the rules left out of select
+
+
 7.5.1
 -----
 
