@@ -4,20 +4,53 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.7.0
+-----
+
+  - report: the cover's document-control table is gone; Appendix B.1 gives
+    the inputs and their SHA256, the footer and PDF metadata the generator
+  - report: Section 1.3, now Action checklist, merges the actions table and
+    the checklist; Section 3 keeps each action's commands
+  - report: the verdict no longer repeats the tiles' note on a journal
+    that was not read when no error class was seen
+  - dmesg: one table in 6.1 replaces the boot phases table of 5.2, the
+    dmesg overview, and the subsystem table of 6.2, now By source
+  - dmesg: it counts each subsystem's lines per boot phase and after the
+    boot; a lead gives the lines' span and how many a rule matches
+  - dmesg: a subsystem's first and last line show once dmesg has lost the
+    boot; otherwise the boot and after-boot charts show when it logs
+  - boot: 5.2 is Milestones and captures; when dmesg has lost the boot,
+    5.1 alone says where it starts
+  - report: times since the kernel start use thousands separators in the
+    dmesg tables, pauses, milestones, and chart labels too
+  - report: a ry-verify run whose ends round to the same tenth of a
+    second shows one time in the timeline table and the boot chart
+  - actions: a script path with whitespace other than a space (a tab, a
+    line break) reruns ry-verify as ~/ry-install/ry-verify.fish
+  - code: one formatter prints seconds; helpers build Matched by cells and
+    NOTE line sets; the rendered charts live in the build state
+  - code: docstrings follow ry-verify 7.254.0's counting of stopped,
+    finished, and interrupted runs
+  - docs: README lists the report by section and splits How It Works by
+    input, subsystem, count, and boot
+
+
 7.6.0
 -----
 
   - figures: journal entries by process and by finding are no longer
-    drawn; the process table and the Cur. and Prev. columns hold them
+    drawn; tables count them, and message classes keep their timeline rows
   - boot: the boot phases table folds into the subsystem table: each phase
     heads its column with its span, and a last row totals the lines
-  - boot: the During boot column appears only when the phases leave lines
-    of the burst out; otherwise it repeats each row's sum
+  - boot: phase durations, >= for a cut userspace, move to the boot
+    chart's legend; During boot shows only when phases leave lines out
   - report: system health keeps the ry-verify result and the hardware
     checks; error classes, dmesg, and unit failures have their own tables
+  - report: the error-class lead names journal lines that could not be
+    read, as the health rows that said so are gone
   - report: the verdict no longer repeats the error classes its tile names
-  - actions: the ry-verify rerun calls the script by the path the log's
-    header records, a home directory as ~
+  - actions: the ry-verify rerun names the script by the absolute path in
+    the log's header, a home directory as ~, else ~/ry-install/ry-verify.fish
   - code: ty 0.0.90 passes; four functions over 50 lines are split, and a
     local no longer shadows run()
   - docs: README follows the new layout and names the versions tested;

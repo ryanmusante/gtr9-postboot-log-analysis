@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.6.0"
+__version__ = "7.7.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -223,6 +223,7 @@ class BuildState:
     tables: int = 0
     total: int = 0
     chart_dir: Path = field(default_factory=Path)
+    charts: dict[str, str | None] = field(default_factory=dict)  # rendered chart per key; None when not drawn
     font_dir: Path = field(default_factory=Path)
     root_uuid: str = ""  # the root file system's UUID from the kernel command line, which mask() names
     mpl: ModuleType | None = None
@@ -360,7 +361,10 @@ class VerifyLog:
 
     @property
     def interrupted(self) -> bool:
-        """Return True when the footer says the run was interrupted (its counts then cover one phase only)."""
+        """Return True when the footer says the run was interrupted; its counts are those at the signal.
+
+        A signal during a phase leaves that phase's counts only, as ry-verify resets them when the phase starts.
+        """
         return self.footer.get("interrupted") is True
 
     @property
@@ -406,8 +410,8 @@ class VerifyLog:
     def phase_stops(self) -> list[VerifyItem]:
         """Return the first record of each phase that logged only ERR results, when another phase ran its checks.
 
-        ry-verify restores the static totals when its runtime phase stops for want of sudo, so the totals leave out
-        such a phase's records.
+        ry-verify stops a phase this way when it cannot cache sudo; the stop comes before the phase resets its
+        counters, so the totals count the stopped phase's records.
         """
         if self.stopped:
             return []
@@ -422,8 +426,9 @@ class VerifyLog:
     def outside_totals(self) -> list[str]:
         """Return the preamble FAIL and WARN records the totals leave out, as ["2 WARN"], judged by the totals.
 
-        ry-verify resets its counters once its checks start, so a finished run's totals omit what the preamble
-        logged; a run that stopped before its checks keeps it.
+        ry-verify resets its counters as each phase starts and adds the preamble's records back to a finished run's
+        totals, as a run that stopped before its checks keeps them; totals rebuilt from an interrupted run's phases
+        leave them out.
         """
         out = []
         for status in ("FAIL", "WARN"):
@@ -1205,7 +1210,7 @@ class Model:
     verify_sections: list[tuple[str, str, dict[str, int]]]
     facts: dict[str, str]
     health: list[tuple[str, str, str, str]]
-    keyword_lines: dict[str, int]
+    keyword_entries: dict[str, int]  # journal entries with failure keywords per boot
     actions: list[Action]
 
 
@@ -1244,6 +1249,16 @@ def plural(n: int, noun: str, nouns: str = "") -> str:
 def series(items: Sequence[str]) -> str:
     """Return items as running text: A; A and B; A, B, and C."""
     return " and ".join(items) if len(items) < 3 else f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def secs(t: float) -> str:
+    """Return seconds as the report prints them: hundredths with thousands separators, as 1,203.92 s."""
+    return f"{t:,.2f} s"
+
+
+def secs_span(a: float, b: float) -> str:
+    """Return a span of seconds as secs() prints them, as 1.25-2.65 s (the dash is an en dash)."""
+    return f"{a:,.2f}–{b:,.2f} s"
 
 
 def no_journal(m: Model) -> str:
@@ -1480,22 +1495,30 @@ def verify_findings(vj: VerifyLog) -> list[Finding]:
     return out
 
 
-VERIFY_SCRIPT = "~/ry-install/ry-verify.fish"  # the rerun's script when the log's header names none
+VERIFY_SCRIPT = "~/ry-install/ry-verify.fish"  # the rerun's script when the log's header names no usable path
 
 
 def verify_script(vj: VerifyLog) -> str:
     """Return the ry-verify script that wrote the log as one fish word, a home directory as ~.
 
-    ry-verify logs its argv with the path it was run by first, as typed; a bare file name gains ./ so that fish runs
-    the file, not a command of that name. A header without that path gives VERIFY_SCRIPT.
+    ry-verify logs its argv with the path it was run by first, as typed. Only an absolute path finds the script from
+    any directory; a relative one, one the report would mask, one with whitespace other than a space (a tab, a line
+    break, a no-break space), which a page cannot show as typed, and one too long for a command line give
+    VERIFY_SCRIPT.
     """
     argv = vj.header.get("argv")
     path = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) else ""
-    if not path.strip() or path.startswith("-"):
+    home = re.fullmatch(r"/home/[^/]+/(.+)", path)
+    shown = home.group(1) if home else path
+    word = f"~/{fish_quote(shown)}" if home else fish_quote(shown)
+    if (
+        not path.startswith("/")
+        or sanitize(shown) != shown
+        or re.search(r"[^\S ]", shown)
+        or len(f"{word} --verify") > COMMAND_WIDTH
+    ):
         return VERIFY_SCRIPT
-    if home := re.fullmatch(r"/home/[^/]+/(.+)", path):
-        return "~/" + fish_quote(sanitize(home.group(1)))
-    return fish_quote(sanitize(path if "/" in path else f"./{path}"))
+    return word
 
 
 def section_title(section: str) -> str:
@@ -1853,17 +1876,17 @@ def health_rows(m: Model) -> list[tuple[str, str, str, str]]:
     return [*verify_health(m), *gpu_health(m), *hardware_health(m)]
 
 
-def keyword_lines(br: BugReport, boilerplate: set[int]) -> dict[str, int]:
-    """Count the dmesg lines and the journal entries of each boot holding a failure keyword, leaving out NOTE lines.
+def note_lines(found: Iterable[Finding]) -> set[int]:
+    """Return the lines that NOTE rules claim: boilerplate, which the failure-keyword counts leave out."""
+    return {mt.no for f in found if f.severity == "NOTE" for mt in f.matches}
 
-    Lines count as the report counts them: a dmesg or journal continuation belongs to its entry.
-    """
-    found = {
-        "dmesg": [(e.no, e.text) for e in br.dmesg],
-        "journal-current": [(e.no, e.text) for e in br.journal if e.boot == "current"],
-        "journal-previous": [(e.no, e.text) for e in br.journal if e.boot == "previous"],
+
+def keyword_entries(br: BugReport, boilerplate: set[int]) -> dict[str, int]:
+    """Count each boot's journal entries holding a failure keyword, NOTE lines aside; a continuation is its entry's."""
+    return {
+        boot: sum(1 for e in br.journal if e.boot == boot and e.no not in boilerplate and KEYWORD_RE.search(e.text))
+        for boot in ("current", "previous")
     }
-    return {k: sum(1 for n, text in v if n not in boilerplate and KEYWORD_RE.search(text)) for k, v in found.items()}
 
 
 # dmesg subsystems: the prefix a kernel message starts with names the driver, facility, or device that printed it.
@@ -2150,7 +2173,7 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
         verify_sections(vj),
         facts,
         [],
-        keyword_lines(br, {mt.no for f in others if f.severity == "NOTE" for mt in f.matches}),
+        keyword_entries(br, note_lines(others)),
         [],
     )
     m.health = health_rows(m)
@@ -2390,7 +2413,7 @@ def boot_phases(m: Model) -> list[tuple[str, float, float]]:
 
 def phase_duration(name: str, a: float, b: float, *, cut: bool) -> str:
     """Return a phase's duration as the report prints it; a userspace whose burst the window cut lasts at least that."""
-    return f"{'≥' if cut and name == 'Userspace' else ''}{gap_seconds(a, b):,.2f} s"
+    return ("≥" if cut and name == "Userspace" else "") + secs(gap_seconds(a, b))
 
 
 def boot_axis(m: Model) -> tuple[float, dict[str, float]] | None:
@@ -2410,6 +2433,12 @@ def boot_axis(m: Model) -> tuple[float, dict[str, float]] | None:
     return xmax, captures
 
 
+def run_span(a: float, b: float) -> str:
+    """Return a run's span in seconds to tenths, as 12.3-15.8 (the dash is an en dash); one time if both round alike."""
+    first, last = f"{a:,.1f}", f"{b:,.1f}"
+    return first if first == last else f"{first}–{last}"
+
+
 def capture_marks(points: dict[str, float], xmax: float) -> dict[str, float]:
     """Return the chart labels for the capture points: one mark per capture, the ry-verify run at its middle.
 
@@ -2418,11 +2447,11 @@ def capture_marks(points: dict[str, float], xmax: float) -> dict[str, float]:
     marks = {}
     if "ry-verify starts" in points and "ry-verify ends" in points:
         a, b = points["ry-verify starts"], points["ry-verify ends"]
-        marks[f"ry-verify {a:.1f}–{b:.1f} s"] = (a + min(b, xmax)) / 2
+        marks[f"ry-verify {run_span(a, b)} s"] = (a + min(b, xmax)) / 2
     elif "ry-verify starts" in points:
-        marks[f"ry-verify from {points['ry-verify starts']:.1f} s"] = points["ry-verify starts"]
+        marks[f"ry-verify from {points['ry-verify starts']:,.1f} s"] = points["ry-verify starts"]
     if "bug report" in points:
-        marks[f"bug report {points['bug report']:.1f} s"] = points["bug report"]
+        marks[f"bug report {points['bug report']:,.1f} s"] = points["bug report"]
     return marks
 
 
@@ -2470,7 +2499,7 @@ def draw_boot(m: Model) -> Figure | None:
             counts[round(e.t * 1e6) // step] += 1
     phases = [p for p in boot_phases(m) if p[1] < xmax]  # a phase that starts past the chart is not drawn
     lanes: dict[int, Lane] = {}  # row 1, the milestones, labeled above; row 0, the captures, labeled below
-    if boot := {f"{k}\n{v:.2f} s": v for k, v in m.milestones.items() if v <= xmax}:
+    if boot := {f"{k}\n{secs(v)}": v for k, v in m.milestones.items() if v <= xmax}:
         lanes[1] = (boot, "v", label_levels(boot, xmax * MILESTONE_GAP))
     if marks := capture_marks(captures, xmax):
         lanes[0] = (marks, "s", label_levels(marks, xmax * CAPTURE_GAP))
@@ -2558,7 +2587,7 @@ def boot_bars(ax1: Axes, m: Model, xmax: float, counts: Sequence[int], width: fl
         a, b = span
         ax1.axvspan(a, b, color=C_LIGHT, zorder=0)
         if b - a >= 0.1 * xmax:  # a narrower stretch is named in the caption only
-            label = f"no output\n{gap_seconds(*m.quiet_gap):.2f} s"
+            label = f"no output\n{secs(gap_seconds(*m.quiet_gap))}"
             ax1.text((a + b) / 2, (0.8 * top) ** 0.5, label, ha="center", va="center", fontsize=6.4, clip_on=True)
 
 
@@ -2994,7 +3023,6 @@ sty_info_meaning = style("im", parent=sty_td, fontSize=7.3, leading=9.4, textCol
 sty_cover_title = style("ct", fontName="Plex-SB", fontSize=25, leading=29, spaceAfter=6)
 sty_cover_line = style("cs", fontSize=10.2, leading=13.5, textColor=MUTE)
 sty_cover_date = style("cs2", parent=sty_cover_line, spaceAfter=12)
-sty_cover_head = style("dch", fontName="Plex-SB", fontSize=8.4, leading=11, spaceAfter=3)
 sty_cover_label = style("cl", fontName="PlexC-SB", fontSize=6.6, leading=8.6, textColor=MUTE)  # the cover's labels
 sty_verdict_head = style("vh", fontName="Plex-SB", fontSize=12.5, leading=16, spaceAfter=2)
 sty_verdict = style("vb", fontSize=8.6, leading=11.8)
@@ -3003,7 +3031,6 @@ sty_kpi_value = style("kb", fontName="Plex-SB", fontSize=17, leading=19, alignme
 sty_kpi_label = style("ks", parent=sty_cover_label, alignment=TA_CENTER)
 sty_tile_value = style("hv", fontName="Plex-SB", fontSize=10.5, leading=13)
 sty_tile_detail = style("hs", fontName="PlexC", fontSize=6.6, leading=8.2, textColor=SOFT)
-sty_doc_key = style("dk", fontName="PlexC-SB", fontSize=7.6, leading=9.8)
 sty_contents = style("cth", fontName="Plex-SB", fontSize=15.5, leading=19, spaceAfter=10)
 sty_toc0 = style("tc0", fontName="Plex-SB", fontSize=8.8, leading=11.4)
 sty_toc1 = style("tc1", fontSize=8.2, leading=10.6, leftIndent=16)
@@ -3135,7 +3162,7 @@ STRUCT = (
     ("sec-1", 0, "1", "Summary"),
     ("sub-1.1", 1, "1.1", "Key facts"),
     ("sub-1.2", 1, "1.2", "Findings register"),
-    ("sub-1.3", 1, "1.3", "Actions"),
+    ("sub-1.3", 1, "1.3", "Action checklist"),
     ("sec-2", 0, "2", "Findings"),
     ("sub-2.1", 1, "2.1", "Action needed"),
     ("sub-2.2", 1, "2.2", "Watch items and settings"),
@@ -3145,11 +3172,11 @@ STRUCT = (
     ("sub-4.2", 1, "4.2", "Error classes"),
     ("sec-5", 0, "5", "Boot"),
     ("sub-5.1", 1, "5.1", "Boot chart"),
-    ("sub-5.2", 1, "5.2", "Phases and milestones"),
+    ("sub-5.2", 1, "5.2", "Milestones and captures"),
     ("sub-5.3", 1, "5.3", "Pauses"),
     ("sec-6", 0, "6", "dmesg"),
     ("sub-6.1", 1, "6.1", "Overview"),
-    ("sub-6.2", 1, "6.2", "By subsystem and source"),
+    ("sub-6.2", 1, "6.2", "By source"),
     ("sub-6.3", 1, "6.3", "Repeated warnings"),
     ("sub-6.4", 1, "6.4", "By rule family"),
     ("sec-7", 0, "7", "Journal"),
@@ -3593,11 +3620,6 @@ def file_name(path: Path) -> str:
     return sanitize(os.fsencode(path.name).decode("utf-8", "replace"))
 
 
-def sha16(raw: bytes) -> str:
-    """Return the first 16 hex digits of a SHA256."""
-    return hashlib.sha256(raw).hexdigest()[:16]
-
-
 def severity_counts(m: Model) -> dict[str, int]:
     """Return the number of findings per severity."""
     return {s: sum(1 for f in m.findings if f.severity == s) for s in FINDING_LEVELS}
@@ -3623,9 +3645,8 @@ def verify_run_text(m: Model) -> str:
 def verdict(m: Model) -> tuple[str, str]:
     """Return the cover verdict: a head line and a summary, both from the model.
 
-    The summary adds what the head line and the tiles leave out: LOW findings beside HIGH and MED ones, the INFO
-    findings, the ry-verify run, and a log that was not read when no error class was seen, as the tile then reads
-    clean; the tile names the classes seen.
+    The summary adds what the head line leaves out: LOW findings beside HIGH and MED ones, the INFO findings, and the
+    ry-verify run. The error-class and unit-failure tiles name the classes seen and a journal that was not read.
     """
     c, (shown, gen) = severity_counts(m), generator_failures(m.vj)  # a GEN_FAIL record is a finding already
     low = ""
@@ -3655,12 +3676,7 @@ def verdict(m: Model) -> tuple[str, str]:
         target = (
             f" Its {lit(m.vj.meta('profile'))} profile targets other hardware (VJ {mismatch.no})." if mismatch else ""
         )
-    error = ""  # the error-class tile names the classes seen, or that none was
-    if not error_findings(m) and not m.br.journal:
-        error = f" No error class seen in dmesg; {no_journal(m)}."
-    elif not error_findings(m) and m.br.journal_unparsed:
-        error = f" No error class seen; {no_journal(m)}."
-    return head, (f"{findings}. " if findings else "") + f"{verify_run_text(m)}.{target}{error}"
+    return head, (f"{findings}. " if findings else "") + f"{verify_run_text(m)}.{target}"
 
 
 def verdict_panel(m: Model) -> Table:
@@ -3738,8 +3754,8 @@ def tile_rows(m: Model) -> list[tuple[str, str, str]]:
         )
     ]
     if "Root mounted" in m.milestones:
-        quiet = f"longest silence {gap_seconds(*m.quiet_gap):,.2f} s" if m.quiet_gap else "dmesg"
-        tiles.append(("boot to root mount", f"{m.milestones['Root mounted']:,.2f} s", quiet))
+        quiet = f"longest silence {secs(gap_seconds(*m.quiet_gap))}" if m.quiet_gap else "dmesg"
+        tiles.append(("boot to root mount", secs(m.milestones["Root mounted"]), quiet))
     failed = unit_failures(m)
     if failed is None:
         tiles.append(("unit failures", "—", no_journal(m)))
@@ -3783,33 +3799,6 @@ def health_tiles(m: Model) -> Table:
         )
     )
     return tiles
-
-
-def doc_control(m: Model) -> Table:
-    """Return the cover's document-control table."""
-    br_size = f"{plural(len(m.br.raw), 'byte')} · {plural(len(m.br.lines), 'line')}"
-    vj_size = f"{plural(len(m.vj.raw), 'byte')} · {plural(len(m.vj.records), 'record')}"
-    rows = [
-        ("Bug report", f"`{lit(file_name(m.br.path))}` · {br_size} · SHA256 {sha16(m.br.raw)}…"),
-        ("ry-verify log", f"`{lit(file_name(m.vj.path))}` · {vj_size} · SHA256 {sha16(m.vj.raw)}…"),
-        ("Generated by", f"build_report.py {__version__}"),
-    ]
-    table_ = Table(
-        [[Paragraph(k, sty_doc_key), Paragraph(fmt(v, sty_td), sty_td)] for k, v in rows], colWidths=[80, FW - 80]
-    )
-    table_.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (0, 0), (-1, 0), 0.8, INK),
-                ("LINEBELOW", (0, 0), (-1, -1), HAIR, RULE),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                ("TOPPADDING", (0, 0), (-1, -1), 2.2),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.4),
-            ]
-        )
-    )
-    return table_
 
 
 def machine_line(m: Model) -> str:
@@ -3922,9 +3911,6 @@ def _story_cover(m: Model) -> list[Flowable]:
         kpi_strip(m),
         Spacer(1, 14),
         health_tiles(m),
-        Spacer(1, 12),
-        Paragraph("Document control", sty_cover_head),
-        doc_control(m),
         NextPageTemplate("body"),
         PageBreak(),
         Paragraph("Contents", sty_contents),
@@ -3975,16 +3961,16 @@ def key_facts(m: Model) -> list[str]:
         journal = no_journal(m)
     out.append(f"Logs: {plural(len(m.br.dmesg), 'dmesg line')}; {journal}.")
     early = [(name.lower(), a, b) for name, a, b in boot_phases(m) if name != "Userspace"]
-    phases = ", ".join(f"{name} {gap_seconds(a, b):.2f} s" for name, a, b in early)
+    phases = ", ".join(f"{name} {secs(gap_seconds(a, b))}" for name, a, b in early)
     boot = [phases] if phases else []
     if "Root mounted" in m.milestones:
-        root = f"root mounted at {m.milestones['Root mounted']:,.2f} s"
+        root = f"root mounted at {secs(m.milestones['Root mounted'])}"
         if m.quiet_gap:
             a, b = m.quiet_gap
-            root += f", the longest silence before it {gap_seconds(a, b):,.2f} s ({a:,.2f}–{b:,.2f} s)"
+            root += f", the longest silence before it {secs(gap_seconds(a, b))} ({secs_span(a, b)})"
         boot.append(root)
     if (wifi := m.milestones.get("Wi-Fi associated")) is not None:
-        boot.append(f"Wi-Fi associated at {wifi:.2f} s")
+        boot.append(f"Wi-Fi associated at {secs(wifi)}")
     if boot:
         out.append(f"Boot: {'; '.join(boot)}.")
     return out
@@ -4018,7 +4004,7 @@ def jcounts(f: Finding) -> tuple[object, object]:
 
 
 def _story_summary(m: Model) -> list[Flowable]:
-    """Return Section 1: key facts, the register of findings that call for action, and the actions."""
+    """Return Section 1: key facts, the register of findings that call for action, and the actions as a checklist."""
     out: list[Flowable] = [HPara("sec-1"), HPara("sub-1.1"), *bullet_paragraphs(key_facts(m)), HPara("sub-1.2")]
     acting = [f for f in m.findings if f.severity != "INFO"]
     if acting:
@@ -4040,10 +4026,14 @@ def _story_summary(m: Model) -> list[Flowable]:
     out.append(HPara("sub-1.3"))
     if not m.actions:
         return [*out, para("The findings call for no action.")]
-    rows = [[a.aid, a.title, a.why, f"{{p:act-{a.aid}}}"] for a in m.actions]
-    return out + table(
-        ["ID", "Action", "Why", "Page"], rows, [32, 170, 270, 40], title="Actions the findings call for", right=(3,)
-    )
+    rows = [[tick_box(), a.aid, a.title, a.done_when, "", f"{{p:act-{a.aid}}}"] for a in m.actions]
+    head = ["", "ID", "Action", "Done when", "Date / initials", "Page"]
+    return out + table(head, rows, [18, 32, 160, 182, 80, 40], title="Actions the findings call for", right=(5,))
+
+
+def tick_box() -> Table:
+    """Return an empty tick box for the actions checklist."""
+    return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
 
 
 def inputs_table(m: Model) -> list[Flowable]:
@@ -4155,15 +4145,15 @@ def timeline_rows(m: Model) -> list[list[str]]:
     if m.kernel_start:
         when, half = m.kernel_start
         shown = f"{when + dt.timedelta(microseconds=5000):%Y-%m-%d %H:%M:%S.%f}"[:-4]  # rounded to hundredths
-        events.append(((0, 0.0), ["Kernel start (estimate)", f"{shown} ±{half:.2f} s", "0.00 s"]))
-    events += [(order(1, None, t), [name, "—", f"{t:.2f} s"]) for name, t in m.milestones.items()]
+        events.append(((0, 0.0), ["Kernel start (estimate)", f"{shown} ±{secs(half)}", secs(0.0)]))
+    events += [(order(1, None, t), [name, "—", secs(t)]) for name, t in m.milestones.items()]
     begin, end = (w.replace(tzinfo=None) if w else None for w in (m.vj.started, m.vj.finished))
     if begin:
         a, b = points.get("ry-verify starts"), points.get("ry-verify ends")
         if end:
             day = f"{end:%H:%M:%S}" if end.date() == begin.date() else f"{end:%Y-%m-%d %H:%M:%S}"
             span = f"{begin:%Y-%m-%d %H:%M:%S}" + (f" – {day}" if f"{end:%F %T}" != f"{begin:%F %T}" else "")
-            since = f"≈{a:,.1f}–{b:,.1f} s" if a is not None and b is not None else "—"
+            since = f"≈{run_span(a, b)} s" if a is not None and b is not None else "—"
             events.append((order(2, begin), ["ry-verify run", span, since]))
         else:
             since = f"≈{a:,.1f} s" if a is not None else "—"
@@ -4190,36 +4180,65 @@ def with_steps(rows: list[list[str]]) -> list[list[str]]:
         step = "—"
         if times and (before := [t for t in last if t <= times[0]]):
             gap = times[0] - max(before)
-            step = f"≈+{gap:,.1f} s" if approx or estimated else f"+{gap:,.2f} s"
+            step = f"≈+{gap:,.1f} s" if approx or estimated else f"+{secs(gap)}"
         if times:
             last, estimated = times, approx
         out.append([*row, step])
     return out
 
 
-def phase_subsystem_rows(m: Model) -> tuple[list[str], list[list[object]]]:
-    """Return the boot phase table's head and rows: each phase with its span, its dmesg lines per subsystem, a total.
+def phase_lines(lines: Sequence[DmesgEntry], phases: Sequence[tuple[str, float, float]]) -> list[int]:
+    """Return the lines of each boot phase: from its start up to the next phase's, userspace's last line included."""
+    return [sum(1 for e in lines if a <= e.t < b or (p == "Userspace" and e.t == b)) for p, a, b in phases]
 
-    A phase holds the lines from its start up to the next phase's; userspace, which ends on the burst's last line,
-    holds that line too. A During boot column, which counts every line up to the burst's end as the dmesg overview
-    does, appears only when dmesg bounds some phases alone and so leaves lines of the burst out of them. The phases'
-    durations are the boot chart's legend. Without a phase, there is no table.
+
+def subsystem_table(m: Model) -> tuple[list[str], list[list[object]], list[float]]:
+    """Return the dmesg subsystem table's head, rows, and column widths; a last row totals the counts.
+
+    A subsystem gives its lines, those of each boot phase and those after the boot, its lines with failure keywords
+    (NOTE lines aside), and the rules its lines match. During boot counts the lines up to the burst's end when the
+    phases leave some of them out or dmesg bounds no phase. Once dmesg has lost the boot, no chart shows when a
+    subsystem logs, so its first and last line stand in for the phases.
     """
     phases, burst = boot_phases(m), boot_burst(m)
-    if not phases or burst is None:
-        return [], []
-    counted: list[tuple[str, list[int]]] = []
+    owners, notes = evidence_owners(m, "dmesg"), note_lines(m.others)
+    counted: list[tuple[str, list[int], tuple[float, float], str]] = []
     for name, lines in subsystem_lines(m.br).items():
-        counts = [sum(1 for e in lines if a <= e.t < b or (p == "Userspace" and e.t == b)) for p, a, b in phases]
-        if during := sum(1 for e in lines if e.t <= burst):
-            counted.append((name, [*counts, during]))
-    whole = all(sum(n[:-1]) == n[-1] for _, n in counted)  # every line of the burst falls into a phase
-    width = len(phases) if whole else len(phases) + 1
-    totals = [sum(n[i] for _, n in counted) for i in range(width)]
-    rows: list[list[object]] = [[name, *(f"{v:,}" for v in n[:width])] for name, n in counted]
-    rows.append(["**All subsystems**", *(f"{v:,}" for v in totals)])
-    head = ["Subsystem", *(f"{p} {a:,.2f}–{b:,.2f} s" for p, a, b in phases), *([] if whole else ["During boot"])]
-    return head, rows
+        counts = [len(lines)]
+        if burst is not None:
+            during = sum(1 for e in lines if e.t <= burst)
+            counts += [*phase_lines(lines, phases), during, len(lines) - during]
+        keyword = sum(1 for e in lines if e.no not in notes and KEYWORD_RE.search(e.text))
+        span = (min(e.t for e in lines), max(e.t for e in lines))
+        counted.append((name, [*counts, keyword], span, matched_by(owners, lines)))
+    n = len(phases)
+    during_col = burst is not None and (not n or any(sum(c[1 : n + 1]) != c[n + 1] for _, c, _, _ in counted))
+    if burst is not None and not during_col:  # every line of the burst falls into a phase
+        for _, c, _, _ in counted:
+            del c[n + 1]
+    head, widths = ["Subsystem", "Lines"], [96.0, 36.0]
+    if burst is not None:
+        head += [f"{p} {secs_span(a, b)}" for p, a, b in phases]
+        widths += [54.0 if during_col else 58.0] * n
+        head += [*(["During boot"] if during_col else []), "After boot"]
+        widths += [*([46.0] if during_col else []), 44.0]
+    else:
+        head += ["First", "Last"]
+        widths += [56.0, 56.0]
+    head += ["Keyword lines", "Matched by"]
+    widths += [48.0, FW - sum(widths) - 48.0]
+
+    def row(label: str, c: Sequence[int], span: tuple[float, float], ids: str) -> list[object]:
+        """Return a row: the counts, then the first and last line when no chart shows them, the keyword lines, rules."""
+        times = [secs(t) for t in span] if burst is None else []
+        return [label, *(f"{v:,}" for v in c[:-1]), *times, f"{c[-1]:,}", ids]
+
+    rows = [row(name, c, span, ids) for name, c, span, ids in counted]
+    if counted:
+        totals = [sum(c[i] for _, c, _, _ in counted) for i in range(len(counted[0][1]))]
+        whole = (min(s[0] for _, _, s, _ in counted), max(s[1] for _, _, s, _ in counted))
+        rows.append(row("**All subsystems**", totals, whole, ""))
+    return head, rows, widths
 
 
 def pause_rows(m: Model) -> list[list[object]]:
@@ -4232,8 +4251,8 @@ def pause_rows(m: Model) -> list[list[object]]:
     longest = sorted(gaps, key=lambda g: (-g[0], g[1].t))[:PAUSES]
     return [
         [
-            f"{gap_seconds(a.t, b.t):.2f} s",
-            f"{a.t:.2f}–{b.t:.2f} s",
+            secs(gap_seconds(a.t, b.t)),
+            secs_span(a.t, b.t),
             f"BR {a.no}: {clip(quote(a.text), PAUSE_QUOTE)}",
             f"BR {b.no}: {clip(quote(b.text), PAUSE_QUOTE)}",
         ]
@@ -4252,7 +4271,7 @@ def subsystems_caption(m: Model) -> str:
     outside = sum(1 for e in m.br.dmesg if axis and e.t >= axis[0])
     if outside:
         verb = "falls" if outside == 1 else "fall"
-        text += f" {plural(outside, 'later line')} {verb} outside the chart; {section_ref('sub-6.2')} counts all."
+        text += f" {plural(outside, 'later line')} {verb} outside the chart; {section_ref('sub-6.1')} counts all."
     return text
 
 
@@ -4268,7 +4287,7 @@ def boot_caption(m: Model) -> str:
     marks = f", with {' and '.join(parts)}" if parts else ""
     text = f"dmesg lines per {boot_bin(xmax):g} s, log scale{marks}." + burst_text(m, xmax)
     if drawn and m.kernel_start:
-        text += f" Capture points use the kernel-start estimate (±{m.kernel_start[1]:.2f} s)."
+        text += f" Capture points use the kernel-start estimate (±{secs(m.kernel_start[1])})."
     text += captures_left(m, drawn)
     outside = sum(1 for e in m.br.dmesg if e.t >= xmax)
     if outside:
@@ -4285,15 +4304,15 @@ def burst_text(m: Model, xmax: float) -> str:
     text = ""
     if cut:
         text += f" No {BOOT_PAUSE:g} s pause ends the boot's burst in its {BOOT_SPAN:g} s window, so it is cut at "
-        text += f"{end:,.2f} s."
+        text += f"{secs(end)}."
     if end > xmax:
         text += f" The chart shows the first {xmax:g} s of the burst" + (
-            "." if cut else f", which ends at {end:,.2f} s."
+            "." if cut else f", which ends at {secs(end)}."
         )
     if m.quiet_gap:
         a, b = m.quiet_gap
         limit = "the root mount" if "Root mounted" in m.milestones else "the root switch"
-        gap = f"{gap_seconds(a, b):,.2f} s ({a:,.2f}–{b:,.2f} s)"
+        gap = f"{secs(gap_seconds(a, b))} ({secs_span(a, b)})"
         if quiet_span(m, xmax):
             text += f" Shading: the longest silence before {limit}, {gap}."
         else:
@@ -4328,7 +4347,8 @@ def captures_left(m: Model, drawn: dict[str, float]) -> str:
 def _story_health(m: Model) -> list[Flowable]:
     """Return Section 4: the system health checks, then the lines each error class matched in each log."""
     rows = [[lit(check_), lit(result), lit(detail), lit(source)] for check_, result, detail, source in m.health]
-    lead = "Lines per error class and log; 0 means checked and clean, and a dash means not read or empty."
+    unread = f"; {no_journal(m)}, so a journal count can fall short" if m.br.journal_unparsed else ""
+    lead = f"Lines per error class and log; 0 means checked and clean, and a dash means not read or empty{unread}."
     return [
         CondPageBreak(SECTION_ROOM),
         HPara("sec-4"),
@@ -4377,23 +4397,17 @@ def no_boot(m: Model) -> str:
     """Return why the report shows no boot: no dmesg line at all, or a ring buffer that has lost the boot."""
     if not m.br.dmesg:
         return "The bug report holds no dmesg line"
-    return f"dmesg no longer holds the boot: its first line comes {m.br.dmesg[0].t:.2f} s after the kernel start"
+    return f"dmesg no longer holds the boot: its first line comes {secs(m.br.dmesg[0].t)} after the kernel start"
 
 
 def _story_boot(m: Model) -> list[Flowable]:
-    """Return Section 5: the boot chart, phases by subsystem, milestones and captures, and the longest pauses."""
+    """Return Section 5: the boot chart and the boot's activity by subsystem, milestones and captures, pauses."""
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-5"), HPara("sub-5.1")]
-    out += svgfig(STATE_FIGS.get("boot"), "Boot chart", boot_caption(m)) or [para(f"{no_boot(m)}; no chart is drawn.")]
-    out += svgfig(STATE_FIGS.get("subsystems"), "Boot activity by subsystem", subsystems_caption(m))
+    boot = svgfig(STATE.charts.get("boot"), "Boot chart", boot_caption(m))
+    out += boot or [para(f"{no_boot(m)}; no chart is drawn.")]
+    out += svgfig(STATE.charts.get("subsystems"), "Boot activity by subsystem", subsystems_caption(m))
     out.append(HPara("sub-5.2"))
-    head, rows = phase_subsystem_rows(m)
-    if rows:
-        cols = len(head) - 1
-        out += table(head, rows, [152, *[(FW - 152) / cols] * cols], title="Boot phases: dmesg lines by subsystem",
-                     right=tuple(range(1, cols + 1)))  # fmt: skip
-    elif boot_axis(m) is None:
-        out.append(para(f"{no_boot(m)}; no phase is measured."))
-    else:
+    if boot_axis(m) is not None and not boot_phases(m):
         out.append(para("dmesg holds no milestone that bounds a boot phase."))
     out += table(
         ["Event", "Wall clock (local)", "Since kernel start", "Step"],
@@ -4414,7 +4428,7 @@ def _story_boot(m: Model) -> list[Flowable]:
     elif boot_axis(m):
         out.append(para(f"No pause in dmesg during the boot reaches {PAUSE_MIN:.2f} s."))
     else:
-        out.append(para(f"{no_boot(m)}; no pause is measured."))
+        out.append(para("Without the boot in dmesg, no pause is measured."))
     return out
 
 
@@ -4502,7 +4516,7 @@ def verify_caption(m: Model) -> str:
 def _story_verify(m: Model) -> list[Flowable]:
     """Return Section 8: ry-verify results by section, its failures and warnings, and its notes."""
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-8"), HPara("sub-8.1")]
-    out += svgfig(STATE_FIGS.get("verify"), "ry-verify results by section", verify_caption(m)) or [
+    out += svgfig(STATE.charts.get("verify"), "ry-verify results by section", verify_caption(m)) or [
         para("The log holds no result records from a verification phase.")
     ]
     out.append(HPara("sub-8.2"))
@@ -4571,9 +4585,9 @@ def after_caption(m: Model) -> str:
     end, cut = burst
     unit = time_unit(span[1] - span[0])[1].lower()
     if cut:
-        since = f"after {end:,.2f} s, where the {BOOT_SPAN:g} s window cut the boot's burst"
+        since = f"after {secs(end)}, where the {BOOT_SPAN:g} s window cut the boot's burst"
     else:
-        since = f"after the boot's burst ended at {end:,.2f} s"
+        since = f"after the boot's burst ended at {secs(end)}"
     text = f"One tick per dmesg line {since}, one row per subsystem; {unit} since the kernel start"
     if sleeps := after_suspends(m):
         marks = "a dashed line marks a suspend" if len(sleeps) == 1 else f"dashed lines mark {len(sleeps):,} suspends"
@@ -4596,25 +4610,21 @@ def families_caption(m: Model) -> str:
 
 
 def _story_dmesg(m: Model) -> list[Flowable]:
-    """Return Section 6: the overview and after-boot lines, subsystems and sources, repeats, and rule families."""
+    """Return Section 6: the lines by subsystem and after the boot, the sources, repeats, and rule families."""
     if not m.br.dmesg:
         return [CondPageBreak(SECTION_ROOM), HPara("sec-6"), para("The bug report holds no dmesg line.")]
-    out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-6"), HPara("sub-6.1")]
-    head = ["Lines", "Span", "During boot", "After boot", "Subsystems", "Rule matches", "Keyword lines"]
-    out += table(head, [dmesg_overview_row(m)], [52, 140, 62, 58, 62, 66, 72], title="dmesg overview",
-                 right=(0, 2, 3, 4, 5, 6))  # fmt: skip
-    out += svgfig(STATE_FIGS.get("after"), "dmesg after the boot", after_caption(m)) or [para(after_absent(m))]
+    out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-6"), HPara("sub-6.1"), para(dmesg_lead(m), sty_lead)]
+    head, rows, widths = subsystem_table(m)
+    out += table(head, rows, widths, title="dmesg lines by subsystem", right=tuple(range(1, len(head) - 1)))
+    out += svgfig(STATE.charts.get("after"), "dmesg after the boot", after_caption(m)) or [para(after_absent(m))]
     rows, lines, total = after_messages(m)
     if rows:
-        if total < lines or total > REPEATS:  # else the overview's After boot count says it all
+        if total < lines or total > REPEATS:  # else the subsystem table's After boot total says it all
             out.append(para(after_lead(lines, total), sty_lead))
         head = ["Message", "Lines", "First", "Last", "Matched by"]
         out += table(head, rows, [272, 40, 56, 56, 88], title="dmesg messages after the boot", mono=(0,),
                      right=(1, 2, 3))  # fmt: skip
     out.append(HPara("sub-6.2"))
-    head = ["Subsystem", "Lines", "First", "Last", "Keyword lines", "Matched by"]
-    out += table(head, subsystem_rows(m), [112, 50, 58, 58, 70, 164], title="dmesg lines by subsystem",
-                 right=(1, 2, 3, 4))  # fmt: skip
     rows, total = source_rows(m)
     if rows:
         if total > SOURCES:
@@ -4637,7 +4647,7 @@ def _story_dmesg(m: Model) -> list[Flowable]:
         out.append(para("No dmesg line with a failure keyword repeats, boilerplate aside."))
     out.append(HPara("sub-6.4"))
     return out + (
-        svgfig(STATE_FIGS.get("families"), "dmesg lines by rule family", families_caption(m))
+        svgfig(STATE.charts.get("families"), "dmesg lines by rule family", families_caption(m))
         or [para("No dmesg line matches a rule.")]
     )
 
@@ -4656,7 +4666,7 @@ def _story_journal(m: Model) -> list[Flowable]:
     if not m.br.journal:
         return [*out, para(f"{no_journal(m)[0].upper()}{no_journal(m)[1:]}."), *overview]
     out += [HPara("sub-7.1"), *overview, HPara("sub-7.2")]
-    out += svgfig(STATE_FIGS.get("journal"), "Journal timeline", journal_caption(m))
+    out += svgfig(STATE.charts.get("journal"), "Journal timeline", journal_caption(m))
     out.append(HPara("sub-7.3"))
     head = ["Process", "Current", "Previous", "Keyword entries", "Matched by"]
     out += table(head, process_rows(m), [150, 50, 50, 62, 200], title="Journal entries by process", right=(1, 2, 3),
@@ -4709,21 +4719,14 @@ def _journal_comparison(m: Model) -> list[Flowable]:
     ]  # fmt: skip
 
 
-def dmesg_overview_row(m: Model) -> list[object]:
-    """Return the dmesg overview: lines, span, lines during and after the boot, subsystems, rule and keyword lines."""
+def dmesg_lead(m: Model) -> str:
+    """Return the sentence above the dmesg subsystem table: the lines, their span, and how many a rule matches."""
     d = m.br.dmesg
-    burst = boot_burst(m)
-    during = sum(1 for e in d if e.t <= burst) if burst is not None else None
-    named = [k for k in subsystem_lines(m.br) if k != OTHER]
-    return [
-        f"{len(d):,}",
-        f"{min(e.t for e in d):.2f}–{max(e.t for e in d):.2f} s since kernel start",
-        f"{during:,}" if during is not None else "—",
-        f"{len(d) - during:,}" if during is not None else "—",
-        f"{len(named):,}",
-        f"{sum(f.count('dmesg') for f in [*m.findings, *m.others]):,}",
-        f"{m.keyword_lines.get('dmesg', 0):,}",
-    ]
+    first, last = min(e.t for e in d), max(e.t for e in d)
+    span = secs(first) if secs(first) == secs(last) else secs_span(first, last)
+    matched = sum(f.count("dmesg") for f in [*m.findings, *m.others])
+    rules = f"{matched:,} {'matches' if matched == 1 else 'match'} a rule" if matched else "none matches a rule"
+    return f"{plural(len(d), 'dmesg line')}, {span} since the kernel start; {rules}."
 
 
 def journal_overview_rows(m: Model) -> list[list[object]]:
@@ -4743,7 +4746,7 @@ def journal_overview_rows(m: Model) -> list[list[object]]:
         counts = (
             len({e.ident for e in entries}),
             sum(f.count("journal", boot) for f in found),
-            m.keyword_lines.get(f"journal-{boot}", 0),
+            m.keyword_entries.get(boot, 0),
             sum(1 for e in entries if e.ident == "systemd" and UNIT_RESULT.match(e.text)),
         )
         span = journal_span(entries) if entries else "—"
@@ -4790,7 +4793,7 @@ def dmesg_repeats(m: Model) -> tuple[list[list[object]], int]:
     Boilerplate (NOTE) lines are left out, and so are lines without a keyword, as a device per line enumerates. A row
     gives the message as a template, its lines, the first and last time, and the rules its lines match.
     """
-    notes = {mt.no for f in m.others if f.severity == "NOTE" for mt in f.matches}
+    notes = note_lines(m.others)
     owners = evidence_owners(m, "dmesg")
     groups: dict[str, list[DmesgEntry]] = {}
     for e in m.br.dmesg:
@@ -4799,9 +4802,8 @@ def dmesg_repeats(m: Model) -> tuple[list[list[object]], int]:
     repeated = sorted((g for g in groups.values() if len(g) > 1), key=lambda g: (-len(g), g[0].no))
     rows: list[list[object]] = []
     for lines in repeated[:REPEATS]:
-        ids = sorted(dict.fromkeys(i for e in lines for i in owners.get(e.no, [])), key=id_order)
-        span = [f"{lines[0].t:.2f} s", f"{lines[-1].t:.2f} s"]
-        rows.append([message_template(lines[0].text), f"{len(lines):,}", *span, ", ".join(ids) or "—"])
+        span = [secs(lines[0].t), secs(lines[-1].t)]
+        rows.append([message_template(lines[0].text), f"{len(lines):,}", *span, matched_by(owners, lines)])
     return rows, len(repeated)
 
 
@@ -4818,9 +4820,8 @@ def after_messages(m: Model) -> tuple[list[list[object]], int, int]:
         groups.setdefault(message_template(e.text), []).append(e)
     rows: list[list[object]] = []
     for group in list(groups.values())[:REPEATS]:
-        ids = sorted(dict.fromkeys(i for e in group for i in owners.get(e.no, [])), key=id_order)
-        span = [f"{group[0].t:.2f} s", f"{group[-1].t:.2f} s"]
-        rows.append([shown_message(group[0].text, len(group)), f"{len(group):,}", *span, ", ".join(ids) or "—"])
+        span = [secs(group[0].t), secs(group[-1].t)]
+        rows.append([shown_message(group[0].text, len(group)), f"{len(group):,}", *span, matched_by(owners, group)])
     return rows, len(lines), len(groups)
 
 
@@ -4873,7 +4874,7 @@ def source_rows(m: Model) -> tuple[list[list[object]], int]:
     its subsystem; NOTE lines are left out, as in the keyword counts. A row gives the source, its subsystem, its
     keyword lines and all its lines, their first and last time, and the rules its lines match.
     """
-    notes = {mt.no for f in m.others if f.severity == "NOTE" for mt in f.matches}
+    notes = note_lines(m.others)
     owners = evidence_owners(m, "dmesg")
     subsystems = {e.no: name for name, lines in subsystem_lines(m.br).items() for e in lines}
     groups: dict[str, list[DmesgEntry]] = {}
@@ -4899,10 +4900,9 @@ def source_rows(m: Model) -> tuple[list[list[object]], int]:
     rows: list[list[object]] = []
     for s in flagged[:SOURCES]:
         lines = groups[s]
-        span = [f"{min(e.t for e in lines):.2f} s", f"{max(e.t for e in lines):.2f} s"]
-        ids = sorted(dict.fromkeys(i for e in lines for i in owners.get(e.no, [])), key=id_order)
+        span = [secs(min(e.t for e in lines)), secs(max(e.t for e in lines))]
         subsystem_ = subsystems.get(lines[0].no, OTHER)
-        rows.append([quote(s), subsystem_, f"{len(keyword[s]):,}", f"{len(lines):,}", *span, ", ".join(ids) or "—"])
+        rows.append([quote(s), subsystem_, f"{len(keyword[s]):,}", f"{len(lines):,}", *span, matched_by(owners, lines)])
     return rows, len(flagged)
 
 
@@ -4924,9 +4924,8 @@ def new_messages(m: Model) -> tuple[list[list[object]], int] | None:
     ranked = sorted(groups.values(), key=lambda g: (-len(g), g[0].no))
     rows: list[list[object]] = []
     for entries in ranked[:REPEATS]:
-        ids = sorted(dict.fromkeys(i for e in entries for i in owners.get(e.no, [])), key=id_order)
         message = f"{quote(entries[0].ident)}: {shown_message(entries[0].text, len(entries))}"
-        rows.append([message, f"{len(entries):,}", f"{entries[0].when:%H:%M:%S}", ", ".join(ids) or "—"])
+        rows.append([message, f"{len(entries):,}", f"{entries[0].when:%H:%M:%S}", matched_by(owners, entries)])
     return rows, len(ranked)
 
 
@@ -4943,9 +4942,8 @@ def journal_repeats(m: Model) -> tuple[list[list[object]], int]:
     rows: list[list[object]] = []
     for entries in repeated[:REPEATS]:
         cur = sum(1 for e in entries if e.boot == "current")
-        ids = sorted(dict.fromkeys(i for e in entries for i in owners.get(e.no, [])), key=id_order)
         message = f"{quote(entries[0].ident)}: {message_template(entries[0].text)}"
-        rows.append([message, f"{cur:,}", f"{len(entries) - cur:,}", ", ".join(ids) or "—"])
+        rows.append([message, f"{cur:,}", f"{len(entries) - cur:,}", matched_by(owners, entries)])
     return rows, len(repeated)
 
 
@@ -4965,21 +4963,14 @@ def evidence_owners(m: Model, stream: str) -> dict[int, list[str]]:
     return owners
 
 
-def subsystem_rows(m: Model) -> list[list[object]]:
-    """Return one row per dmesg subsystem: lines, first and last time, failure-keyword lines, and the rules matched.
+def id_list(ids: Iterable[str]) -> str:
+    """Return finding IDs and rule kinds once each, in ID order, as a Matched by cell; a dash for none."""
+    return ", ".join(sorted(dict.fromkeys(ids), key=id_order)) or "—"
 
-    The rules are named by finding ID, and by kind (WATCH, SETTING, NOTE) for the others.
-    """
-    owners = evidence_owners(m, "dmesg")
-    notes = {mt.no for f in m.others if f.severity == "NOTE" for mt in f.matches}
-    rows: list[list[object]] = []
-    for name, lines in subsystem_lines(m.br).items():
-        ids = list(dict.fromkeys(i for e in lines for i in owners.get(e.no, [])))
-        ids.sort(key=id_order)
-        keyword = sum(1 for e in lines if e.no not in notes and KEYWORD_RE.search(e.text))
-        first, last = min(e.t for e in lines), max(e.t for e in lines)
-        rows.append([name, f"{len(lines):,}", f"{first:.2f} s", f"{last:.2f} s", f"{keyword:,}", ", ".join(ids) or "—"])
-    return rows
+
+def matched_by(owners: Mapping[int, list[str]], lines: Iterable[DmesgEntry | JournalEntry]) -> str:
+    """Return the Matched by cell of a group of lines: the IDs and kinds evidence_owners() gives their lines."""
+    return id_list(i for e in lines for i in owners.get(e.no, []))
 
 
 def process_rows(m: Model) -> list[list[object]]:
@@ -4989,7 +4980,7 @@ def process_rows(m: Model) -> list[list[object]]:
     NOTE lines, as the overview counts them.
     """
     owners = evidence_owners(m, "journal")
-    notes = {mt.no for f in m.others if f.severity == "NOTE" for mt in f.matches}
+    notes = note_lines(m.others)
     by_process: dict[str, list[str]] = {}
     keyword: Counter[str] = Counter()
     for e in m.br.journal:
@@ -4998,15 +4989,14 @@ def process_rows(m: Model) -> list[list[object]]:
     procs = journal_processes(m.br)
     rows: list[list[object]] = []
     for name, cur, prev in procs[:PROCESS_ROWS]:
-        ids = sorted(dict.fromkeys(by_process.get(name, [])), key=id_order)
-        rows.append([quote(name), f"{cur:,}", f"{prev:,}", f"{keyword[name]:,}", ", ".join(ids) or "—"])
+        rows.append([quote(name), f"{cur:,}", f"{prev:,}", f"{keyword[name]:,}", id_list(by_process.get(name, []))])
     rest = procs[PROCESS_ROWS:]
     if rest:
         cur, prev = sum(r[1] for r in rest), sum(r[2] for r in rest)
-        ids = sorted(dict.fromkeys(i for name, _, _ in rest for i in by_process.get(name, [])), key=id_order)
         label = Paragraph(escape(plural(len(rest), "more process", "more processes")), sty_td)
         hits = sum(keyword[name] for name, _, _ in rest)
-        rows.append([label, f"{cur:,}", f"{prev:,}", f"{hits:,}", ", ".join(ids) or "—"])
+        ids = id_list(i for name, _, _ in rest for i in by_process.get(name, []))
+        rows.append([label, f"{cur:,}", f"{prev:,}", f"{hits:,}", ids])
     return rows
 
 
@@ -5069,11 +5059,12 @@ def cross_checks(m: Model) -> list[list[str]]:
 
 
 def _story_actions(m: Model) -> list[Flowable]:
-    """Return Section 3: commands for each action, then the checklist with each completion test."""
+    """Return Section 3: the commands for each action; the checklist with each completion test is Section 1.3."""
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-3")]
     if not m.actions:
         return [*out, para("The findings call for no action.")]
-    out.append(para("Fish commands for each action, one per line; tick the checklist as each test passes.", sty_lead))
+    lead = "Fish commands for each action, one per line; tick the action in {s:sub-1.3} once its test passes."
+    out.append(para(lead, sty_lead))
     out.extend(
         KeepTogether(
             [
@@ -5084,15 +5075,7 @@ def _story_actions(m: Model) -> list[Flowable]:
         )
         for a in m.actions
     )
-
-    def box() -> Table:
-        """Return an empty tick box."""
-        return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
-
-    rows = [[box(), a.aid, a.title, a.done_when, ""] for a in m.actions]
-    return out + table(
-        ["", "ID", "Action", "Done when", "Date / initials"], rows, [18, 34, 190, 190, 80], title="Checklist"
-    )
+    return out
 
 
 def _story_appendix(m: Model) -> list[Flowable]:
@@ -5103,9 +5086,6 @@ def _story_appendix(m: Model) -> list[Flowable]:
     )
     out += [HPara("sub-B.2"), *checks]
     return [*out, HPara("sub-B.3"), *method_bullets()]
-
-
-STATE_FIGS: dict[str, str | None] = {}
 
 
 def story(m: Model) -> list[Flowable]:
@@ -5272,16 +5252,15 @@ def page_sections(total: int) -> dict[int, str]:
 
 def render_figures(m: Model) -> int:
     """Render every figure the model supports; return how many were drawn."""
-    STATE_FIGS.clear()
-    STATE_FIGS.update(boot_figures(m))
+    STATE.charts = boot_figures(m)
     for key, draw in (
         ("after", fig_after),
         ("families", fig_families),
         ("journal", fig_journal),
         ("verify", fig_verify),
     ):
-        STATE_FIGS[key] = draw(m)
-    return sum(1 for v in STATE_FIGS.values() if v)
+        STATE.charts[key] = draw(m)
+    return sum(1 for v in STATE.charts.values() if v)
 
 
 def layout(path: Path, m: Model, log: Callable[[str], None]) -> None:
