@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.7.0"
+__version__ = "7.8.1"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -626,7 +626,7 @@ def text_lines(raw: bytes) -> list[str]:
 def parse_bugreport(path: Path, fallback: dt.datetime | None = None) -> BugReport:
     """Parse cachyos-bugreport.log; raise InputError when it does not look like one.
 
-    Journal years come from the capture time, else from fallback (the ry-verify start), else from 1970.
+    Journal years come from the capture time, else from fallback (the ry-verify start), else from 1972, a leap year.
     """
     raw = path.read_bytes()
     lines = text_lines(raw)
@@ -678,6 +678,11 @@ GENERATOR_FAILED = re.compile(r": generator failed\b")  # a FAIL record that ry-
 PHASE_BANNER = re.compile(r"^INFO: (?:Static|Runtime) verification \(")  # a phase heading logged as INFO, no result
 # ry-verify's signal handler logs this through _log, which counts nothing: no result either.
 SIGNAL_NOTICE = re.compile(r"^WARN: Caught SIG[A-Z]+ — cleaning up")
+# ERR lines ry-verify logs without counting them: continuations of a counted ERR, and a note its callers grade.
+UNCOUNTED_ERR = re.compile(
+    r"^ERR: (?:sudo required for verification$|\s+(?:Checking gfx1151/Strix Halo expectations "
+    r"|Override \(at your risk\): |ESP autodetect failed AND /boot is not a directory))"
+)
 COUNTS = re.compile(r"\b(ok|fail|warn|gen_fail)=(\d{1,9})\b")
 FOOTER_NUMBERS = ("pass", "fail", "warn", "gen_fail", "exit_code")  # footer fields the report reads as integers
 FOOTER_LIMIT = 10**9  # footer counts lie from 0 up to this, as the VERIFY_RESULT counts (COUNTS) do
@@ -760,26 +765,24 @@ def parse_verify(path: Path) -> VerifyLog:
             and at.section != "VERIFICATION SUMMARY"
             and not PHASE_BANNER.match(data)
             and not SIGNAL_NOTICE.match(data)
+            and not UNCOUNTED_ERR.match(data)
         ):
             items.append(VerifyItem(n, at.phase, at.section, m.group(1), m.group(2).strip(), at.heading))
     return VerifyLog(path, raw, records, header, foot, items, phase_results, combined)
 
 
 # ── RULES ─────────────────────────────────────────────────────────────
-# Message patterns and what they mean. Rules carry knowledge, never results: a rule only reaches the
-# report when its pattern matches a line of the inputs, and every count it shows is taken from them.
+# Message patterns and what they mean: knowledge, never results; every count comes from the input lines matched.
 SEVERITY_RANK = {"HIGH": 0, "MED": 1, "LOW": 2, "INFO": 3, "WATCH": 4, "SETTING": 5, "NOTE": 6}
 FINDING_LEVELS = ("HIGH", "MED", "LOW", "INFO")
 # A stop sequence logs its last lines within seconds; a longer window would reach into the session before it.
 SHUTDOWN_WINDOW = 15  # seconds before the previous boot's last journal entry that count as shutdown
-# Lines only a stop sequence logs. The capture keeps warnings alone, so a shutdown that logs none leaves the boot's
-# last warning in the session before it; the window counts as the shutdown only when it holds one of these.
+# Lines only a stop sequence logs; the window is the shutdown only with one, as a quiet shutdown logs no warning.
 SHUTDOWN_MARK = re.compile(
     r"Failed to enqueue SYSTEMD_(?:USER_)?WANTS job|Transaction for .* is destructive|PipeWire remote error"
     r"|context kaput|crashed \(signal (?:1|15)\)|Authentication error: .*crashed"
 )
-# Words that mark a line as a possible failure; "tainted" stays out, as an untainted kernel's splat header reads
-# "Not tainted" (a tainted kernel's "Tainted:" line is the kernel-taint rule's).
+# Words that mark a possible failure; not "tainted", as an untainted kernel's splat header reads "Not tainted".
 KEYWORDS = (
     "fail", "failed", "failure", "failures", "error", "warn", "warning", "unable", "cannot", "can't", "could not",
     "couldn't", "not supported", "unsupported", "not found", "no such", "denied", "invalid", "timeout", "timed out",
@@ -807,9 +810,7 @@ class Rule:
     idents: str = ""  # journal: the process name must match this pattern
     requires: str = ""  # the rule applies only when this pattern occurs somewhere in the bug report
     mitigated_by: str = ""  # a ry-verify OK record matching this lowers the severity to INFO
-    # A mitigation that names devices must name each one the evidence comes from: "ids", by USB vendor and product
-    # ID as 0xVVVV/0xPPPP; "names", by the product or manufacturer string dmesg logged for its USB port.
-    covers: str = ""
+    covers: str = ""  # "ids": the record names each evidence device by USB vendor and product ID, 0xVVVV/0xPPPP
 
 
 RESET_REASON = r"Previous system reset reason \[0x[0-9a-f]+\]: "  # amd.c prints one line per reason bit (6.16+)
@@ -820,8 +821,7 @@ ROUTINE_RESET = (
 )
 R = Rule
 RULES = (
-    # The five kernel error classes read dmesg only: attribute() routes the journal's kernel entries to dmesg rules,
-    # so a program that prints "Oops" or "I/O error" is not taken for the kernel.
+    # The five kernel error classes read dmesg only, so a program that prints "Oops" is not taken for the kernel.
     R("kernel-splat", "Kernel oops, BUG, or warning splat", "Kernel", "HIGH", ("dmesg",),
       (r"\bOops\b", r"\bBUG: ", r"kernel BUG at ", r"^general protection fault",
        r"^WARNING: (?:CPU: \d+ PID: \d+ |.*, CPU#\d+: )", r"^UBSAN: ", r"INFO: task .+ blocked for more than",
@@ -968,8 +968,7 @@ RULES = (
     R("usb-volume", "USB audio device reports a tiny hardware volume range", "Audio / USB", "LOW", ("dmesg",),
       (r"Unlikely small volume range",),
       "The device's hardware volume control spans so little that the slider has almost no effect.",
-      "Enable WirePlumber's soft mixer (api.alsa.soft-mixer) for the card.", mitigated_by=r"(?i)soft.?mixer",
-      covers="names"),
+      "Enable WirePlumber's soft mixer (api.alsa.soft-mixer) for the card."),
     R("jack-server", "jack2 is installed beside PipeWire", "Audio / JACK", "LOW", ("inxi",), (r"Server-\d+: JACK",),
       "jack2 provides libjack, so JACK clients bypass PipeWire.",
       "Replace jack2 with pipewire-jack.", mitigated_by=r"pipewire-jack"),
@@ -1039,9 +1038,7 @@ IDENT_RES = {r.key: re.compile(r.idents) for r in RULES if r.idents}
 ERROR_RULES = ("kernel-splat", "kernel-taint", "gpu-hang", "storage-errors", "oom-kill", "reset-abnormal", "core-dump")
 KERNEL_ERRORS = ERROR_RULES[:5]  # the error classes journalctl -k shows; resets and core dumps have their own actions
 # Identifiers that make a quote traceable to one machine or person, with the placeholder mask() puts in their place.
-# Hex digits, not word boundaries, delimit the hex forms, so an identifier stays found after an underscore
-# (dev_AC_80_…) or an escape sequence's final letter.
-HEX_BEFORE, HEX_AFTER = r"(?<![0-9A-Fa-f])", r"(?![0-9A-Fa-f])"
+HEX_BEFORE, HEX_AFTER = r"(?<![0-9A-Fa-f])", r"(?![0-9A-Fa-f])"  # not \b, which an underscore (dev_AC_80_) hides
 UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 NIL_UUID = r"0{8}-0{4}-[0-9]0{3}-[0-9a-fA-F]0{3}-0{12}"  # the nil UUID, or a placeholder with only version and variant
 UNIT_DASH = r"\\x2d"  # systemd escapes "-" in unit names, as in dev-disk-by\x2duuid-0f8e3a2c\x2d1b4d…
@@ -1082,9 +1079,7 @@ PLACEHOLDER = re.compile(
 # About five lines of monospace; past that, a line is a data dump (a hex buffer, a long command line).
 QUOTE_LIMIT = 400  # characters of a log line quoted in the report; the rest is cut with an ellipsis
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # CSI sequences a program may have written into a log
-# C0 and C1 controls other than tab and newline, the Unicode line and paragraph separators, and the invisible format
-# characters that hide or reorder text: the soft hyphen, zero-width and directional marks, embeddings, overrides,
-# isolates, the byte order mark, and the interlinear annotation marks.
+# C0 and C1 controls but tab and newline, line and paragraph separators, and invisible marks that hide or reorder text.
 CONTROL = re.compile(
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff"
     r"\ufff9-\ufffb]"
@@ -1354,7 +1349,7 @@ def inxi_line_at(br: BugReport, start: int, joined: str, rule: Rule) -> tuple[in
     return start, joined.strip()
 
 
-def apply_mitigations(found: dict[str, Finding], vj: VerifyLog, br: BugReport) -> None:
+def apply_mitigations(found: dict[str, Finding], vj: VerifyLog) -> None:
     """Lower a finding to INFO when ry-verify reports its mitigation in place, citing the record.
 
     Any FAIL, GEN_FAIL, or WARN record about the mitigation keeps the finding as it is (a file in place that the
@@ -1369,7 +1364,7 @@ def apply_mitigations(found: dict[str, Finding], vj: VerifyLog, br: BugReport) -
         related = [i for i in vj.items if re.search(rule.mitigated_by, i.text)]
         if any(i.counted in ("FAIL", "GEN_FAIL", "WARN") for i in related):
             continue
-        devices = evidence_devices(rule, f, br) if rule.covers else []
+        devices = evidence_devices(f) if rule.covers else []
         if devices is None:
             continue
         ok = [i for i in related if i.status == "OK" and names_devices(f"{i.heading} {i.text}", devices)]
@@ -1383,46 +1378,26 @@ def apply_mitigations(found: dict[str, Finding], vj: VerifyLog, br: BugReport) -
 
 
 USB_ID = re.compile(r"\b[0-9A-Fa-f]{4}:([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})\.")  # a HID device: bus:vendor:product.N
-USB_PORT = re.compile(r"\busb (\d+-[\d.]+): ")  # a USB device by its port, as in usb 3-4: …
-USB_STRING = re.compile(r"^usb (\d+-[\d.]+): (Product|Manufacturer): (.+)$")
 
 
-def evidence_devices(rule: Rule, f: Finding, br: BugReport) -> list[frozenset[str]] | None:
-    """Return, per evidence line, the names a mitigation may give its device, lowercased; None when one has none.
+def evidence_devices(f: Finding) -> list[str] | None:
+    """Return, per evidence line, the name a mitigation must give its device, lowercased; None when one has none.
 
-    "ids" reads a HID device's vendor and product IDs from the line, as 0xvvvv/0xpppp. "names" reads a USB port from
-    the line and takes the product and manufacturer dmesg last logged for that port before it, each also by its first
-    word when that has four characters or more (POROSVOC of POROSVOC USB Audio); a current-boot journal entry takes
-    the port's last ones, and a previous-boot entry, whose devices dmesg does not hold, none.
+    The name is the HID device's vendor and product ID the line states, as 0xvvvv/0xpppp.
     """
-    logged: dict[str, list[tuple[int, str, str]]] = {}
-    for e in br.dmesg if rule.covers == "names" else ():
-        if hit := USB_STRING.match(e.text):
-            logged.setdefault(hit.group(1), []).append((e.no, hit.group(2), hit.group(3).strip().lower()))
     out = []
     for mt in f.matches:
-        if rule.covers == "ids":
-            ids = USB_ID.search(mt.text)
-            names = {f"0x{ids.group(1)}/0x{ids.group(2)}".lower()} if ids else set()
-        else:
-            port = USB_PORT.search(mt.text)
-            strings = logged.get(port.group(1), []) if port else []
-            if mt.stream == "dmesg":
-                strings = [s for s in strings if s[0] < mt.no]
-            elif mt.boot != "current":
-                strings = []
-            last = {kind: name for _, kind, name in strings}.values()  # the port's last product and manufacturer
-            names = {*last, *(word for name in last if len(word := name.split(" ", 1)[0]) >= 4)}  # and a brand word
-        if not names:
+        ids = USB_ID.search(mt.text)
+        if ids is None:
             return None
-        out.append(frozenset(names))
+        out.append(f"0x{ids.group(1)}/0x{ids.group(2)}".lower())
     return out
 
 
-def names_devices(text: str, devices: Sequence[frozenset[str]]) -> bool:
-    """Return whether text names each device by one of its names, as a whole word, ignoring case."""
+def names_devices(text: str, devices: Sequence[str]) -> bool:
+    """Return whether text names each device, as a whole word, ignoring case."""
     low = text.lower()
-    return all(any(re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", low) for n in names) for names in devices)
+    return all(re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", low) for name in devices)
 
 
 def hardware_mismatch(vj: VerifyLog) -> VerifyItem | None:
@@ -1495,16 +1470,16 @@ def verify_findings(vj: VerifyLog) -> list[Finding]:
     return out
 
 
-VERIFY_SCRIPT = "~/ry-install/ry-verify.fish"  # the rerun's script when the log's header names no usable path
+VERIFY_SCRIPT = "~/ry-verify/ry-verify.fish"  # where ry-verify's README clones it, for a header with no usable path
 
 
 def verify_script(vj: VerifyLog) -> str:
     """Return the ry-verify script that wrote the log as one fish word, a home directory as ~.
 
     ry-verify logs its argv with the path it was run by first, as typed. Only an absolute path finds the script from
-    any directory; a relative one, one the report would mask, one with whitespace other than a space (a tab, a line
-    break, a no-break space), which a page cannot show as typed, and one too long for a command line give
-    VERIFY_SCRIPT.
+    any directory; a relative one (./ry-verify.fish, as its README runs it), one the report would mask, one with
+    whitespace other than a space (a tab, a line break, a no-break space), which a page cannot show as typed, and one
+    too long for a command line give VERIFY_SCRIPT.
     """
     argv = vj.header.get("argv")
     path = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) else ""
@@ -1659,6 +1634,7 @@ def verify_sections(vj: VerifyLog) -> list[tuple[str, str, dict[str, int]]]:
     return [(phase, section, counts) for (phase, section), counts in order.items()]
 
 
+CELSIUS = "\u00a0°C"  # an inxi temperature's unit, bound to its number by a no-break space
 INXI_FACTS = (  # (key, inxi block, pattern, template); patterns run on the block's logical lines joined by newlines
     ("machine", "Machine", r"System:\s*(.+?)\s+product:\s*(.+?)\s+(?:v:|serial:)", "{0} {1}"),
     (  # inxi 3.3 prints "Firmware: UEFI vendor: … v: … date: …", older releases "UEFI: … v: … date: …"
@@ -1681,7 +1657,7 @@ INXI_FACTS = (  # (key, inxi block, pattern, template); patterns run on the bloc
     ("drive", "Drive-1", r"ID-1:\s*/dev/(\w+)\s.*?model:\s*(.+?)(?=\s+(?:drive vendor|drive model|family|size):|$)",
      "{0} {1}"),
     ("smart", "Drive-1", r"health:\s*(\w+)", "{0}"),
-    ("drive-temp", "Drive-1", r"\btemp:\s*([\d.]+ C)", "{0}"),
+    ("drive-temp", "Drive-1", r"\btemp:\s*([\d.]+) C\b", "{0}" + CELSIUS),
     ("written", "Drive-1", r"written(?:-units)?:\s*(?:[\d,]+\s+\[)?([\d.]+ \w+)", "{0} written"),  # NVMe: units [size]
 )  # fmt: skip
 
@@ -1842,9 +1818,9 @@ def gpu_health(m: Model) -> list[tuple[str, str, str, str]]:
 
 
 def sensor_temps(text: str) -> list[str]:
-    """Return inxi's CPU, board, and GPU temperatures as "cpu 49.6 C", in the order inxi prints them."""
-    found = re.findall(r"\b(cpu|mobo|gpu)\S*:(?:\s+\S+\s+temp:)?\s+([\d.]+ C)\b", text)
-    return [f"{name} {value}" for name, value in found]
+    """Return inxi's CPU, board, and GPU temperatures as "cpu 49.6 °C", in the order inxi prints them."""
+    found = re.findall(r"\b(cpu|mobo|gpu)\S*:(?:\s+\S+\s+temp:)?\s+([\d.]+) C\b", text)
+    return [f"{name} {value}{CELSIUS}" for name, value in found]
 
 
 def hardware_health(m: Model) -> list[tuple[str, str, str, str]]:
@@ -1889,9 +1865,7 @@ def keyword_entries(br: BugReport, boilerplate: set[int]) -> dict[str, int]:
     }
 
 
-# dmesg subsystems: the prefix a kernel message starts with names the driver, facility, or device that printed it.
-# The first subsystem whose pattern matches the whole prefix, in lowercase, claims the line; a line whose prefix no
-# pattern matches, or that has none, counts as Other.
+# dmesg subsystems: the first whose pattern matches a message's whole prefix, lowercased, claims it; else Other.
 SUBSYSTEMS = (
     ("GPU", ("amdgpu", "drm", "radeon", "i915", "xe", "nouveau", r"nvidia\w*", "simpledrm", "efifb", "fbcon",
              "vgaarb")),
@@ -2150,7 +2124,7 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
     rules = applicable_rules(br)
     found = attribute(br, rules)
     if not other_machine(vj, facts.get("cpu", "")):  # another machine's records say nothing about this one
-        apply_mitigations(found, vj, br)
+        apply_mitigations(found, vj)
     findings = [f for f in found.values() if f.severity in FINDING_LEVELS] + verify_findings(vj)
     findings.sort(key=register_order)
     counters: dict[str, int] = {}
@@ -2182,8 +2156,7 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
 
 
 # ── FIGURES ───────────────────────────────────────────────────────────
-# Vector charts from the model: matplotlib with text as paths, embedded through svglib; grayscale only. svglib draws
-# no SVG patterns, so styles differ by gray level and outline, never by hatching.
+# Grayscale vector charts: matplotlib, text as paths, through svglib, which draws no hatching: grays and outlines.
 C_INK, C_DARK, C_MID, C_LIGHT = "#1d1d1d", "#3c3c3c", "#8a8a8a", "#c9c9c9"
 CW = 7.1  # chart width in inches: the 512 pt text frame
 FIG_MAX_HEIGHT = 8.0  # inches; a row-scaled chart stops growing here so it fits a page with its caption
@@ -2209,15 +2182,6 @@ STATUS_STYLE: dict[str, dict[str, Any]] = {
     "WARN": {"color": C_MID},
     "GEN_FAIL": {"color": "#555555"},
     "FAIL": {"color": C_INK},
-}
-SEVERITY_STYLE: dict[str, dict[str, Any]] = {  # darker for more severe; watch items, settings outlined; NOTE lightest
-    "HIGH": {"color": C_INK},
-    "MED": {"color": "#4a4a4a"},
-    "LOW": {"color": "#777777"},
-    "INFO": {"color": "#a4a4a4"},
-    "WATCH": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.8, "ls": (0, (3, 1.5))},
-    "SETTING": {"facecolor": "white", "edgecolor": C_INK, "lw": 0.8, "ls": (0, (0.8, 1.2))},
-    "NOTE": {"color": "#d4d4d4"},
 }
 
 
@@ -2335,8 +2299,7 @@ def capture_points(m: Model) -> dict[str, float]:
 BOOT_SPAN = 600.0  # seconds of the ring buffer the boot chart covers at most
 BOOT_MIN_SPAN = 1.0  # s, the least it covers, so lines all stamped near 0 s still draw a chart
 BOOT_PAUSE = 30.0  # s; the boot's dmesg burst ends at the first pause this long after the last milestone
-# Milestones that are the boot whenever they come, as after a long wait for a disk passphrase; a Wi-Fi association
-# after BOOT_SPAN is the running system's.
+# Milestones of the boot whenever they come (a slow disk passphrase); Wi-Fi associating after BOOT_SPAN is not one.
 BOOT_MARKS = ("initrd starts", "init starts", "Root mounted", "Switching root")
 BOOT_BARS = 120  # most bars the boot chart draws
 BAR_WIDTHS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)  # s, the bar widths the boot chart picks from
@@ -2627,50 +2590,6 @@ def fig_verify(m: Model) -> str | None:
     handles = [Patch(label=k, **STATUS_STYLE[k]) for k in present]
     fig.legend(handles=handles, loc="outside lower center", ncol=len(handles))
     return save(fig, "verify")
-
-
-def family_rows(m: Model) -> list[tuple[str, int, str]]:
-    """Return (family, dmesg lines, disposition) rows: rules with dmesg evidence by count, then the rest.
-
-    Equal counts sort by disposition, then by finding number, then by title; the boilerplate (NOTE) families share
-    one row, last, which a single one heads with its own title.
-    """
-    found = [f for f in [*m.findings, *m.others] if f.count("dmesg")]
-    ranked = sorted(
-        (f for f in found if f.severity != "NOTE"),
-        key=lambda f: (-f.count("dmesg"), SEVERITY_RANK[f.severity], int(f.fid.partition("-")[2] or 0), f.title),
-    )
-    rows = [(f"{f.fid}  {f.title}" if f.fid else f.title, f.count("dmesg"), f.severity) for f in ranked]
-    notes = [f for f in found if f.severity == "NOTE"]
-    if notes:
-        label = notes[0].title if len(notes) == 1 else f"Boilerplate, {len(notes):,} families"
-        rows.append((label, sum(f.count("dmesg") for f in notes), "NOTE"))
-    return rows
-
-
-def fig_families(m: Model) -> str | None:
-    """Draw dmesg lines per family, styled by disposition."""
-    rows = family_rows(m)[::-1]
-    if not rows:
-        return None
-    plt = _mpl()
-    from matplotlib.patches import Patch
-    from matplotlib.ticker import MaxNLocator
-
-    fig, ax = plt.subplots(figsize=(CW, fig_height(0.75, 0.17, len(rows))), layout="constrained")
-    for i, (_name, value, sev) in enumerate(rows):
-        ax.barh(i, value, height=0.62, **SEVERITY_STYLE[sev])
-        value_label(ax, value, i, f"{value:,}")
-    ax.set_yticks(range(len(rows)), [r[0] for r in rows])
-    ax.set_ylim(-0.6, len(rows) - 0.4)
-    ax.set_xlim(0, max(r[1] for r in rows) * 1.12 + 1)
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.set_xlabel("dmesg lines", fontsize=7.2)
-    clean(ax)
-    present = [s for s in SEVERITY_STYLE if any(r[2] == s for r in rows)]
-    handles = [Patch(label=s, **SEVERITY_STYLE[s]) for s in present]
-    fig.legend(handles=handles, loc="outside lower center", ncol=len(handles))
-    return save(fig, "families")
 
 
 TICKS = 2000  # tick positions a row draws at most across its axis: four per point at full width
@@ -3019,7 +2938,8 @@ sty_card_id = style("cid", fontName="PlexM-SB", fontSize=11, leading=13)
 sty_card_title = style("ctt", fontName="Plex-SB", fontSize=9.4, leading=12)
 sty_chip = style("chip", fontName="PlexC-SB", fontSize=6.8, leading=8, alignment=TA_CENTER)
 sty_code_label = style("cbl", fontName="PlexC-SB", fontSize=6.8, leading=8.5, textColor=colors.white)
-sty_info_meaning = style("im", parent=sty_td, fontSize=7.3, leading=9.4, textColor=MUTE)
+INFO_SIZE = 7.3  # pt, the meaning text of Appendix A, whose notes break to fit their column
+sty_info_meaning = style("im", parent=sty_td, fontSize=INFO_SIZE, leading=9.4, textColor=MUTE)
 sty_cover_title = style("ct", fontName="Plex-SB", fontSize=25, leading=29, spaceAfter=6)
 sty_cover_line = style("cs", fontSize=10.2, leading=13.5, textColor=MUTE)
 sty_cover_date = style("cs2", parent=sty_cover_line, spaceAfter=12)
@@ -3027,7 +2947,8 @@ sty_cover_label = style("cl", fontName="PlexC-SB", fontSize=6.6, leading=8.6, te
 sty_verdict_head = style("vh", fontName="Plex-SB", fontSize=12.5, leading=16, spaceAfter=2)
 sty_verdict = style("vb", fontSize=8.6, leading=11.8)
 sty_kpi_group = style("kg", parent=sty_cover_label, textColor=INK, alignment=TA_CENTER)
-sty_kpi_value = style("kb", fontName="Plex-SB", fontSize=17, leading=19, alignment=TA_CENTER)
+KPI_FONT, KPI_SIZE = "Plex-SB", 17.0  # the cover counts' face, and their size while the widest fits its column
+sty_kpi_value = style("kb", fontName=KPI_FONT, fontSize=KPI_SIZE, leading=19, alignment=TA_CENTER)
 sty_kpi_label = style("ks", parent=sty_cover_label, alignment=TA_CENTER)
 sty_tile_value = style("hv", fontName="Plex-SB", fontSize=10.5, leading=13)
 sty_tile_detail = style("hs", fontName="PlexC", fontSize=6.6, leading=8.2, textColor=SOFT)
@@ -3106,24 +3027,30 @@ def fmt(text: str, st: ParagraphStyle | None = None) -> str:
     return REF_KEYS.sub(lambda m: pref(m.group(1)), out).translate(UNLITERAL)
 
 
+def line_cut(text: str, limit: int) -> tuple[int, int]:
+    """Return where a line of at most limit characters of text ends, and where the next line starts.
+
+    The line ends at its last space that fits, else after a slash or another separator, else at the limit.
+    """
+    cut = text.rfind(" ", len(text) - len(text.lstrip(" ")) + 1, limit + 1)
+    if cut > 0:
+        return cut, cut + 1
+    cut = max(text.rfind(c, 0, limit) for c in "/,;:=&") + 1
+    cut = cut if cut > limit // 3 else limit
+    return cut, cut
+
+
 def mono_markup(text: str, width: float, size: float) -> str:
     """Return text as monospace Paragraph markup broken into lines that fit width, keeping runs of spaces.
 
-    A line breaks at its last space that fits, else after a slash or another separator, else at the width; a
-    Paragraph alone would collapse the spaces and break a long path anywhere.
+    Lines break as line_cut() says; a Paragraph alone would collapse the spaces and break a long path anywhere.
     """
     limit = max(8, int((width - 0.5) / (size * MONO_ADVANCE)))
     lines = []
     while len(text) > limit:
-        cut = text.rfind(" ", len(text) - len(text.lstrip(" ")) + 1, limit + 1)
-        if cut > 0:
-            lines.append(text[:cut])
-            text = text[cut + 1 :]
-            continue
-        cut = max(text.rfind(c, 0, limit) for c in "/,;:=&") + 1
-        cut = cut if cut > limit // 3 else limit
-        lines.append(text[:cut])
-        text = text[cut:]
+        end, start = line_cut(text, limit)
+        lines.append(text[:end])
+        text = text[start:]
     lines.append(text)
 
     def keep(line: str) -> str:
@@ -3132,6 +3059,25 @@ def mono_markup(text: str, width: float, size: float) -> str:
         return re.sub(r" {2,}", lambda m: NBSP * (len(m.group(0)) - 1) + " ", line)
 
     return "<br/>".join(keep(line) for line in lines)
+
+
+def fit_markup(text: str, width: float, font: str, size: float) -> str:
+    """Return plain text escaped for a Paragraph line of its own, broken by line_cut() when a word is too wide.
+
+    A Paragraph cuts a word wider than its line at the width, mid-name; such text is broken into lines here, each
+    the most of it that fits. Text whose words all fit is left for the Paragraph to wrap.
+    """
+    room = width - 0.5
+    if all(stringWidth(word, font, size) <= room for word in text.split(" ")):  # where line_cut() breaks
+        return esc(text)
+    lines = []
+    while stringWidth(text, font, size) > room:
+        fits = sum(1 for w in itertools.accumulate(stringWidth(c, font, size) for c in text) if w <= room)
+        end, start = line_cut(text, max(1, fits))
+        lines.append(text[:end])
+        text = text[start:]
+    lines.append(text)
+    return "<br/>".join(esc(line) for line in lines)
 
 
 UNIT_SPACE = re.compile(r"(?<=\d) (?=(?:ms|s|min|h)\b)")  # the space between a number and its time unit
@@ -3178,7 +3124,6 @@ STRUCT = (
     ("sub-6.1", 1, "6.1", "Overview"),
     ("sub-6.2", 1, "6.2", "By source"),
     ("sub-6.3", 1, "6.3", "Repeated warnings"),
-    ("sub-6.4", 1, "6.4", "By rule family"),
     ("sec-7", 0, "7", "Journal"),
     ("sub-7.1", 1, "7.1", "Overview"),
     ("sub-7.2", 1, "7.2", "Timeline"),
@@ -3702,6 +3647,20 @@ def verdict_panel(m: Model) -> Table:
     return panel
 
 
+KPI_PAD = 5.0  # pt either side of a cover count, so that two wide neighbors still read as two
+KPI_MIN_SIZE = 8.0  # pt; the cover counts shrink together until the widest fits its column, to this size at least
+
+
+def kpi_style(values: Sequence[str], width: float) -> ParagraphStyle:
+    """Return the cover counts' style: sty_kpi_value, or one smaller size for all at which the widest fits width."""
+    widest = max(stringWidth(v, KPI_FONT, 1) for v in values)
+    size = int(min(KPI_SIZE, (width - 2 * KPI_PAD) / widest) * 10) / 10  # tenths of a point, rounded down
+    if size >= KPI_SIZE:
+        return sty_kpi_value
+    size = max(KPI_MIN_SIZE, size)
+    return style("kb-fit", parent=sty_kpi_value, fontSize=size, leading=size + 2)
+
+
 def kpi_strip(m: Model) -> Table:
     """Return the cover's count strip: findings, watch items, dmesg lines and journal entries, ry-verify results."""
     c, t = severity_counts(m), m.vj.totals
@@ -3712,20 +3671,20 @@ def kpi_strip(m: Model) -> Table:
         ("RY-VERIFY", [("FAIL", t["fail"]), ("WARN", t["warn"]), ("GEN_FAIL", t["gen_fail"])]),
     )
     items = [i for _, g in groups for i in g]
+    width, values = FW / len(items), [f"{v:,}" for _, v in items]
     row0: list[object] = []
     for name, g in groups:
         row0 += [Paragraph(name, sty_kpi_group), *[""] * (len(g) - 1)]
-    data = [
-        row0,
-        [Paragraph(f"{v:,}", sty_kpi_value) for _, v in items],
-        [Paragraph(k, sty_kpi_label) for k, _ in items],
-    ]
-    strip = Table(data, colWidths=[FW / len(items)] * len(items), rowHeights=[13, 22, 12])
+    value = kpi_style(values, width)
+    data = [row0, [Paragraph(v, value) for v in values], [Paragraph(k, sty_kpi_label) for k, _ in items]]
+    strip = Table(data, colWidths=[width] * len(items), rowHeights=[13, 22, 12])
     commands: list[tuple[object, ...]] = [
         ("LINEBELOW", (0, 0), (-1, 0), HAIR, RULE),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 1),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+        ("LEFTPADDING", (0, 1), (-1, 1), KPI_PAD),
+        ("RIGHTPADDING", (0, 1), (-1, 1), KPI_PAD),
     ]
     col = 0
     for i, (_, g) in enumerate(groups):
@@ -4090,8 +4049,8 @@ def method_bullets() -> list[Flowable]:
                 ),
                 (
                     "ry-verify FAIL and GEN_FAIL records become MED findings and WARN records LOW ones, one per "
-                    "phase, section, and status; ERR counts as FAIL and a generator failure as GEN_FAIL; the "
-                    "hardware-mismatch warning is no finding."
+                    "phase, section, and status; an ERR record ry-verify counts is a FAIL and a generator failure a "
+                    "GEN_FAIL; the hardware-mismatch warning is no finding."
                 ),
                 (
                     f"The previous boot's last {SHUTDOWN_WINDOW} s of journal entries also meet the shutdown-noise "
@@ -4378,13 +4337,19 @@ def error_class_rows(m: Model) -> list[list[object]]:
     return rows
 
 
+INFO_WIDTHS = (34, 290, 116, 36, 36)  # pt, Appendix A's columns: ID, meaning, lines, two journal counts
+
+
 def info_rows(m: Model) -> list[list[object]]:
     """Return one row per INFO finding: ID, message class with its meaning and notes, lines, journal counts."""
     rows: list[list[object]] = []
+    room = INFO_WIDTHS[1] - CELL_PAD
     for f in m.findings:
         if f.severity != "INFO":
             continue
-        notes = "".join(f'<br/><font name="Plex-It">{esc(n)}</font>' for n in f.notes)  # PlexC has no italic
+        notes = "".join(  # PlexC has no italic
+            f'<br/><font name="Plex-It">{fit_markup(n, room, "Plex-It", INFO_SIZE)}</font>' for n in f.notes
+        )
         text = [
             Paragraph(f"<b>{escape(f.title)}</b>", sty_td),
             Paragraph(fmt(f.explanation, sty_info_meaning) + notes, sty_info_meaning),
@@ -4467,7 +4432,7 @@ def _story_explained(m: Model) -> list[Flowable]:
     if not (rows := info_rows(m)):
         return [*out, para("No finding is INFO.")]
     head = ["ID", "Message class and meaning", "Lines", "Cur.", "Prev."]
-    return out + table(head, rows, [34, 290, 116, 36, 36], title="INFO findings and what they mean", right=(3, 4))
+    return out + table(head, rows, INFO_WIDTHS, title="INFO findings and what they mean", right=(3, 4))
 
 
 def failure_rows(m: Model) -> tuple[list[list[object]], dict[int, str]]:
@@ -4565,7 +4530,7 @@ def journal_caption(m: Model) -> str:
     unit = journal_unit(m, "current")
     clock = {"current": f"{unit[1].lower()} since the kernel start" if unit else "wall clock", "previous": "wall clock"}
     widths = " and per ".join(f"{width_text(w)} in the {boot} boot ({clock[boot]})" for boot, (_, w) in panels.items())
-    peak = max(n for bars, _ in panels.values() for _, n in bars)
+    peak = max(n for bars, _width in panels.values() for _x, n in bars)
     text = f"Journal entries per {widths}{', log scale' if peak >= JOURNAL_LOG else ''}"
     if not journal_timeline_rows(m):
         return text + "."
@@ -4602,15 +4567,8 @@ def after_absent(m: Model) -> str:
     return "No dmesg line follows the boot's burst."
 
 
-def families_caption(m: Model) -> str:
-    """Return the rule-family chart's caption, naming only the kinds of rows drawn."""
-    notes = sum(1 for f in m.others if f.severity == "NOTE" and f.count("dmesg"))
-    shared = "; the NOTE families share one bar" if notes > 1 else ""
-    return f"dmesg lines per rule family, styled by disposition{shared}."
-
-
 def _story_dmesg(m: Model) -> list[Flowable]:
-    """Return Section 6: the lines by subsystem and after the boot, the sources, repeats, and rule families."""
+    """Return Section 6: the lines by subsystem and after the boot, the sources with failure keywords, and repeats."""
     if not m.br.dmesg:
         return [CondPageBreak(SECTION_ROOM), HPara("sec-6"), para("The bug report holds no dmesg line.")]
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-6"), HPara("sub-6.1"), para(dmesg_lead(m), sty_lead)]
@@ -4645,11 +4603,7 @@ def _story_dmesg(m: Model) -> list[Flowable]:
                      right=(1, 2, 3))  # fmt: skip
     else:
         out.append(para("No dmesg line with a failure keyword repeats, boilerplate aside."))
-    out.append(HPara("sub-6.4"))
-    return out + (
-        svgfig(STATE.charts.get("families"), "dmesg lines by rule family", families_caption(m))
-        or [para("No dmesg line matches a rule.")]
-    )
+    return out
 
 
 def _story_journal(m: Model) -> list[Flowable]:
@@ -4720,12 +4674,15 @@ def _journal_comparison(m: Model) -> list[Flowable]:
 
 
 def dmesg_lead(m: Model) -> str:
-    """Return the sentence above the dmesg subsystem table: the lines, their span, and how many a rule matches."""
+    """Return the sentence above the dmesg subsystem table: lines, span, and how many a rule (a NOTE rule) matches."""
     d = m.br.dmesg
     first, last = min(e.t for e in d), max(e.t for e in d)
     span = secs(first) if secs(first) == secs(last) else secs_span(first, last)
     matched = sum(f.count("dmesg") for f in [*m.findings, *m.others])
     rules = f"{matched:,} {'matches' if matched == 1 else 'match'} a rule" if matched else "none matches a rule"
+    if notes := sum(f.count("dmesg") for f in m.others if f.severity == "NOTE"):  # no table totals NOTE lines
+        share = ("both" if matched == 2 else "all") if notes == matched else f"{notes:,}"
+        rules += ", a NOTE rule" if matched == 1 else f", {share} of them a NOTE rule"
     return f"{plural(len(d), 'dmesg line')}, {span} since the kernel start; {rules}."
 
 
@@ -5036,8 +4993,8 @@ def cross_checks(m: Model) -> list[list[str]]:
         result = "match" if found == stated else f"differs: records give {gave}"
         out.append([f"ry-verify {phase} records match its VERIFY_RESULT ({said})", result])
     if m.vj.combined and m.vj.footer:
-        pairs = (("ok", "pass"), ("fail", "fail"), ("warn", "warn"), ("gen_fail", "gen_fail"))
-        same = all(m.vj.combined.get(c, 0) == m.vj.footer.get(f, 0) for c, f in pairs)
+        fields = (("ok", "pass"), ("fail", "fail"), ("warn", "warn"), ("gen_fail", "gen_fail"))
+        same = all(m.vj.combined.get(c, 0) == m.vj.footer.get(f, 0) for c, f in fields)
         out.append(
             ["ry-verify combined totals match the footer (OK, FAIL, WARN, GEN_FAIL)", "match" if same else "differs"]
         )
@@ -5255,7 +5212,6 @@ def render_figures(m: Model) -> int:
     STATE.charts = boot_figures(m)
     for key, draw in (
         ("after", fig_after),
-        ("families", fig_families),
         ("journal", fig_journal),
         ("verify", fig_verify),
     ):
@@ -5571,10 +5527,9 @@ def print_path(path: Path) -> None:
 
 
 if __name__ == "__main__":
-    status = main()
+    _status = main()
     for _stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(AttributeError, OSError, ValueError):  # a stream closed or never opened
             _stream.flush()
-    # The run is over and its files are gone. The interpreter's teardown would restore the default signal handlers,
-    # so that a signal then kills the process, and a C extension an interrupt caught half loaded can crash in it.
-    os._exit(status)
+    # Its files are gone: skip teardown, which restores default signal handlers and can crash a half-loaded extension.
+    os._exit(_status)

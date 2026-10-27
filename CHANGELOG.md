@@ -4,6 +4,33 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.8.1
+-----
+
+  - report: the cover counts share one type size at which the widest fits
+    its column; a four-digit count no longer wraps over its label
+  - report: temperatures carry a degree sign; a word too wide for its
+    Appendix A column breaks after a separator, not mid-name
+  - report: the method says ERR is a FAIL only where ry-verify counts it
+
+
+7.8.0
+-----
+
+  - report: the dmesg lines by rule family chart and Section 6.4 are gone;
+    the 6.1 lead counts the lines a NOTE rule matches
+  - actions: the ry-verify rerun falls back to ~/ry-verify/ry-verify.fish,
+    where ry-verify's README clones it, not ~/ry-install/ry-verify.fish
+  - rules: usb-volume loses its soft-mixer mitigation, which no ry-verify
+    record has named since 7.229.0; mitigations name devices by USB ID
+  - ry-verify: ERR lines it logs without counting them (continuations,
+    the boot-path note) are no results, so the cross-checks agree
+  - code: comments are single lines and the year-fallback docstring says
+    1972; status, pairs, and a generator's _ no longer reuse names
+  - docs: README runs ~/ry-verify/ry-verify.fish and names ry-verify
+    7.256.0, ReportLab 5.1.0, ruff 0.17.3, and ty 0.0.92 as tested
+
+
 7.7.0
 -----
 
