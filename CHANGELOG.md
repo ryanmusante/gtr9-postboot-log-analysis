@@ -4,6 +4,31 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.9.0
+-----
+
+  - report: the action checklist moves to the cover from Section 1.3, with
+    the findings each action answers, under a log-scale uptime strip
+  - report: severity marks (a filled, half-filled, or open square) stand
+    beside the levels, and each running header tallies HIGH, MED, and LOW
+  - report: the footer names each input's SHA256 prefix; the PDF opens with
+    its bookmarks, states en-US, and names the machine in its title
+  - report: the PDF carries both inputs as attachments unless --no-attach
+  - cli: --brief builds the cover and Sections 1 to 3; a reference past
+    them names the full report
+  - cli: --json writes a summary and --compare reads one: the register
+    marks findings new, worse, better, or same and names those resolved
+  - rules: gpu-hang claims the process and ring-reset lines of its event;
+    a WATCH rule covers MT79xx firmware timeouts and cites ry-verify's ASPM
+  - figures: WARN, GEN_FAIL, and the initrd phase are striped, as svglib
+    drops hatching and close grays blur in black-and-white print
+  - layout: ry-verify records that share a template are one row; 6.3 drops
+    its table when the after-boot table lists every repeat
+  - layout: a word too wide for a table cell breaks after a separator
+  - docs: README lists the failure keywords, which B.3 now counts, and
+    covers the new options, the JSON summary, context, and cites
+
+
 7.8.1
 -----
 
