@@ -4,6 +4,51 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.9.2
+-----
+
+  - rules: storage-errors matches the block layer's device offline and
+    reservation conflict errors (critical nexus before 6.5)
+  - report: Section 6.2 names a block-layer error's source by its device,
+    as it does for an I/O error
+  - report: Appendix B.3 names the lines a rule claims for an event
+  - figures: axis titles share one type size, and text inside a chart
+    another
+  - cli: --help lists the options in the README's order with PATH and DIR
+    values, --help last
+  - cli: a preflight error names why an input or a font file cannot be read
+  - cli: --verbose names the font directory and the Python and library
+    versions, under --check too
+  - cli: --verbose names the --compare summary read and the JSON summary
+    written
+  - code: two comments, a plain-string regex, and two docstrings corrected
+  - docs: README covers lead patterns and the tested svglib 2.3.2 and ty
+    0.0.93; the minimum versions build the same PDF
+
+
+7.9.1
+-----
+
+  - rules: gpu-hang claims the ring-reset lines, and the process line right
+    after a timeout, as kernels 6.12 to 7.3 word them
+  - rules: gpu-hang matches GPU Recovery Failed, and its explanation covers
+    a recovery that fails
+  - report: a machine name too long for the running header is cut, so the
+    HIGH, MED, and LOW tally always shows
+  - report: --compare names a summary from another machine as such; a
+    finding INFO then counts as new, one INFO now as resolved
+  - report: --compare names resolved findings by title and earlier ID, as
+    IDs shift between runs
+  - figures: an uptime label stands above the ticks it reaches, so no tick
+    crosses a label; labels that reach each other's ticks merge
+  - figures: the uptime axis writes 1,000,000 s, not 1e+06 s
+  - cli: --compare rejects a pipe, a device, or JSON nested too deeply
+    with exit 1
+  - cli: --json writes ASCII and adds ry_verify.exit_code, a number or null
+  - parsing: a lone surrogate from a JSON escape shows as U+FFFD
+  - docs: README covers lead patterns, exit_code, and what --compare reads
+
+
 7.9.0
 -----
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+import stat
 
 if __name__ == "__main__":
 
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.9.0"
+__version__ = "7.9.2"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -102,39 +103,43 @@ def out_path(text: str) -> Path:
     return Path(text)
 
 
+OPTIONS: tuple[tuple[str, dict[str, Any]], ...] = (  # in the README's order
+    ("--bugreport", {"type": Path, "required": True, "metavar": "PATH",
+                     "help": "cachyos-bugreport.log from cachyos-bugreport.sh"}),
+    ("--verify", {"type": Path, "required": True, "metavar": "PATH",
+                  "help": "ry-verify JSONL log (verify-*.jsonl or report-*.jsonl)"}),
+    ("--out", {"type": out_path, "metavar": "PATH",
+               "help": "output PDF (default: ./post-boot-log-analysis-<capture date>.pdf, -brief.pdf under --brief)"}),
+    ("--brief", {"action": "store_true", "help": "build the cover and Sections 1 to 3 only, for paper"}),
+    ("--json", {"type": out_path, "metavar": "PATH",
+                "help": "also write the findings as a JSON summary, for a later --compare"}),
+    ("--compare", {"type": Path, "metavar": "PATH",
+                   "help": "an earlier run's JSON summary: mark findings new or changed and name those resolved"}),
+    ("--no-attach", {"action": "store_true",
+                     "help": "leave the two inputs out of the PDF, which otherwise attaches them"}),
+    ("--fonts", {"type": Path, "metavar": "DIR",
+                 "help": "directory with the IBM Plex TTF files (default: system and user font directories)"}),
+    ("--check", {"action": "store_true", "help": "parse the inputs and run the cross-checks; build nothing"}),
+    ("--verbose", {"action": "store_true",
+                   "help": "report the setup, parsing, analysis, layout passes, and files written"}),
+    ("--version", {"action": "version", "version": f"%(prog)s {__version__}", "help": "print the version and exit"}),
+)  # fmt: skip
+
+
 def build_parser() -> argparse.ArgumentParser:
-    """Return the command-line parser; its epilog lists the exit codes from the EXIT_* constants."""
+    """Return the command-line parser with OPTIONS; its epilog lists the exit codes from the EXIT_* constants."""
     parser = argparse.ArgumentParser(
         prog="build_report.py",
         description="Analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.",
+        add_help=False,
         epilog=(
             f"Exit codes: {EXIT_OK} built (--check: inputs parsed), {EXIT_FAIL} input or build failed, "
             f"{EXIT_USAGE} usage, {EXIT_PREFLIGHT} preflight failed, {EXIT_INTERRUPT} interrupted."
         ),
     )
-    parser.add_argument("--bugreport", type=Path, required=True, help="cachyos-bugreport.log from cachyos-bugreport.sh")
-    parser.add_argument(
-        "--verify", type=Path, required=True, help="ry-verify JSONL log (verify-*.jsonl or report-*.jsonl)"
-    )
-    parser.add_argument(
-        "--out", type=out_path, help="output PDF (default: ./post-boot-log-analysis-<capture date>.pdf)"
-    )
-    parser.add_argument(
-        "--fonts", type=Path, help="directory with the IBM Plex TTF files (default: system and user font directories)"
-    )
-    parser.add_argument("--check", action="store_true", help="parse the inputs and run the cross-checks; build nothing")
-    parser.add_argument("--brief", action="store_true", help="build the cover and Sections 1 to 3 only, for paper")
-    parser.add_argument(
-        "--json", type=out_path, metavar="PATH", help="also write the findings as a JSON summary, for a later --compare"
-    )
-    parser.add_argument(
-        "--compare", type=Path, metavar="PATH", help="an earlier run's JSON summary: mark findings new or changed"
-    )
-    parser.add_argument("--no-attach", action="store_true", help="leave the two inputs out; the PDF carries them")
-    parser.add_argument(
-        "--verbose", action="store_true", help="report parsing, analysis, layout passes, and the result"
-    )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    for flag, options in OPTIONS:
+        parser.add_argument(flag, **options)
+    parser.add_argument("-h", "--help", action="help", help="print this help and exit")  # last, as in the README
     return parser
 
 
@@ -185,12 +190,24 @@ class InputError(Exception):
     """An input that is present but not in the expected format; maps to exit code 1."""
 
 
-def readable(path: Path) -> bool:
-    """Return whether path is a file this process can read; a directory it cannot enter counts as no."""
+def unreadable(path: Path) -> str:
+    """Return why path is no regular file this process can read, as the error names it; "" when it is one."""
     try:
-        return path.is_file() and os.access(path, os.R_OK)
-    except OSError:
-        return False
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return "no such file"
+    except (OSError, ValueError) as exc:  # a directory on the way it cannot enter, say; ValueError: a NUL byte
+        return (getattr(exc, "strerror", None) or str(exc)).lower()
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    if not stat.S_ISREG(mode):
+        return "no regular file"  # a pipe or a device, which a read would not finish
+    return "" if os.access(path, os.R_OK) else "permission denied"
+
+
+def readable(path: Path) -> bool:
+    """Return whether path is a regular file this process can read."""
+    return not unreadable(path)
 
 
 def preflight(fonts: Path | None, inputs: Sequence[Path]) -> Path:
@@ -203,8 +220,13 @@ def preflight(fonts: Path | None, inputs: Sequence[Path]) -> Path:
     dirs = (fonts,) if fonts else FONT_DIRS
     font_dir = next((d for d in dirs if all(readable(d / f) for f in need)), None)
     if font_dir is None:
+        best = max(dirs, key=lambda d: sum(readable(d / f) for f in need))  # the first that holds the most of them
+        lacking = [f"{best / f} ({why})" for f in need if (why := unreadable(best / f))]
+        more = f" and {len(lacking) - 1} more" if len(lacking) > 1 else ""
         searched = ", ".join(str(d) for d in dirs)
-        msg = f"readable IBM Plex TTF files not found in {searched} (pacman: ttf-ibm-plex, or pass --fonts)"
+        msg = (
+            f"IBM Plex TTF files not found: {lacking[0]}{more}; searched {searched} (pacman: ttf-ibm-plex, or --fonts)"
+        )
         raise PreflightError(msg)
     for stem in FONT_FILES.values():
         path = font_dir / f"{stem}.ttf"
@@ -213,9 +235,9 @@ def preflight(fonts: Path | None, inputs: Sequence[Path]) -> Path:
         except (TTFError, struct.error, ValueError, LookupError) as exc:
             msg = f"not a TrueType font: {path} ({exc})"
             raise PreflightError(msg) from exc
-    unreadable = [str(p) for p in inputs if not readable(p)]
-    if unreadable:
-        msg = "cannot read input: " + ", ".join(unreadable)
+    blocked = [f"{p} ({why})" for p in inputs if (why := unreadable(p))]
+    if blocked:
+        msg = "cannot read input: " + ", ".join(blocked)
         raise PreflightError(msg)
     return font_dir
 
@@ -242,6 +264,7 @@ class BuildState:
     brief: bool = False  # --brief: the cover and Sections 1 to 3 only
     attach: bool = True  # the inputs ride along as PDF attachments; --no-attach leaves them out
     compare: dict[str, Any] | None = None  # --compare: an earlier run's JSON summary
+    uptime_shared: bool = False  # a label of the uptime strip names findings that first show close together
     mpl: ModuleType | None = None
 
     def reset(self) -> None:
@@ -828,9 +851,15 @@ class Rule:
     mitigated_by: str = ""  # a ry-verify OK record matching this lowers the severity to INFO
     covers: str = ""  # "ids": the record names each evidence device by USB vendor and product ID, 0xVVVV/0xPPPP
     context: tuple[str, ...] = ()  # an event's other lines, claimed within CONTEXT_SPAN lines of it from its source
+    lead: tuple[str, ...] = ()  # context only while the event's last line is a match: a timeout's process line
     cites: str = ""  # ry-verify records about the same setting; the notes cite the last that matches
 
 
+# Block-layer names for failed I/O besides "I/O" (blk_errors[]); "critical nexus" is "reservation conflict" since 6.5.
+BLOCK_ERRORS = (
+    r"(?:critical (?:medium|target|nexus|space allocation)|recoverable transport|reservation conflict|protection"
+    r"|timeout|device offline)"
+)
 RESET_REASON = r"Previous system reset reason \[0x[0-9a-f]+\]: "  # amd.c prints one line per reason bit (6.16+)
 # The reasons a reboot or power-off the system asked for leaves; keyboard reset is the reboot=k path.
 ROUTINE_RESET = (
@@ -855,14 +884,16 @@ RULES = (
       "upstream wants reproductions on an untainted kernel.",
       "Read `/proc/sys/kernel/tainted` and identify the module that set the flag."),
     R("gpu-hang", "GPU hang or reset", "GPU / amdgpu", "HIGH", ("dmesg",),
-      (r"amdgpu.*(?:GPU reset|ring \S+ timeout|job timed out|GPU recovery)",),
-      "amdgpu found a GPU job stuck and recovered, by ending the job (soft recovery) or by resetting the GPU; "
-      "applications using it may have lost their work or contexts.",
+      (r"amdgpu.*(?:GPU reset|ring \S+ timeout|job timed out|GPU [Rr]ecovery)",),
+      "amdgpu found a GPU job stuck and tried to recover, by ending the job (soft recovery) or resetting a ring or the "
+      "GPU; applications using it may have lost work or contexts, and a failed recovery can leave the GPU unusable.",
       "Note the process the evidence names, if any, and check the amdgpu lines around the timeout or reset.",
-      context=(r"\bProcess information: process ", r"\bring \S+ reset succeeded")),
+      lead=(r"\bProcess .+? pid \d+ thread ",),  # a later page fault prints the same line
+      context=(r"\bStarting \S+ ring reset\b", r"\bRing reset disabled by debug mask",
+               r"\bRing \S+ reset (?:succeeded|failed|failure)\b")),
     R("storage-errors", "Storage or file-system errors", "Storage", "HIGH", ("dmesg",),
-      (r"I/O error", (r"\b(?:critical (?:medium|target|nexus|space allocation)|recoverable transport|protection"
-       r"|timeout) error, dev "), r"EXT4-fs error", r"BTRFS (?:error|critical)", r"XFS .*[Cc]orruption",
+      (r"I/O error", rf"\b{BLOCK_ERRORS} error, dev ", r"EXT4-fs error", r"BTRFS (?:error|critical)",
+       r"XFS .*[Cc]orruption",
        r"nvme\d+: (?:controller is down|resetting controller)", r"nvme\d+: I/O (?:tag )?\d+ .*\bQID \d+ timeout, "),
       "The kernel reported failed I/O or file-system damage; data on the affected device may be at risk.",
       "Check the device with `smartctl -a` and run a file-system check from a live system."),
@@ -1057,7 +1088,8 @@ RULES = (
 )  # fmt: skip
 del R
 COMPILED = {r.key: [re.compile(p) for p in r.patterns] for r in RULES}
-CONTEXT = {r.key: [re.compile(p) for p in r.context] for r in RULES if r.context}
+CONTEXT = {r.key: [re.compile(p) for p in r.context] for r in RULES}
+LEAD = {r.key: [re.compile(p) for p in r.lead] for r in RULES}
 IDENT_RES = {r.key: re.compile(r.idents) for r in RULES if r.idents}
 
 
@@ -1105,10 +1137,10 @@ PLACEHOLDER = re.compile(
 # About five lines of monospace; past that, a line is a data dump (a hex buffer, a long command line).
 QUOTE_LIMIT = 400  # characters of a log line quoted in the report; the rest is cut with an ellipsis
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # CSI sequences a program may have written into a log
-# C0 and C1 controls but tab and newline, line and paragraph separators, and invisible marks that hide or reorder text.
+# C0 and C1 controls but tab and newline, line and paragraph separators, marks that hide or reorder text, surrogates.
 CONTROL = re.compile(
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff"
-    r"\ufff9-\ufffb]"
+    r"\ufff9-\ufffb\ud800-\udfff]"
 )
 
 
@@ -1126,7 +1158,7 @@ def mask(text: str) -> str:
 
 
 def sanitize(text: str) -> str:
-    """Return text with ANSI escapes removed, then masked, with other control characters shown as U+FFFD."""
+    """Return text with ANSI escapes removed, then masked, with controls and lone surrogates shown as U+FFFD."""
     return CONTROL.sub("\ufffd", mask(ANSI_ESCAPE.sub("", text)))
 
 
@@ -1330,7 +1362,7 @@ def match_rule(
 
 
 CONTEXT_SPAN = 3  # lines after a match, or after a line claimed with it, that can belong to the same event
-Event = tuple[Rule, str, int]  # an open event: its rule, its source, and the index of its last line
+Event = tuple[Rule, str, int, bool]  # an open event: its rule, source, last line's index, and whether that matched
 
 
 def event_source(text: str) -> str:
@@ -1342,17 +1374,30 @@ def event_rule(event: Event | None, index: int, text: str) -> Rule | None:
     """Return the open event's rule when a line no rule matches belongs to it, else None.
 
     The line comes within CONTEXT_SPAN lines of the event's last line, from the same source, and matches one of the
-    rule's context patterns.
+    rule's context patterns, or one of its lead patterns when the event's last line matched the rule's patterns.
     """
     if event is None or index - event[2] > CONTEXT_SPAN or event_source(text) != event[1]:
         return None
-    return event[0] if any(p.search(text) for p in CONTEXT[event[0].key]) else None
+    rule, _, _, matched = event
+    return rule if any(p.search(text) for p in CONTEXT[rule.key] + (LEAD[rule.key] if matched else [])) else None
+
+
+def claim(rules: Sequence[Rule], event: Event | None, index: int, text: str) -> tuple[Rule | None, Event | None]:
+    """Return the rule that claims a kernel line, by its patterns or as the open event's, and the event after it.
+
+    A match of a rule with context or lead patterns opens an event; a line the event claims extends it.
+    """
+    hit = match_rule(rules, "dmesg", text)
+    rule = hit or event_rule(event, index, text)
+    if rule and (rule.context or rule.lead):
+        event = (rule, event_source(text), index, hit is not None)
+    return rule, event
 
 
 def attribute(br: BugReport, rules: Sequence[Rule]) -> dict[str, Finding]:
     """Attribute the dmesg lines, journal entries, and inxi lines a rule knows to that rule's finding.
 
-    A rule with context patterns also claims the lines of the same event that follow a match (event_rule()).
+    A rule with context or lead patterns also claims the lines of the same event that follow a match (claim()).
     """
     found: dict[str, Finding] = {}
 
@@ -1365,10 +1410,9 @@ def attribute(br: BugReport, rules: Sequence[Rule]) -> dict[str, Finding]:
 
     event: Event | None = None
     for k, e in enumerate(br.dmesg):
-        rule = match_rule(rules, "dmesg", e.text) or event_rule(event, k, e.text)
+        rule, event = claim(rules, event, k, e.text)
         if rule:
             add(rule, Match("dmesg", e.no, quote(f"[{e.t:12.6f}] {e.text}")))
-            event = (rule, event_source(e.text), k) if rule.context else event
     previous = [e for e in br.journal if e.boot == "previous"]
     last_prev = max((e.when for e in previous), default=None)
     window = [e for e in previous if last_prev and (last_prev - e.when).total_seconds() <= SHUTDOWN_WINDOW]
@@ -1377,11 +1421,9 @@ def attribute(br: BugReport, rules: Sequence[Rule]) -> dict[str, Finding]:
     for e in br.journal:
         rule = match_rule(rules, "journal", e.text, e.ident, shutdown=e.no in tail)
         if rule is None and e.ident == "kernel":  # kernel warnings repeat in the journal; dmesg rules know them
-            rule = match_rule(rules, "dmesg", e.text) or event_rule(event, kernel, e.text)
+            rule, event = claim(rules, event, kernel, e.text)
         if rule:
             add(rule, Match("journal", e.no, quote(e.line), e.boot, e.when))
-            if rule.context and e.ident == "kernel":
-                event = (rule, event_source(e.text), kernel)
         kernel += e.ident == "kernel"
     for n, line in br.inxi:
         rule = match_rule(rules, "inxi", line)
@@ -1814,7 +1856,7 @@ def dmesg_facts(br: BugReport) -> dict[str, str]:
         m = re.search(pattern, text)
         if m:
             out[key] = " / ".join(m.groups())
-    out["smu"] = "initialized" if re.search(r"SMU is initialized", text) else ""
+    out["smu"] = "initialized" if "SMU is initialized" in text else ""
     return {k: v for k, v in out.items() if v}
 
 
@@ -2259,8 +2301,9 @@ MPL_STYLE: dict[str, Any] = {
     "axes.linewidth": 0.6, "axes.edgecolor": "#3a3a3a", "xtick.major.width": 0.5, "ytick.major.width": 0,
     "xtick.major.size": 2.5, "axes.labelcolor": "#222", "xtick.color": "#333", "ytick.color": "#222",
     "axes.titlesize": 8.2, "axes.titleweight": "semibold", "axes.titlelocation": "left", "legend.frameon": False,
-    "legend.fontsize": 7.2,
+    "legend.fontsize": 7.2, "axes.labelsize": 7.2,
 }  # fmt: skip
+CHART_NOTE = 6.4  # pt, text inside a chart: bar values, phase and lane labels, and the uptime strip's labels
 STATUS_ORDER = ("OK", "FAIL", "GEN_FAIL", "WARN", "INFO")  # as the text names them and the ry-verify chart stacks them
 STATUS_STYLE: dict[str, dict[str, Any]] = {
     "OK": {"color": C_LIGHT},
@@ -2360,7 +2403,7 @@ def clean(ax: Axes, *, grid: bool = True) -> None:
 def value_label(ax: Axes, x: float, y: float, text: str) -> None:
     """Write a bar's value 3 pt past its end, whatever the axis scale, boxed in white over the grid lines."""
     ax.annotate(
-        text, (x, y), xytext=(3, 0), textcoords="offset points", va="center", fontsize=6.4,
+        text, (x, y), xytext=(3, 0), textcoords="offset points", va="center", fontsize=CHART_NOTE,
         bbox={"boxstyle": "square,pad=0.1", "facecolor": "white", "edgecolor": "none"},
     )  # fmt: skip
 
@@ -2558,7 +2601,7 @@ def gap_seconds(a: float, b: float) -> float:
     return round(b, 2) - round(a, 2)
 
 
-MILESTONE_GAP = 0.12  # share of the axis two milestone labels need between them on one level (about 0.65 in)
+MILESTONE_GAP = 0.12  # share of the axis two milestone labels need between them on one level (about 0.7 in)
 CAPTURE_GAP = 0.16  # the same for the wider capture labels
 
 
@@ -2629,7 +2672,7 @@ def draw_boot(m: Model) -> Figure | None:
         boot_lanes(axes[-1], lanes, captures)
         axes[-1].set_ylim(low, high)
     axes[-1].set_xlim(0, xmax)
-    axes[-1].set_xlabel("Seconds since kernel start", fontsize=7.2)
+    axes[-1].set_xlabel("Seconds since kernel start")
     return fig
 
 
@@ -2675,7 +2718,7 @@ def boot_lanes(ax: Axes, lanes: Mapping[int, Lane], captures: dict[str, float]) 
                 face: dict[str, Any] = {"mfc": "white", "mew": 0.9} if row == 0 else {}
                 ax.plot([x], [row], marker=marker, ms=5, color=C_INK, ls="none", clip_on=False, zorder=3, **face)
             y = row + 0.25 + 1.35 * levels[label] if row else row - 0.3 - 0.75 * levels[label]
-            ax.text(x, y, label, ha="center", va="bottom" if row else "top", fontsize=6.2)
+            ax.text(x, y, label, ha="center", va="bottom" if row else "top", fontsize=CHART_NOTE)
     rows = sorted(lanes, reverse=True)
     ax.set_yticks(rows, ["Boot" if row else "Captures" for row in rows])
     clean(ax, grid=False)
@@ -2690,13 +2733,15 @@ def boot_bars(ax1: Axes, m: Model, xmax: float, counts: Sequence[int], width: fl
     ax1.yaxis.set_minor_formatter(NullFormatter())  # a range under a decade would label its minor ticks too
     top = max([*counts, 1]) * 1.8
     ax1.set_ylim(0.8, top)  # a fixed floor keeps one-line bars visible and the gap label inside the axes
-    ax1.set_ylabel(f"dmesg lines\nper {width:g} s", fontsize=7)
+    ax1.set_ylabel(f"dmesg lines\nper {width:g} s")
     if m.quiet_gap and (span := quiet_span(m, xmax)):
         a, b = span
         ax1.axvspan(a, b, color=C_LIGHT, zorder=0)
         if b - a >= 0.1 * xmax:  # a narrower stretch is named in the caption only
             label = f"no output\n{secs(gap_seconds(*m.quiet_gap))}"
-            ax1.text((a + b) / 2, (0.8 * top) ** 0.5, label, ha="center", va="center", fontsize=6.4, clip_on=True)
+            ax1.text(
+                (a + b) / 2, (0.8 * top) ** 0.5, label, ha="center", va="center", fontsize=CHART_NOTE, clip_on=True
+            )
 
 
 def fig_verify(m: Model) -> str | None:
@@ -2732,7 +2777,7 @@ def fig_verify(m: Model) -> str | None:
         clean(ax)
     axs[0][0].set_xlim(0, peak * 1.3 + 1)  # room for the value labels on the shared scale
     axs[0][0].xaxis.set_major_locator(MaxNLocator(integer=True))
-    axs[-1][0].set_xlabel("Records", fontsize=7.2)
+    axs[-1][0].set_xlabel("Records")
     present = [k for k in STATUS_ORDER if any(s[2][k] for s in m.verify_sections)]  # the legend keys those drawn
     handles = [Patch(label=k, **STATUS_STYLE[k]) for k in present]
     keys = {h: striped_key(STRIPES[k]) for h, k in zip(handles, present, strict=True) if k in STRIPES}
@@ -2744,7 +2789,9 @@ def fig_verify(m: Model) -> str | None:
 
 
 UPTIME_MIN = 0.1  # s, the uptime strip's left edge, as a log axis cannot reach the kernel start itself
-UPTIME_GAP = 0.16  # decades between two finding labels on one level of the uptime strip
+UPTIME_PAD = 3.0  # pt kept clear between two finding labels of the uptime strip, and between a label and a tick
+UPTIME_WIDE = 150.0  # pt a finding label may take; a wider one names its first findings and counts the rest
+Label = tuple[float, str, float, float]  # an uptime label: its tick, text, and left and right edges, in decades
 
 
 def uptime_events(m: Model) -> dict[str, float]:
@@ -2770,7 +2817,7 @@ def fig_uptime(m: Model) -> str | None:
     """Draw the cover's uptime strip on a log axis: the boot phases, each finding's first line, and the capture.
 
     The phases end at the milestones dmesg logs; a line runs from the boot's end to the bug report, marked by a white
-    square; each finding's ID stands above its tick, stacked where two would meet.
+    square; the IDs of the findings stand above their tick (uptime_labels()), stacked where two labels would meet.
     """
     phases, events = boot_phases(m), uptime_events(m)
     capture = capture_points(m).get("bug report")
@@ -2781,28 +2828,109 @@ def fig_uptime(m: Model) -> str | None:
 
     ends = [b for _, _, b in phases] + list(events.values()) + ([capture] if capture else [])
     xmax = max([*ends, 1.0]) * 1.8
-    levels = label_levels({k: math.log10(v) for k, v in events.items()}, UPTIME_GAP)
-    rows = max(levels.values(), default=-1) + 1
-    fig, ax = plt.subplots(figsize=(CW, 0.7 + 0.14 * rows), layout="constrained")
+    fig, ax = plt.subplots(figsize=(CW, 0.84), layout="constrained")
     ax.set_xscale("log")
     ax.set_xlim(UPTIME_MIN, xmax)
+    per = unit_points(fig, ax)  # the height set below leaves the axis width as it is
+    labels, levels = uptime_labels(events, (math.log10(UPTIME_MIN), math.log10(xmax)), per)
+    rows = max(levels, default=-1) + 1
+    fig.set_size_inches(CW, 0.7 + 0.14 * rows)
     ax.set_ylim(-1.3, 0.75 + 0.55 * rows)
     uptime_phases(fig, ax, phases)
     if capture:
         ax.plot([phases[-1][2] if phases else UPTIME_MIN, capture], [0, 0], color=C_MID, lw=0.9, zorder=1)
         ax.plot([capture], [0], marker="s", ms=4.5, mfc="white", mew=0.8, color=C_INK, ls="none", zorder=3)
-        ax.text(capture, -0.55, "bug report", ha="center", va="top", fontsize=6)
-    for fid, t in events.items():
-        top = 0.62 + 0.55 * levels[fid]
-        ax.plot([t, t], [0.36, top], color=C_INK, lw=0.6)
-        ax.text(t, top + 0.04, fid, ha="center", va="bottom", fontsize=6.2)
+        ax.text(capture, -0.55, "bug report", ha="center", va="top", fontsize=CHART_NOTE)
+    for (x, text, a, b), level in zip(labels, levels, strict=True):
+        top = 0.62 + 0.55 * level
+        ax.plot([10**x, 10**x], [0.36, top], color=C_INK, lw=0.6)
+        ax.text(10 ** ((a + b) / 2), top + 0.04, text, ha="center", va="bottom", fontsize=CHART_NOTE)
+    STATE.uptime_shared = len(labels) < len(events)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(b=False)
     ax.set_yticks([])
-    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,g} s"))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f} s" if v >= 1 else f"{v:g} s"))
     ax.xaxis.set_minor_formatter(NullFormatter())  # an axis under two decades would label its minor ticks too
-    ax.set_xlabel("Seconds since kernel start, log scale", fontsize=6.6)
+    ax.set_xlabel("Seconds since kernel start, log scale")
     return save(fig, "uptime", full_width=True)
+
+
+def text_points(text: str, size: float) -> float:
+    """Return how wide the charts set text at a size, in points: their face, IBM Plex Sans, is the report's Plex."""
+    return stringWidth(text, "Plex", size)
+
+
+def uptime_labels(events: dict[str, float], span: tuple[float, float], per: float) -> tuple[list[Label], list[int]]:
+    """Return the uptime strip's labels, left to right, and the level each stands on.
+
+    A label names the findings that share a tick, at the first of them; it centers on the tick, or keeps flush with
+    the axis end it would cross. A label that reaches another's tick stands above it, so no tick crosses a label;
+    labels that reach each other's ticks merge. A label wider than UPTIME_WIDE names its first findings in register
+    order and counts the rest, as H-1, M-2 +3.
+    """
+    pad = UPTIME_PAD / per
+    groups = [(math.log10(t), [fid]) for fid, t in sorted(events.items(), key=lambda kv: (kv[1], id_order(kv[0])))]
+    while True:
+        labels = [uptime_label(x, sorted(ids, key=id_order), span, per) for x, ids in groups]
+        covers = [
+            {j for j, other in enumerate(labels) if j != i and a - pad < other[0] < b + pad}
+            for i, (_, _, a, b) in enumerate(labels)
+        ]
+        cycle = sorted(tick_cycle(covers))
+        if not cycle:
+            return labels, stack_labels(labels, covers, pad)
+        for k in reversed(cycle[1:]):  # into the earliest, whose tick the merged label keeps
+            groups[cycle[0]][1].extend(groups.pop(k)[1])
+
+
+def uptime_label(x: float, ids: list[str], span: tuple[float, float], per: float) -> Label:
+    """Return one uptime label at tick x (decades): its text, cut to UPTIME_WIDE, and its edges within the span."""
+    text, shown = id_ranges(ids), len(ids)
+    while shown > 1 and text_points(text, CHART_NOTE) > UPTIME_WIDE:
+        shown -= 1
+        text = f"{id_ranges(ids[:shown])} +{len(ids) - shown}"
+    width = text_points(text, CHART_NOTE) / per
+    left = min(max(x - width / 2, span[0]), span[1] - width)
+    return x, text, left, left + width
+
+
+def tick_cycle(covers: Sequence[set[int]]) -> list[int]:
+    """Return labels that each reach the next one's tick, the last the first's, by index; [] when no labels do."""
+    state = [0] * len(covers)  # 0 not seen, 1 on the path, 2 done
+    path: list[int] = []
+
+    def visit(i: int) -> list[int]:
+        state[i] = 1
+        path.append(i)
+        for j in sorted(covers[i]):
+            if state[j] == 1:
+                return path[path.index(j) :]
+            if state[j] == 0 and (found := visit(j)):
+                return found
+        state[i] = 2
+        path.pop()
+        return []
+
+    return next((found for i in range(len(covers)) if state[i] == 0 and (found := visit(i))), [])
+
+
+def stack_labels(labels: Sequence[Label], covers: Sequence[set[int]], pad: float) -> list[int]:
+    """Return each label's level: above every label whose tick it reaches, and pad clear of the others on its level.
+
+    A label is placed once every label whose tick it reaches is, leftmost first; the covers hold no cycle.
+    """
+    levels: dict[int, int] = {}
+    placed: list[list[tuple[float, float]]] = []
+    while len(levels) < len(labels):
+        i = next(k for k in range(len(labels)) if k not in levels and covers[k] <= levels.keys())
+        _, _, a, b = labels[i]
+        level = max((levels[j] + 1 for j in covers[i]), default=0)
+        while level < len(placed) and any(a < end + pad and start < b + pad for start, end in placed[level]):
+            level += 1
+        placed += [[] for _ in range(level + 1 - len(placed))]
+        placed[level].append((a, b))
+        levels[i] = level
+    return [levels[k] for k in range(len(labels))]
 
 
 def uptime_phases(fig: Figure, ax: Axes, phases: Sequence[tuple[str, float, float]]) -> None:
@@ -2810,7 +2938,7 @@ def uptime_phases(fig: Figure, ax: Axes, phases: Sequence[tuple[str, float, floa
     for name, a, b in phases:
         lo = max(a, UPTIME_MIN)
         ax.barh(0, b - lo, left=lo, height=0.6, **PHASE_STYLE[name])
-        ax.text(math.sqrt(lo * b), -0.55, name, ha="center", va="top", fontsize=6)
+        ax.text(math.sqrt(lo * b), -0.55, name, ha="center", va="top", fontsize=CHART_NOTE)
     per = unit_points(fig, ax)
     for name, a, b in phases:
         if name in STRIPES:
@@ -2847,7 +2975,7 @@ def draw_subsystems(m: Model) -> Figure | None:
     ax.set_yticks(range(len(rows)), [f"{name} ({len(times):,})" for name, times in rows])
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.set_xlim(0, xmax)
-    ax.set_xlabel("Seconds since kernel start", fontsize=7.2)
+    ax.set_xlabel("Seconds since kernel start")
     clean(ax)
     return fig
 
@@ -2904,7 +3032,7 @@ def fig_after(m: Model) -> str | None:
     ax.set_ylim(-0.6, len(rows) - 0.4)
     ax.set_xlim(lo, hi + max((hi - lo) * 0.03, 0.5 / div))
     ax.ticklabel_format(axis="x", style="plain", useOffset=False)  # a late, short span keeps whole times
-    ax.set_xlabel(f"{unit} since kernel start", fontsize=7.2)
+    ax.set_xlabel(f"{unit} since kernel start")
     clean(ax)
     return save(fig, "after")
 
@@ -3001,7 +3129,7 @@ def journal_axis(ax: Axes, xs: Sequence[Any], width: int, unit: tuple[float, str
         if max(xs) - min(xs) < 2 * width / div:
             ax.set_xlim(min(xs) - width / div, max(xs) + width / div)
         ax.ticklabel_format(axis="x", style="plain", useOffset=False)  # a long uptime keeps whole times
-        ax.set_xlabel(f"{name} since kernel start", fontsize=7.2)
+        ax.set_xlabel(f"{name} since kernel start")
         return
     loc = mdates.AutoDateLocator(minticks=3, maxticks=7)
     ax.xaxis.set_major_locator(loc)
@@ -3009,7 +3137,7 @@ def journal_axis(ax: Axes, xs: Sequence[Any], width: int, unit: tuple[float, str
     pad = dt.timedelta(seconds=max(width, 60))
     if max(xs) - min(xs) < 2 * pad:
         ax.set_xlim(min(xs) - pad, max(xs) + pad)
-    ax.set_xlabel("Wall clock (local)", fontsize=7.2)
+    ax.set_xlabel("Wall clock (local)")
 
 
 def day_formatter(loc: AutoDateLocator) -> ConciseDateFormatter:
@@ -3096,7 +3224,7 @@ def journal_scale(hist: Axes, peak: int) -> None:
     else:
         hist.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
         hist.set_ylim(0, peak * 1.15)
-    hist.set_ylabel("Entries per bar", fontsize=7)
+    hist.set_ylabel("Entries per bar")
 
 
 # ── LAYOUT ────────────────────────────────────────────────────────────
@@ -3822,7 +3950,11 @@ def cover_strip(m: Model) -> list[Flowable]:
         what
         for what, shown in (
             ("the boot phases", boot_phases(m)),
-            ("where each finding that calls for action first shows", uptime_events(m)),
+            (
+                "where each finding that calls for action first shows"
+                + (" (findings close together share a label)" if STATE.uptime_shared else ""),
+                uptime_events(m),
+            ),
             ("the bug report", "bug report" in capture_points(m)),
         )
         if shown
@@ -4304,11 +4436,12 @@ def jcounts(f: Finding) -> tuple[object, object]:
 def changes(m: Model) -> dict[str, str]:
     """Return each finding's change since the --compare run, by ID: new, worse, better, or same; {} without one.
 
-    Findings match by rule, and a ry-verify finding by its status, phase, and section, as IDs shift between runs.
+    Findings match by rule, and a ry-verify finding by its status, phase, and section, as IDs shift between runs. A
+    finding INFO then is new, as resolved() counts one INFO now as resolved.
     """
     if STATE.compare is None:
         return {}
-    before = {f["key"]: f["severity"] for f in STATE.compare["findings"]}
+    before = {f["key"]: f["severity"] for f in STATE.compare["findings"] if f["severity"] != "INFO"}
     out = {}
     for f in m.findings:
         old = before.get(f.key)
@@ -4318,10 +4451,13 @@ def changes(m: Model) -> dict[str, str]:
 
 
 def resolved(m: Model) -> list[dict[str, Any]]:
-    """Return the --compare run's findings that called for action and no longer show, in its register order."""
+    """Return the --compare run's findings that called for action and no longer do, in its register order.
+
+    A finding is resolved when no finding of its rule shows now, or the one that shows is INFO (a mitigation in place).
+    """
     if STATE.compare is None:
         return []
-    now = {f.key for f in m.findings}
+    now = {f.key for f in m.findings if f.severity != "INFO"}
     return [f for f in STATE.compare["findings"] if f["severity"] != "INFO" and f["key"] not in now]
 
 
@@ -4331,22 +4467,28 @@ def compare_text(m: Model) -> str:
         return ""
     acting = {f.fid for f in m.findings if f.severity != "INFO"}
     counts = Counter(v for k, v in changes(m).items() if k in acting)
-    said = ", ".join(f"{counts[k]:,} {k}" for k in ("new", "worse", "better", "same") if counts[k]) or "no finding"
-    gone = resolved(m)
-    names = [f"{lit(sanitize(f['id']))} {lit(clip(sanitize(f['title']), 70))}" for f in gone[:RESOLVED_SHOWN]]
+    said = ", ".join(f"{counts[k]:,} {k}" for k in ("new", "worse", "better", "same") if counts[k])
+    gone, info = resolved(m), {f.key: f.fid for f in m.findings if f.severity == "INFO"}
+    names = [  # IDs shift between runs: the earlier one names another finding now
+        f"{lit(clip(sanitize(f['title']), 70))} (was {lit(clip(sanitize(f['id']), 16))}"
+        + (f", now {info[f['key']]})" if f["key"] in info else ")")
+        for f in gone[:RESOLVED_SHOWN]
+    ]
     more = f", and {len(gone) - RESOLVED_SHOWN:,} more" if len(gone) > RESOLVED_SHOWN else ""
-    since = f"; resolved since: {', '.join(names)}{more}" if gone else "; none resolved since"
-    return f"Compared with the summary of {compare_day()}: {said}{since}."
+    since = f"; {len(gone):,} resolved since: {', '.join(names)}{more}" if gone else "; none resolved since"
+    return f"Compared with the summary of {compare_day()}: {said or 'no finding calls for action now'}{since}."
 
 
 RESOLVED_SHOWN = 8  # resolved findings the comparison sentence names; it counts the rest
 
 
 def compare_day() -> str:
-    """Return the --compare summary's capture day and generator as the report names them."""
+    """Return the --compare summary's capture day and generator as the report names them, and another machine's name."""
     data = STATE.compare or {}
-    day, generator = (sanitize(str(data.get(k, "?"))) for k in ("day", "generator"))
-    return f"{lit(clip(day, 20))} ({lit(clip(generator, 40))})"
+    day, generator, machine = (sanitize(str(data.get(k, "?"))) for k in ("day", "generator", "machine"))
+    named = f"{lit(clip(day, 20))} ({lit(clip(generator, 40))})"
+    ours = model().facts.get("machine", UNKNOWN_MACHINE)
+    return named if machine == ours else f"{named} from another machine, {lit(clip(machine, 60))}"
 
 
 def _story_summary(m: Model) -> list[Flowable]:
@@ -4435,7 +4577,10 @@ def method_bullets() -> list[Flowable]:
         *bullet_paragraphs(
             (
                 "The bug report splits at its separator lines; quotes keep line numbers; counts are of messages.",
-                f"{len(RULES)} rules recognize message classes; the first matching rule claims a line.",
+                (
+                    f"{len(RULES)} rules recognize message classes; the first matching rule claims a line, and a rule "
+                    "for an event the lines that follow it, such as a GPU timeout's process and ring-reset lines."
+                ),
                 (
                     "A dmesg line belongs to the subsystem its prefix or wording names, an indented line to the "
                     "message above; a journal entry belongs to its process."
@@ -5260,7 +5405,7 @@ SOURCE_WORDING = (
     (re.compile(r"^(?:Out of memory|oom-kill:|oom_reaper:|Memory cgroup out of memory|\S+ invoked oom-killer:)"),
      "OOM killer"),
     (re.compile(r"^(?:\{\d+\})?\[Hardware Error\]"), "machine check"),
-    (re.compile(r"I/O error,? (?:on )?dev ([\w-]+)"), "block {}"),  # the block layer names the device
+    (re.compile(rf"(?:I/O|{BLOCK_ERRORS}) error,? (?:on )?dev ([\w-]+)"), "block {}"),  # by the device it names
     (re.compile(r"^([\w-]+) (?:error|warning|info|notice|critical) \(device ([\w-]+)\)"), "{} ({})"),  # BTRFS, ext4
     (re.compile(r"^\[drm:\S+ \[(\w+)\]\]"), "{} [drm]"),  # [drm:amdgpu_job_timedout [amdgpu]]
 )  # fmt: skip
@@ -5624,23 +5769,42 @@ def on_cover(canvas: Canvas, doc: BaseDocTemplate) -> None:
     canvas.restoreState()
 
 
-TALLY_GAP = 9.0  # pt between the tally's levels, and the least room the tally leaves beside the header's texts
+TALLY_GAP = 9.0  # pt between the tally's levels; the tally keeps twice that from the header's texts
+
+
+def tally_items(m: Model) -> list[tuple[str, str, float]]:
+    """Return the running header's tally: each level, its text, and its width with the mark."""
+    counts = severity_counts(m)
+    texts = [(s, f"{counts[s]:,} {s}") for s in ("HIGH", "MED", "LOW")]
+    return [(s, t, MARK_SIZE + MARK_GAP + stringWidth(t, "Plex", 7)) for s, t in texts]
+
+
+def tally_width(m: Model) -> float:
+    """Return the running header's tally width, its levels TALLY_GAP apart."""
+    items = tally_items(m)
+    return sum(w for *_, w in items) + TALLY_GAP * (len(items) - 1)
+
+
+def fit_width(text: str, font: str, size: float, width: float) -> str:
+    """Return text as it fits width in the font: whole, or cut with an ellipsis."""
+    if stringWidth(text, font, size) <= width:
+        return text
+    while text and stringWidth(text + "…", font, size) > width:
+        text = text[:-1]
+    return text.rstrip() + "…"
 
 
 def draw_tally(canvas: Canvas, m: Model, span: tuple[float, float]) -> None:
     """Draw the running header's tally of HIGH, MED, and LOW findings, each with its mark, between the header's texts.
 
-    The tally centers on the page when it fits there, moves right when the machine's name reaches into it, and is
-    left out when the two texts leave it no room.
+    The tally centers on the page; the machine's name gives way to it, and only a section name reaching the middle
+    of the page leaves it out.
     """
-    counts = severity_counts(m)
-    items = [(s, f"{counts[s]:,} {s}") for s in ("HIGH", "MED", "LOW")]
-    widths = [MARK_SIZE + MARK_GAP + stringWidth(t, "Plex", 7) for _, t in items]
-    total = sum(widths) + TALLY_GAP * (len(items) - 1)
+    total = tally_width(m)
     x = max((PW - total) / 2, span[0] + 2 * TALLY_GAP)
     if x + total > span[1] - 2 * TALLY_GAP:
         return
-    for (severity, text), width in zip(items, widths, strict=True):
+    for severity, text, width in tally_items(m):
         draw_mark(canvas, x, PH - 34 + (CAP_HEIGHT * 7 - MARK_SIZE) / 2, severity)
         canvas.drawString(x + MARK_SIZE + MARK_GAP, PH - 34, text)
         x += width + TALLY_GAP
@@ -5676,7 +5840,8 @@ def on_body(canvas: Canvas, doc: BaseDocTemplate) -> None:
     canvas.setFont("Plex", 7)
     canvas.setFillColor(MUTE)
     name = "Post-Boot Log Analysis (brief)" if STATE.brief else "Post-Boot Log Analysis"
-    left = f"{name} · {model().facts.get('machine', UNKNOWN_MACHINE)}"
+    room = (PW - tally_width(model())) / 2 - 2 * TALLY_GAP - LM  # a long machine name is cut before the tally
+    left = fit_width(f"{name} · {model().facts.get('machine', UNKNOWN_MACHINE)}", "Plex", 7, room)
     canvas.drawString(LM, PH - 34, left)
     section = STATE.page_section.get(doc.page, "Contents")
     span = (LM + stringWidth(left, "Plex", 7), PW - RM - stringWidth(section, "Plex-SB", 7))
@@ -5753,7 +5918,10 @@ def layout(path: Path, m: Model, log: Callable[[str], None]) -> None:
             sections,
             list(STATE.figures),
         )
-        log(f"pass {n}: pages={total} anchors={len(STATE.anchors)} stable={stable}")
+        log(
+            f"layout pass {n}: {plural(total, 'page')}, {plural(len(STATE.anchors), 'anchor')}, "
+            f"{'settled' if stable else 'not settled'}"
+        )
         if stable and n > 1:
             break
     else:
@@ -5824,6 +5992,7 @@ def load_model(args: argparse.Namespace, log: Callable[[str], None]) -> Model:
     STATE.input_tags = "inputs " + " · ".join(hashlib.sha256(raw).hexdigest()[:8] for raw in (br.raw, vj.raw))
     if args.compare is not None:
         STATE.compare = read_summary(args.compare)
+        log(f"compare: {args.compare}, {plural(len(STATE.compare['findings']), 'finding')}")
     others = plural(len(m.others), "other message class", "other message classes")
     log(f"analysis: {plural(len(m.findings), 'finding')}, {others}, {plural(len(m.actions), 'action')}")
     return m
@@ -5832,7 +6001,7 @@ def load_model(args: argparse.Namespace, log: Callable[[str], None]) -> Model:
 def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) -> Path:
     """Parse and analyze the inputs, render the figures, lay out the report, and write the PDF atomically.
 
-    The JSON summary, when asked for, is written beside it in the same step.
+    The JSON summary, when asked for, is written beside it in the same step (write_outputs()).
     """
 
     def log(message: str) -> None:
@@ -5845,8 +6014,21 @@ def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) ->
     STATE.font_dir = font_dir
     register_fonts(font_dir)
     out = output_path(args, m)
-    tmp = out.with_name(f".build_report-{os.getpid()}.tmp")  # short, so any output name the system allows fits
     target = summary_path(args, out)
+    write_outputs(m, out, target, log)
+    log(f"wrote {out} ({STATE.total} pages, {out.stat().st_size:,} bytes)")
+    if target:
+        log(f"wrote {target} ({target.stat().st_size:,} bytes)")
+    return out
+
+
+def write_outputs(m: Model, out: Path, target: Path | None, log: Callable[[str], None]) -> None:
+    """Lay the report out under a scratch name beside out, then replace out with it, and target with the summary.
+
+    A signal cannot split the replacing step. The PDF is dated by SOURCE_DATE_EPOCH, which the capture time sets for
+    this build unless the environment does.
+    """
+    tmp = out.with_name(f".build_report-{os.getpid()}.tmp")  # short, so any output name the system allows fits
     sidecar = target.with_name(f".build_report-{os.getpid()}.json.tmp") if target else None
     epoch = os.environ.get("SOURCE_DATE_EPOCH")  # ReportLab dates the PDF from it; set for this build only
     if epoch is None:
@@ -5854,7 +6036,7 @@ def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) ->
     try:
         render_report(tmp, m, log)
         if sidecar:
-            sidecar.write_text(json.dumps(summary(m), indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+            sidecar.write_text(json.dumps(summary(m), indent=1) + "\n", encoding="utf-8")
         with interrupts_deferred():  # the PDF replaces its target and is recorded as written, or neither happens
             if INTERRUPTED:  # an interrupt raised inside a callback that Python swallowed
                 raise KeyboardInterrupt
@@ -5868,8 +6050,20 @@ def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) ->
                 path.unlink(missing_ok=True)
         if epoch is None:
             os.environ.pop("SOURCE_DATE_EPOCH", None)
-    log(f"wrote {out} ({STATE.total} pages, {out.stat().st_size:,} bytes)")
-    return out
+
+
+def library_versions() -> str:
+    """Return the versions of Python and the libraries that shape the PDF, as the verbose setup line names them."""
+    from importlib import metadata
+
+    names = {"reportlab": "ReportLab", "matplotlib": "matplotlib", "svglib": "svglib", "pillow": "Pillow"}
+    found = []
+    for dist, name in names.items():
+        try:
+            found.append(f"{name} {metadata.version(dist)}")
+        except metadata.PackageNotFoundError:
+            found.append(f"{name} unknown")
+    return ", ".join([f"Python {sys.version.split()[0]}", *found])
 
 
 def render_report(path: Path, m: Model, log: Callable[[str], None]) -> None:
@@ -5881,7 +6075,7 @@ def render_report(path: Path, m: Model, log: Callable[[str], None]) -> None:
             drawn = render_figures(m)
         for warning in caught:
             log(f"figure warning: {warning.message}")
-        log(f"{plural(drawn, 'figure')} rendered")
+        log(f"{plural(drawn, 'chart')} rendered")
         layout(path, m, log)
 
 
@@ -5909,7 +6103,8 @@ def summary(m: Model) -> dict[str, Any]:
         {"file": file_name(p), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
         for p, raw in ((m.br.path, m.br.raw), (vj.path, vj.raw))
     ]
-    result, code = vj.status
+    result, exit_text = vj.status
+    code = vj.footer.get("exit_code")
     return {
         "schema": SUMMARY_SCHEMA,
         "generator": f"build_report.py {__version__}",
@@ -5919,7 +6114,8 @@ def summary(m: Model) -> dict[str, Any]:
         "kernel": m.facts.get("kernel", ""),
         "inputs": inputs,
         "ry_verify": {"version": vj.meta("version"), "profile": vj.meta("profile"), "mode": vj.meta("mode"),
-                      "result": result, "exit": code, "totals": vj.totals},
+                      "result": result, "exit": exit_text, "exit_code": code if type(code) is int else None,
+                      "totals": vj.totals},
         "findings": [finding_summary(f) for f in m.findings],
         "watch": [{"key": f.key, "kind": f.severity, "title": f.title, "lines": len(f.matches)}
                   for f in m.others if f.severity in ("WATCH", "SETTING")],
@@ -5940,12 +6136,16 @@ def finding_summary(f: Finding) -> dict[str, Any]:
 def read_summary(path: Path) -> dict[str, Any]:
     """Read an earlier run's JSON summary for --compare; raise InputError for anything else.
 
-    Each finding needs a string ID, key, and title and one of the finding severities; nothing else is read.
+    Each finding needs a string ID, key, and title and one of the finding severities; of the rest, only the capture
+    day, generator, and machine are read, to name the summary.
     """
+    if why := unreadable(path):  # a pipe or a device would be read without end
+        msg = f"--compare {path}: no JSON summary ({why})"
+        raise InputError(msg)
     try:
         data = json.loads(path.read_bytes())
-    except (OSError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
-        msg = f"--compare {path}: no JSON summary ({exc})"
+    except (OSError, ValueError, RecursionError) as exc:  # bad JSON or UTF-8 raises ValueError; deep nesting, the other
+        msg = f"--compare {path}: no JSON summary ({clip(str(exc), 120)})"
         raise InputError(msg) from exc
     findings = data.get("findings") if isinstance(data, dict) else None
     ok = isinstance(findings, list) and data.get("schema") == SUMMARY_SCHEMA and all(
@@ -6117,6 +6317,8 @@ def run(args: argparse.Namespace) -> int:
     except PreflightError as exc:
         say(str(exc))
         return EXIT_PREFLIGHT
+    if args.verbose:
+        say(f"setup: fonts in {font_dir}; {library_versions()}")
     try:
         if args.check:
             return check(args)
