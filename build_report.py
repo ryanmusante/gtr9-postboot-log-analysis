@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.9.2"
+__version__ = "7.10.1"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -278,6 +278,7 @@ STATE = BuildState()
 # ── INPUT ─────────────────────────────────────────────────────────────
 # Parsers for the two capture formats: cachyos-bugreport.sh output and ry-verify JSONL.
 SEPARATOR = re.compile(r"^(?:_{44}|-{44})$")  # the bare 44-character rules cachyos-bugreport.sh writes
+# Matched ignoring case: the CachyOS-Settings tree after 1.4.1 lowercases the two "Getting" titles.
 SECTION_TITLES = {
     "Start of CachyOS bug report log file": "header",
     "Getting Hardware Information": "inxi",
@@ -382,6 +383,7 @@ class VerifyLog:
     items: list[VerifyItem]
     phase_results: dict[str, dict[str, int]]  # phase -> counts from its VERIFY_RESULT record
     combined: dict[str, int]
+    events: dict[str, tuple[int, str]] = field(default_factory=dict)  # first KEY: event of each key, line and text
 
     def meta(self, key: str) -> str:
         """Return a header field for display: sanitized, or "?" when the log does not state it."""
@@ -399,23 +401,35 @@ class VerifyLog:
         return parse_iso(self.footer.get("ts", ""))
 
     @property
+    def version(self) -> tuple[int, int, int] | None:
+        """Return the header's ry-verify version as numbers, as (7, 258, 0), or None when it states none."""
+        found = re.fullmatch(r"(\d{1,6})\.(\d{1,6})\.(\d{1,6})", str(self.header.get("version", "")))
+        return (int(found[1]), int(found[2]), int(found[3])) if found else None
+
+    @property
     def interrupted(self) -> bool:
         """Return True when the footer says the run was interrupted; its counts are those at the signal.
 
-        A signal during a phase leaves that phase's counts only, as ry-verify resets them when the phase starts.
+        From ry-verify 7.257.0 on they count every section's rows; before, a signal during a phase left that phase's
+        counts only, as ry-verify reset them when the phase started.
         """
         return self.footer.get("interrupted") is True
+
+    @property
+    def footer_counts_all(self) -> bool:
+        """Return whether the footer counts every record: a finished run's, or an interrupted one's from 7.257.0 on."""
+        return bool(self.footer) and (not self.interrupted or (self.version or (0, 0, 0)) >= FOOTER_COUNTS_ALL)
 
     @property
     def totals(self) -> dict[str, int]:
         """Return the run's ok, fail, warn, and gen_fail counts from the best source the log holds.
 
-        A finished run's footer comes first; without one, the VERIFY_RESULT_COMBINED record. Otherwise the phase
-        records are summed, and a phase without one (the phase an interruption cut short) adds its result records,
-        which cannot see generator failures.
+        The footer comes first when it counts every record; without such a footer, the VERIFY_RESULT_COMBINED record.
+        Otherwise the phase records are summed, and a phase without one (the phase an interruption cut short) adds
+        its result records, which cannot see generator failures.
         """
         keys = ("ok", "fail", "warn", "gen_fail")
-        if self.footer and not self.interrupted:
+        if self.footer_counts_all:
             return {k: self.footer.get("pass" if k == "ok" else k, 0) for k in keys}  # integers, checked on parse
         if self.combined:
             return {k: self.combined.get(k, 0) for k in keys}
@@ -427,7 +441,11 @@ class VerifyLog:
 
     @property
     def status(self) -> tuple[str, str]:
-        """Return the verdict and exit text: PASS or FAIL with exit N, interrupted, or unknown (no footer or exit)."""
+        """Return the verdict in ry-verify's words with the exit text, interrupted, or unknown (no footer or exit).
+
+        Exit 3 is PREFLIGHT, a gate that stopped the run; any other failing exit is FAIL; a passing run with a WARN
+        is PASS-WITH-WARNINGS, as ry-verify's --report words them.
+        """
         if not self.footer:
             return "unknown", "no footer"
         code = self.footer.get("exit_code")
@@ -435,32 +453,67 @@ class VerifyLog:
             return "unknown", "no exit code"
         if self.interrupted:
             return "interrupted", f"exit {code}"
-        return ("PASS" if code == 0 else "FAIL"), f"exit {code}"
+        if code == VERIFY_PREFLIGHT:
+            return "PREFLIGHT", f"exit {code}"
+        if code:
+            return "FAIL", f"exit {code}"
+        return ("PASS-WITH-WARNINGS" if self.totals["warn"] else "PASS"), f"exit {code}"
 
     @property
     def stopped(self) -> VerifyItem | None:
-        """Return the first ERR record when ry-verify stopped before any check ran (only ERR results), else None."""
-        checks = [i for i in self.items if i.phase != "preamble"]
-        if checks and all(i.status == "ERR" for i in checks):
-            return checks[0]
-        return None
+        """Return the first ERR record when ry-verify stopped before any check ran, else None."""
+        return stop_record([i for i in self.items if i.phase != "preamble"])
 
     @property
     def phase_stops(self) -> list[VerifyItem]:
-        """Return the first record of each phase that logged only ERR results, when another phase ran its checks.
+        """Return the first ERR record of each phase that stopped before its checks, when another phase ran them.
 
         ry-verify stops a phase this way when it cannot cache sudo; the stop comes before the phase resets its
         counters, so the totals count the stopped phase's records.
         """
         if self.stopped:
             return []
-        phases = [[i for i in self.items if i.phase == p] for p in ("static", "runtime")]
-        return [items[0] for items in phases if items and all(i.status == "ERR" for i in items)]
+        stops = (stop_record([i for i in self.items if i.phase == p]) for p in ("static", "runtime"))
+        return [s for s in stops if s]
 
     @property
     def hints(self) -> list[VerifyItem]:
-        """Return the INFO records in which ry-verify names its own fix (Run: …, Install missing: …)."""
-        return [i for i in self.items if i.status == "INFO" and re.search(r"\b(?:Run|Install missing): \S", i.text)]
+        """Return the INFO records in which ry-verify suggests a fix, in log order.
+
+        As ry-verify's --report reads them, a ↳ line logged right after a FAIL, WARN, or ERR record of the same
+        section and sub-heading is that record's hint; an INFO record that names its fix (Run: …, Install
+        missing: …) is one too, as older logs word them.
+        """
+        out = []
+        for n, item in enumerate(self.items):
+            if item.status != "INFO":
+                continue
+            before = self.items[n - 1] if n else None
+            follows = (
+                before is not None
+                and before.status in ("FAIL", "WARN", "ERR")
+                and item.text.startswith("↳ ")
+                and (before.phase, before.section, before.heading) == (item.phase, item.section, item.heading)
+            )
+            if follows or RUN_HINT.search(item.text):
+                out.append(item)
+        return out
+
+    @property
+    def fixes(self) -> list[VerifyItem]:
+        """Return the FAIL and WARN records that end by naming their fix, as a chown or a restart."""
+        return [i for i in self.items if i.status in ("FAIL", "WARN") and FIX_COMMAND.search(i.text)]
+
+    @property
+    def lapses(self) -> list[VerifyItem]:
+        """Return the WARN records in which ry-verify skipped a check because its sudo cache lapsed."""
+        return [i for i in self.items if i.status == "WARN" and SUDO_LAPSE.search(i.text)]
+
+    @property
+    def root_uuid(self) -> str:
+        """Return the root file system's UUID that ry-verify resolved (its ROOT_UUID_OK record), or "" without one."""
+        found = re.fullmatch(rf"uuid=({UUID})", self.events.get("ROOT_UUID_OK", (0, ""))[1])
+        return found[1].lower() if found else ""
 
     def outside_totals(self) -> list[str]:
         """Return the preamble FAIL and WARN records the totals leave out, as ["2 WARN"], judged by the totals.
@@ -508,8 +561,8 @@ def parse_sections(lines: Sequence[str]) -> dict[str, tuple[int, int]]:
         title_no = next((n for n in range(first, last + 1) if lines[n - 1].strip()), None)
         if title_no is None:
             continue
-        title = lines[title_no - 1].strip()
-        name = next((v for k, v in SECTION_TITLES.items() if title.startswith(k)), None)
+        title = lines[title_no - 1].strip().casefold()
+        name = next((v for k, v in SECTION_TITLES.items() if title.startswith(k.casefold())), None)
         if name and name not in sections:
             sections[name] = (title_no + 1, last) if name != "header" else (first, last)
     return sections
@@ -716,15 +769,45 @@ RESULT_LINE = re.compile(r"^(OK|INFO|WARN|FAIL|ERR):\s+(.*)$")
 GENERATOR_FAILED = re.compile(r": generator failed\b")  # a FAIL record that ry-verify counts as GEN_FAIL
 PHASE_BANNER = re.compile(r"^INFO: (?:Static|Runtime) verification \(")  # a phase heading logged as INFO, no result
 # ry-verify's signal handler logs this through _log, which counts nothing: no result either.
-SIGNAL_NOTICE = re.compile(r"^WARN: Caught SIG[A-Z]+ — cleaning up")
-# ERR lines ry-verify logs without counting them: continuations of a counted ERR, and a note its callers grade.
+SIGNAL_NOTICE = re.compile(r"^WARN: Caught (?:SIG[A-Z]+|exit) — cleaning up")
+# ERR lines ry-verify logs without counting them: continuations of a counted ERR, and two notes its callers grade,
+# which 7.257.0 and 7.258.0 log as INFO.
 UNCOUNTED_ERR = re.compile(
     r"^ERR: (?:sudo required for verification$|\s+(?:Checking gfx1151/Strix Halo expectations "
     r"|Override \(at your risk\): |ESP autodetect failed AND /boot is not a directory))"
 )
 COUNTS = re.compile(r"\b(ok|fail|warn|gen_fail)=(\d{1,9})\b")
+SCOPE = re.compile(r"\bscope=(static|runtime)\b")  # the phase a VERIFY_RESULT record closes (ry-verify 7.258.0)
+EVENT = re.compile(r"^([A-Z][A-Z0-9_]*): (.*)$", re.DOTALL)  # a structured record, as ROOT_UUID_OK: uuid=…
+RESULT_MODES = ("verify", "report")  # the ry-verify modes whose logs hold check results; --check logs none
 FOOTER_NUMBERS = ("pass", "fail", "warn", "gen_fail", "exit_code")  # footer fields the report reads as integers
 FOOTER_LIMIT = 10**9  # footer counts lie from 0 up to this, as the VERIFY_RESULT counts (COUNTS) do
+FOOTER_COUNTS_ALL = (7, 257, 0)  # from this ry-verify on, an interrupted run's footer counts every section's rows
+VERIFY_PREFLIGHT = 3  # ry-verify's exit when a gate stops the run: missing sudo, a dependency, or a validator
+SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify skipped as its sudo cache lapsed
+# A fix a FAIL or WARN record names at its end, after a dash, a parenthesis, or a semicolon: — sudo chown …
+FIX_COMMAND = re.compile(r"(?:—|\(|;)\s*(?:(?:sudo )?(?:systemctl|chown|chmod|iw|mount)\s|restart \S)")
+RUN_HINT = re.compile(r"\b(?:Run|Install missing): (?=\S)")  # an INFO record that names its fix: Run: sudo …
+
+
+def fix_start(text: str) -> int:
+    """Return where in text the command a ry-verify record suggests starts, or -1 when it names none.
+
+    A command in parentheses starts at its parenthesis; one after a dash, a semicolon, or Run:, after that.
+    """
+    if hit := FIX_COMMAND.search(text):
+        return hit.start() if hit[0].startswith("(") else hit.end() - len(hit[0][1:].lstrip())
+    hit = RUN_HINT.search(text)
+    return hit.end() if hit else -1
+
+
+def stop_record(items: Sequence[VerifyItem]) -> VerifyItem | None:
+    """Return the first ERR of records that hold nothing else but INFO, as a run or phase stopped by a gate; else None.
+
+    ry-verify logs the gate's ERR, and since 7.257.0 an INFO hint under it (↳ sudo required for verification).
+    """
+    results = [i for i in items if i.status != "INFO"]
+    return results[0] if results and all(i.status == "ERR" for i in results) else None
 
 
 def read_jsonl(raw: bytes, name: str) -> list[tuple[int, dict[str, Any]]]:
@@ -769,24 +852,35 @@ class VerifyCursor:
         return False
 
 
-def parse_verify(path: Path) -> VerifyLog:
-    """Parse a ry-verify JSONL log; raise InputError when it is not one. Records are numbered by file line."""
-    raw = path.read_bytes()
-    numbered = read_jsonl(raw, path.name)
-    records = [rec for _, rec in numbered]
+def verify_frame(name: str, records: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a ry-verify log's header and footer ({} without one); raise InputError when they show no such log.
+
+    The header must state a version and, when it names a mode, --verify's or --report's, as only those log results;
+    every footer count must be a whole number.
+    """
     header = next((r for r in records if r.get("event") == "header"), None)
     if header is None or "version" not in header:
-        msg = f"{path.name}: not a ry-verify log (no header record with a version)"
+        msg = f"{name}: not a ry-verify log (no header record with a version)"
+        raise InputError(msg)
+    if "mode" in header and header["mode"] not in RESULT_MODES:
+        msg = f"{name}: not a --verify or --report log (mode {clip(repr(header['mode']), 40)}); it holds no results"
         raise InputError(msg)
     foot = next((r for r in reversed(records) if r.get("event") == "footer"), {})
     for key in FOOTER_NUMBERS:
         value = foot.get(key, 0)
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < FOOTER_LIMIT:
-            msg = (
-                f"{path.name}: footer field {key} is not a whole number from 0 to 999,999,999 ({clip(repr(value), 40)})"
-            )
+            msg = f"{name}: footer field {key} is not a whole number from 0 to 999,999,999 ({clip(repr(value), 40)})"
             raise InputError(msg)
-    items, phase_results, combined = [], {}, {}
+    return header, foot
+
+
+def parse_verify(path: Path) -> VerifyLog:
+    """Parse a ry-verify JSONL log; raise InputError when it is not one. Records are numbered by file line."""
+    raw = path.read_bytes()
+    numbered = read_jsonl(raw, path.name)
+    records = [rec for _, rec in numbered]
+    header, foot = verify_frame(path.name, records)
+    items, phase_results, combined, events = [], {}, {}, {}
     at = VerifyCursor()
     for n, rec in numbered:
         data = str(rec.get("data", "")) if rec.get("event") == "log" else ""
@@ -797,17 +891,20 @@ def parse_verify(path: Path) -> VerifyLog:
         if data.startswith("VERIFY_RESULT_COMBINED:"):
             combined = {k: int(v) for k, v in COUNTS.findall(data)}
         elif data.startswith("VERIFY_RESULT:"):
-            phase_results[at.last_phase] = {k: int(v) for k, v in COUNTS.findall(data)}
-        elif (
-            (m := RESULT_LINE.match(data))
-            and at.phase
-            and at.section != "VERIFICATION SUMMARY"
-            and not PHASE_BANNER.match(data)
-            and not SIGNAL_NOTICE.match(data)
-            and not UNCOUNTED_ERR.match(data)
-        ):
-            items.append(VerifyItem(n, at.phase, at.section, m.group(1), m.group(2).strip(), at.heading))
-    return VerifyLog(path, raw, records, header, foot, items, phase_results, combined)
+            scope = SCOPE.search(data)  # older logs name no scope: the record follows the phase it closes
+            phase_results[scope[1] if scope else at.last_phase] = {k: int(v) for k, v in COUNTS.findall(data)}
+        elif m := RESULT_LINE.match(data):
+            if (
+                at.phase
+                and at.section != "VERIFICATION SUMMARY"
+                and not PHASE_BANNER.match(data)
+                and not SIGNAL_NOTICE.match(data)
+                and not UNCOUNTED_ERR.match(data)
+            ):
+                items.append(VerifyItem(n, at.phase, at.section, m.group(1), m.group(2).strip(), at.heading))
+        elif (e := EVENT.match(data)) and e[1] != "ECHO":
+            events.setdefault(e[1], (n, e[2]))
+    return VerifyLog(path, raw, records, header, foot, items, phase_results, combined, events)
 
 
 # ── RULES ─────────────────────────────────────────────────────────────
@@ -988,8 +1085,8 @@ RULES = (
       "A driver names a workqueue longer than the kernel's limit, and the kernel truncates it once."),
     R("bt-esco", "Bluetooth controller lacks enhanced synchronous connections", "Bluetooth / btusb", "INFO",
       ("dmesg",), (r"Enhanced Setup Synchronous Connection command is advertised, but not supported",),
-      "btusb marks the command broken for this controller; voice links use the legacy setup and A2DP audio is "
-      "unaffected."),
+      "btusb marks the command broken for this controller, so a hands-free call's voice link (HFP/HSP) uses the "
+      "legacy setup; A2DP audio is unaffected.", cites=r"^bluez5\.roles \(|HFP/HSP profile"),
     R("acp-machine", "Audio co-processor finds no machine driver", "Audio / ACP", "INFO", ("dmesg",),
       (r"No matching ASoC machine driver found",),
       "No ACP machine description matches the board, so audio runs through HDA and USB devices instead."),
@@ -1180,13 +1277,33 @@ def clip(text: str, limit: int) -> str:
     return (word if len(word) >= limit // 2 else cut) + "…"
 
 
+def clip_start(text: str, limit: int) -> str:
+    """Return text cut from its start to at most limit characters, with an ellipsis first, keeping its end whole.
+
+    The cut falls at a word boundary unless that keeps under half the limit.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[len(text) - limit + 1 :]
+    word = cut if text[len(text) - limit] == " " else cut.split(" ", 1)[-1]
+    return "…" + (word if len(word) >= limit // 2 else cut)
+
+
 QUOTE_CLIP = 160  # characters of a ry-verify record quoted in running text or a command comment: two lines at most
 COMMENT_WIDTH = 110  # characters per comment line in a command block; longer lines would shrink its type
 
 
-def comment(text: str) -> list[str]:
-    """Return text as fish comment lines of at most COMMENT_WIDTH characters, broken between words."""
-    return textwrap.wrap(text, COMMENT_WIDTH, initial_indent="# ", subsequent_indent="# ", break_on_hyphens=False)
+def comment(text: str, keep: int = -1) -> list[str]:
+    """Return text as fish comment lines of at most COMMENT_WIDTH characters, broken between words.
+
+    The text from index keep on, as a command a record suggests, starts the last line when a break would split it and
+    it fits one line.
+    """
+    lines = textwrap.wrap(text, COMMENT_WIDTH, initial_indent="# ", subsequent_indent="# ", break_on_hyphens=False)
+    tail = text[keep:].strip() if keep > 0 else ""
+    if not tail or lines[-1].endswith(tail) or len(tail) > COMMENT_WIDTH - 2:
+        return lines
+    return [*comment(text[:keep].rstrip()), f"# {tail}"]
 
 
 # ── ANALYSIS ──────────────────────────────────────────────────────────
@@ -1617,6 +1734,15 @@ def root_uuid(br: BugReport) -> str:
     """Return the root file system's UUID from the kernel command line, or "" without one (or with the nil UUID)."""
     root = re.search(rf"root=UUID=(?!{NIL_UUID})({UUID})", br.cmdline)
     return root.group(1) if root else ""
+
+
+def other_root(br: BugReport, vj: VerifyLog) -> int | None:
+    """Return the line of ry-verify's root UUID record when it names another root file system than the bug report's.
+
+    None when the two agree or either leaves the UUID out, as the CachyOS-Settings tree after 1.4.1 redacts it.
+    """
+    ours, theirs = root_uuid(br).lower(), vj.root_uuid
+    return vj.events["ROOT_UUID_OK"][0] if ours and theirs and ours != theirs else None
 
 
 def register_order(f: Finding) -> tuple[int, int, int, str]:
@@ -2145,7 +2271,10 @@ def unit_glob(name: str, room: int) -> str:
 
 
 def verify_action(m: Model) -> Action | None:
-    """Return the action for ry-verify's failures and warnings: its own suggested fixes as comments, then a rerun."""
+    """Return the action for ry-verify's failures and warnings: its own suggested fixes as comments, then a rerun.
+
+    The rerun caches sudo first when a gate stopped ry-verify for want of sudo or its sudo cache lapsed mid-run.
+    """
     fails = [f for f in m.findings if f.key.startswith("verify-")]
     shown, more = generator_failures(m.vj)
     if not fails and not more:
@@ -2153,10 +2282,19 @@ def verify_action(m: Model) -> Action | None:
     sections = {(i.phase, i.section) for i in actionable(m.vj)}
     stop = m.vj.stopped
     cmds = comment(f"ry-verify stopped (VJ {stop.no}): {clip(quote(stop.text), QUOTE_CLIP)}") if stop else []
-    for hint in m.vj.hints[:MAX_UNIT_COMMANDS]:
-        cmds += comment(f"ry-verify suggests (VJ {hint.no}): {clip(quote(hint.text), QUOTE_CLIP)}")
-    if rest := m.vj.hints[MAX_UNIT_COMMANDS:]:
+    tips = sorted({i.no: i for i in (*m.vj.hints, *m.vj.fixes)}.values(), key=lambda i: i.no)  # in log order
+    for tip in tips[:MAX_UNIT_COMMANDS]:  # a record that names its fix keeps its end, where the fix stands
+        text = clip(quote(tip.text), QUOTE_CLIP) if tip.status == "INFO" else clip_start(quote(tip.text), QUOTE_CLIP)
+        line = f"ry-verify suggests (VJ {tip.no}): {text}"
+        cmds += comment(line, fix_start(line))
+    if rest := tips[MAX_UNIT_COMMANDS:]:
         cmds += comment(f"{plural(len(rest), 'more suggestion')}: VJ {ranges([h.no for h in rest], 8)}")
+    if lapses := m.vj.lapses:
+        lines = ranges([i.no for i in lapses], 8)
+        cmds += comment(f"{plural(len(lapses), 'check')} skipped as ry-verify's sudo cache lapsed: VJ {lines}")
+    gates = [s for s in (stop, *m.vj.phase_stops) if s and re.search(r"\bsudo\b", s.text)]
+    if gates or lapses:
+        cmds.append("sudo -v")
     cmds.append(f"{verify_script(m.vj)} --verify")
     kinds = "FAIL, GEN_FAIL, or WARN" if shown else "FAIL or WARN"
     why = f"{plural(len(fails), 'finding')} in {plural(len(sections), 'ry-verify section')} with {kinds}"
@@ -2243,14 +2381,14 @@ def plan_actions(m: Model) -> list[Action]:
 
 def analyze(br: BugReport, vj: VerifyLog) -> Model:
     """Run every analysis step and return the model the report is built from."""
-    STATE.root_uuid = root_uuid(br)
+    STATE.root_uuid = root_uuid(br) or vj.root_uuid  # ry-verify's, where the bug report redacts it
     facts = {**inxi_facts(br), **dmesg_facts(br)}
     if "kernel" not in facts and (release := re.match(r"Linux \S+ (\S+)", br.uname)):
         facts["kernel"] = release.group(1)  # the report header's uname line stands in for a missing inxi block
     facts = {k: sanitize(v) for k, v in facts.items()}  # shown on the cover and in every running header
     rules = applicable_rules(br)
     found = attribute(br, rules)
-    if not other_machine(vj, facts.get("cpu", "")):  # another machine's records say nothing about this one
+    if not other_machine(vj, facts.get("cpu", "")) and other_root(br, vj) is None:  # another system's say nothing
         apply_mitigations(found, vj)
         cite_records(found, vj)
     findings = [f for f in found.values() if f.severity in FINDING_LEVELS] + verify_findings(vj)
@@ -2301,7 +2439,7 @@ MPL_STYLE: dict[str, Any] = {
     "axes.linewidth": 0.6, "axes.edgecolor": "#3a3a3a", "xtick.major.width": 0.5, "ytick.major.width": 0,
     "xtick.major.size": 2.5, "axes.labelcolor": "#222", "xtick.color": "#333", "ytick.color": "#222",
     "axes.titlesize": 8.2, "axes.titleweight": "semibold", "axes.titlelocation": "left", "legend.frameon": False,
-    "legend.fontsize": 7.2, "axes.labelsize": 7.2,
+    "legend.fontsize": 7.2, "axes.labelsize": 7.2, "timezone": "UTC", "date.epoch": "1970-01-01T00:00:00",
 }  # fmt: skip
 CHART_NOTE = 6.4  # pt, text inside a chart: bar values, phase and lane labels, and the uptime strip's labels
 STATUS_ORDER = ("OK", "FAIL", "GEN_FAIL", "WARN", "INFO")  # as the text names them and the ry-verify chart stacks them
@@ -2367,12 +2505,14 @@ def _mpl() -> ModuleType:
     """Import matplotlib on first use (after the preflight), register the fonts, and apply the house style.
 
     The SVG backend measures text as the saved figures draw it, unhinted. The fonts from the font directory replace
-    any installed copy of their families, which matplotlib would otherwise find first.
+    any installed copy of their families, which matplotlib would otherwise find first. The style starts from
+    matplotlib's own defaults, so no matplotlibrc (in the working directory, $MATPLOTLIBRC, or the user's) applies.
     """
     if STATE.mpl is not None:
         return STATE.mpl
     import matplotlib as mpl
 
+    mpl.rcdefaults()  # leaves timezone and date.epoch, which MPL_STYLE sets
     mpl.use("svg")
     import matplotlib.pyplot as plt
     from matplotlib import font_manager
@@ -2813,34 +2953,74 @@ def uptime_events(m: Model) -> dict[str, float]:
     return out
 
 
-def fig_uptime(m: Model) -> str | None:
-    """Draw the cover's uptime strip on a log axis: the boot phases, each finding's first line, and the capture.
+UPTIME_MARKERS = {"ry-verify": ("D", 3.8), "bug report": ("s", 4.5)}  # marker and size: a diamond spans its diagonal
 
-    The phases end at the milestones dmesg logs; a line runs from the boot's end to the bug report, marked by a white
-    square; the IDs of the findings stand above their tick (uptime_labels()), stacked where two labels would meet.
+
+def uptime_captures(m: Model) -> dict[str, float]:
+    """Return the captures the uptime strip marks, in seconds since kernel start: the ry-verify run and the bug report.
+
+    The run is marked at its middle, as the boot chart marks it, or at its start when the log has no end.
     """
-    phases, events = boot_phases(m), uptime_events(m)
-    capture = capture_points(m).get("bug report")
+    points, out = capture_points(m), {}
+    if (start := points.get("ry-verify starts")) is not None:
+        out["ry-verify"] = (start + points.get("ry-verify ends", start)) / 2
+    if (capture := points.get("bug report")) is not None:
+        out["bug report"] = capture
+    return out
+
+
+def capture_labels(marks: dict[str, float], span: tuple[float, float], per: float) -> list[tuple[float, str]]:
+    """Return the uptime strip's capture labels, as (center in decades, text), each kept within the axis.
+
+    A label centers on its mark; when two labels would meet, one label names both captures in time order between
+    their marks.
+    """
+
+    def place(center: float, text: str) -> tuple[float, float]:
+        width = text_points(text, CHART_NOTE) / per
+        left = min(max(center - width / 2, span[0]), span[1] - width)
+        return left, left + width
+
+    spots = sorted((math.log10(x), name) for name, x in marks.items())
+    edges = [place(c, name) for c, name in spots]
+    if len(spots) == 2 and edges[1][0] < edges[0][1] + UPTIME_PAD / per:
+        a, b = place((spots[0][0] + spots[1][0]) / 2, text := f"{spots[0][1]} · {spots[1][1]}")
+        return [((a + b) / 2, text)]
+    return [((a + b) / 2, name) for (a, b), (_, name) in zip(edges, spots, strict=True)]
+
+
+def fig_uptime(m: Model) -> str | None:
+    """Draw the cover's uptime strip on a log axis: the boot phases, each finding's first line, and the captures.
+
+    The phases end at the milestones dmesg logs; a line runs from the boot's end to the last capture, the ry-verify
+    run marked by a white diamond, the bug report by a white square; the IDs of the findings stand above their tick
+    (uptime_labels()), stacked where two labels would meet.
+    """
+    phases, events, marks = boot_phases(m), uptime_events(m), uptime_captures(m)
     if not phases and not events:
         return None
     plt = _mpl()
     from matplotlib.ticker import FuncFormatter, NullFormatter
 
-    ends = [b for _, _, b in phases] + list(events.values()) + ([capture] if capture else [])
+    ends = [b for _, _, b in phases] + list(events.values()) + list(marks.values())
     xmax = max([*ends, 1.0]) * 1.8
     fig, ax = plt.subplots(figsize=(CW, 0.84), layout="constrained")
     ax.set_xscale("log")
     ax.set_xlim(UPTIME_MIN, xmax)
     per = unit_points(fig, ax)  # the height set below leaves the axis width as it is
-    labels, levels = uptime_labels(events, (math.log10(UPTIME_MIN), math.log10(xmax)), per)
+    span = (math.log10(UPTIME_MIN), math.log10(xmax))
+    labels, levels = uptime_labels(events, span, per)
     rows = max(levels, default=-1) + 1
     fig.set_size_inches(CW, 0.7 + 0.14 * rows)
     ax.set_ylim(-1.3, 0.75 + 0.55 * rows)
     uptime_phases(fig, ax, phases)
-    if capture:
-        ax.plot([phases[-1][2] if phases else UPTIME_MIN, capture], [0, 0], color=C_MID, lw=0.9, zorder=1)
-        ax.plot([capture], [0], marker="s", ms=4.5, mfc="white", mew=0.8, color=C_INK, ls="none", zorder=3)
-        ax.text(capture, -0.55, "bug report", ha="center", va="top", fontsize=CHART_NOTE)
+    if marks:
+        ax.plot([phases[-1][2] if phases else UPTIME_MIN, max(marks.values())], [0, 0], color=C_MID, lw=0.9, zorder=1)
+        for name, x in marks.items():
+            marker, size = UPTIME_MARKERS[name]
+            ax.plot([x], [0], marker=marker, ms=size, mfc="white", mew=0.8, color=C_INK, ls="none", zorder=3)
+        for center, text in capture_labels(marks, span, per):
+            ax.text(10**center, -0.55, text, ha="center", va="top", fontsize=CHART_NOTE)
     for (x, text, a, b), level in zip(labels, levels, strict=True):
         top = 0.62 + 0.55 * level
         ax.plot([10**x, 10**x], [0.36, top], color=C_INK, lw=0.6)
@@ -3955,7 +4135,8 @@ def cover_strip(m: Model) -> list[Flowable]:
                 + (" (findings close together share a label)" if STATE.uptime_shared else ""),
                 uptime_events(m),
             ),
-            ("the bug report", "bug report" in capture_points(m)),
+            ("the ry-verify run (diamond)", "ry-verify" in uptime_captures(m)),
+            ("the bug report (square)", "bug report" in uptime_captures(m)),
         )
         if shown
     ]
@@ -4418,6 +4599,8 @@ def verify_fact(m: Model) -> str:
     if foreign := other_machine(vj, m.facts.get("cpu", "")):
         item, theirs, ours = foreign
         ryv += f"; run on another machine (VJ {item.no}: {theirs} CPU, not {ours})"
+    if (line := other_root(m.br, vj)) is not None:
+        ryv += f"; run on another root file system than the bug report's (VJ {line})"
     preamble = [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]
     if preamble:
         logged = Counter(i.status for i in preamble)
@@ -4541,6 +4724,9 @@ def inputs_table(m: Model) -> list[Flowable]:
     br_secs = ", ".join(SECTION_LABELS[n] for n in SECTION_TITLES.values() if n in m.br.sections)
     phases = ", ".join(p for p in ("static", "runtime") if any(i.phase == p for i in m.vj.items))
     vj = m.vj
+    line, written = vj.events.get("REPORT_WRITTEN", (0, ""))  # --report names the HTML report beside its log
+    html = re.match(r"path=(.+?) bytes=\d", written)
+    html_cell = f"; its HTML report `{lit(file_name(Path(html[1])))}` (VJ {line})" if html else ""
     rows: list[list[object]] = [
         [
             f"`{lit(file_name(m.br.path))}`",
@@ -4555,7 +4741,7 @@ def inputs_table(m: Model) -> list[Flowable]:
             f"{len(text_lines(m.vj.raw)):,}",
             (
                 f"{plural(len(vj.records), 'record')}; ry-verify {lit(vj.meta('version'))}, profile "
-                f"{lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; phases: {phases or 'none'}"
+                f"{lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; phases: {phases or 'none'}{html_cell}"
             ),
         ],
         [Paragraph("SHA256", sty_label), Paragraph(hashlib.sha256(m.vj.raw).hexdigest(), sty_td_mono), "", ""],
@@ -5605,6 +5791,18 @@ def cross_checks(m: Model) -> list[list[str]]:
         out.append(
             ["ry-verify combined totals match the footer (OK, FAIL, WARN, GEN_FAIL)", "match" if same else "differs"]
         )
+    if m.vj.footer_counts_all:  # every record, the preamble's too, against the counts the footer states
+        found = Counter(i.counted for i in m.vj.items)
+        stated = {k: m.vj.footer.get(f, 0) for k, f in (("OK", "pass"), ("FAIL", "fail"), ("WARN", "warn"))}
+        stated["GEN_FAIL"] = m.vj.footer.get("gen_fail", 0)
+        keys = [k for k in stated if k != "GEN_FAIL" or found[k] or stated[k]]
+        said, gave = (", ".join(f"{d[k]:,}{NBSP}{k}" for k in keys) for d in (stated, found))
+        result = "match" if all(found[k] == stated[k] for k in stated) else f"differs: records give {gave}"
+        out.append([f"ry-verify records match its footer ({said})", result])
+    if root_uuid(m.br) and m.vj.root_uuid:
+        line = other_root(m.br, m.vj)
+        result = "match" if line is None else f"differs: VJ {line}"
+        out.append(["ry-verify's root file system is the bug report's (root UUID)", result])
     unparsed = m.br.journal_unparsed
     read = "match"
     if unparsed:
@@ -5618,7 +5816,9 @@ def cross_checks(m: Model) -> list[list[str]]:
             agree = "match" if lo <= hi else "differs: no time fits every pair"
         label = f"dmesg and journal times of {plural(len(pairs), 'kernel message')} agree on the kernel start"
         out.append([label, agree])
-    out.append(["Sections found in the bug report", f"{len(m.br.sections)} of {len(SECTION_TITLES)}"])
+    missing = [SECTION_LABELS[name] for name in SECTION_TITLES.values() if name not in m.br.sections]
+    held = f"differs: no {', '.join(missing)}" if missing else "match"
+    out.append([f"The bug report holds the {len(SECTION_TITLES)} sections cachyos-bugreport.sh writes", held])
     return out
 
 

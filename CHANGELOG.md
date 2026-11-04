@@ -4,6 +4,46 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.10.1
+------
+
+  - figures: charts start from matplotlib's defaults, so a matplotlibrc in
+    the working directory, $MATPLOTLIBRC, or ~/.config no longer alters them
+  - actions: a command ry-verify suggests starts a comment line of its own
+    when a line break would split it
+  - docs: README reads tighter and names ty 0.0.96 as tested; Quick Start
+    and Verify run as written on Arch Linux
+
+
+7.10.0
+------
+
+  - ry-verify: a run or phase stopped at a gate reads as stopped; 7.257.0
+    logs an INFO hint under the gate's ERR
+  - ry-verify: from 7.257.0 an interrupted run's footer counts every
+    section, so it gives the totals; older logs rebuild them from the phases
+  - ry-verify: VERIFY_RESULT counts belong to the phase scope= names; the
+    result reads PASS, PASS-WITH-WARNINGS, FAIL, or PREFLIGHT
+  - cli: a ry-verify log of another mode, such as --check, holds no results
+    and is refused with exit 1
+  - actions: ry-verify's hints are read as its --report reads them, and a
+    record that ends with its fix (a chown, a restart) is quoted too
+  - actions: the rerun starts with sudo -v after a sudo stop or lapse and
+    names the checks a lapse skipped
+  - report: B.2 checks ry-verify's records against its footer, its root file
+    system against the bug report's, and the seven bug-report sections
+  - report: a ry-verify log from another root file system lowers no
+    finding; B.1 names the HTML report a --report run wrote
+  - figures: the cover's uptime strip marks the ry-verify run; two capture
+    labels that would meet share one
+  - rules: bt-esco cites ry-verify's Bluetooth roles record and names the
+    hands-free (HFP/HSP) voice links it affects
+  - parsing: section titles match in any case, as CachyOS-Settings after
+    1.4.1 lowercases two; ry-verify's root UUID stands in for a redacted one
+  - docs: README names ry-verify 7.258.0 and ty 0.0.95 as tested and ties
+    byte-identical PDFs to one zlib build
+
+
 7.9.2
 -----
 
