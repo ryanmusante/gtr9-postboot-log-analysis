@@ -11,20 +11,18 @@ select = [
 ignore = [
     "D203",     # docstring layout follows D211 (no blank line before a class docstring)
     "D213",     # and D212 (summary on the first line)
-    "PLR2004",  # page geometry and chart coordinates are numeric by nature
-    "PLC0415",  # matplotlib and svglib load inside functions, after the preflight
+    "PLR2004",  # small counts, seconds per hour and minute, clock limits, and a width tolerance read best as literals
+    "PLC0415",  # matplotlib and svglib load after the preflight; attach_inputs() and library_versions() import on use
     "RUF001",   # the report text uses en dashes in number and time ranges
     "ISC001",   # single-line implicit concatenation is the formatter's call
 ]
-# Left out of `select` on purpose: `ruff check --select ALL --ignore D203,D213,PLR2004,PLC0415,RUF001,ISC001`
-# adds only COM812 (trailing commas are the formatter's call), T201 (print is the command-line output),
-# SLF001 (ReportLab internals: the frame position, table cells, and grouped flowables), and DTZ001, DTZ007,
-# and DTZ901 (journal and capture times are naive wall-clock, as the logs print them).
-
-[lint.per-file-ignores]
-# ReportLab loads after the early argument parse, so --help works without it
-"build_report.py" = ["E402"]
+# Left out of `select` on purpose: on the executable script (0755), `ruff check --select ALL --ignore
+# D203,D213,PLR2004,PLC0415,RUF001,ISC001` adds only COM812 (trailing commas are the formatter's call),
+# T201 (print is the command-line output), SLF001 (ReportLab internals: the frame position, table cells,
+# grouped flowables, and the canvas's document), and DTZ001, DTZ007, and DTZ901 (journal and capture times
+# are naive wall-clock, as the logs print them).
 
 [lint.pylint]
-# table() takes one keyword per layout option: 8 arguments, 3 of them positional
+# table() takes one keyword per layout option (8 arguments, 3 positional), and a legend handler's
+# create_artists() the 8 positional ones matplotlib fixes
 max-args = 8

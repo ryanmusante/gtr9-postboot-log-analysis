@@ -4,15 +4,47 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.10.2
+------
+
+  - privacy: email masking covers domains of several labels, as in
+    a.b@mail.example.co.uk; a nil UUID in a unit name stays readable
+  - ry-verify: a record whose text spans lines stays a result
+  - report: 8.2's lead stands only above a cut section and counts rows, so
+    records that merge into one row no longer get it
+  - report: the verdict and B.3 treat a ry-verify log from another root file
+    system as they treat one from another machine
+  - report: shutdown noise names a reboot or power-off, and bt-esco the
+    enhanced synchronous-connection setup the controller lacks
+  - report: Hardware says when inxi states none; a one-boot journal names
+    its boot; preamble records read as VJ ranges; B.2 is retitled
+  - figures: the boot chart's initrd stripes keep the legend's spacing once
+    the charts align; the uptime strip measures its axis as saved
+  - actions: a suggested fix past 400 characters keeps its command; status
+    lists read FAIL, GEN_FAIL, or WARN throughout
+  - layout: U+FFFD shows in monospace text with older Plex Mono builds, and
+    the pause table right-aligns its durations
+  - parsing: an event of the current boot no longer claims the previous
+    boot's first journal entries; inxi keys may carry a background color
+  - cli: a default output name that names a directory fails before layout;
+    a summary that fails after the PDF names it; cleanup survives signals
+  - cli: --brief titles the PDF brief; a relative XDG_DATA_HOME is ignored;
+    the font error says missing or unreadable
+  - code: shared constants and helpers replace repeated values and logic;
+    docstrings, comments, and ruff.toml's notes match the code
+  - docs: README says the attachments carry the inputs unmasked and fixes
+    exit codes, uptime labels, result values, and JSON fields
+
+
 7.10.1
 ------
 
-  - figures: charts start from matplotlib's defaults, so a matplotlibrc in
-    the working directory, $MATPLOTLIBRC, or ~/.config no longer alters them
+  - figures: charts start from matplotlib's defaults; a matplotlibrc in the
+    working directory, $MATPLOTLIBRC, or ~/.config/matplotlib changes nothing
   - actions: a command ry-verify suggests starts a comment line of its own
     when a line break would split it
   - docs: README reads tighter and names ty 0.0.96 as tested; Quick Start
-    and Verify run as written on Arch Linux
+    (all but cachyos-bugreport.sh) and Verify run as written on Arch Linux
 
 
 7.10.0
@@ -111,7 +143,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     its table when the after-boot table lists every repeat
   - layout: a word too wide for a table cell breaks after a separator
   - docs: README lists the failure keywords, which B.3 now counts, and
-    covers the new options, the JSON summary, context, and cites
+    covers the new options, the JSON summary, and rule context and cites
 
 
 7.8.1
@@ -205,8 +237,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     year end takes the right year
   - rules: a ry-verify mitigation lowers a USB device's finding only when
     the record names that device; gpu-hang covers soft recovery
-  - masking: IPv6 addresses, invisible format characters, ry-verify
-    section names, and file names that are not UTF-8
+  - privacy: masking covers IPv6 addresses, invisible format characters,
+    ry-verify section names, and file names that are not UTF-8
   - boot: milestones past 600 s extend the burst; phases keep their
     measured spans, and a cut userspace reads as a lower bound
   - boot: the chart names later milestones, states a cut burst, draws
@@ -455,7 +487,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - figures: charts use the IBM Plex files the report text uses, even where
     another copy of the family is installed
   - actions: no command names an input file, so sed is no longer needed
-  - cross-checks: the journal attribution check leaves with the
+  - report: the journal attribution cross-check leaves with the
     unclassified list
   - docs: README describes Section 5 Logs, the six figures, and the pause
     table; the identifier and unclassified-line texts are gone
@@ -628,9 +660,9 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     en_GB included, and with numeric zone names such as +04
   - parsing: a ry-verify footer count that is not a whole number is a
     wrong-format input (exit 1) instead of a Python traceback
-  - facts: the kernel release falls back to the header's uname line when the
-    inxi block is missing
-  - facts: firmware and NVMe data written are read in inxi 3.3's layout
+  - parsing: the kernel release falls back to the header's uname line when
+    the inxi block is missing
+  - parsing: firmware and NVMe data written are read in inxi 3.3's layout
     (Firmware: UEFI vendor:, written-units:) as well as the older one
   - rules: the x86 PCI host-bridge notice is boilerplate, not an
     unclassified "report a bug" line
@@ -712,7 +744,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     running headers, and page references settled in a second pass
   - figures: 2, 5, 6, 7, and 10 added; 1, 4, and 8 redrawn as vector; all
     grayscale for black-and-white printing
-  - content: revision 32; wording edited, values and evidence unchanged
+  - text: revision 32; wording edited, values and evidence unchanged
   - checks: content cross-checks and table geometry run before layout; an
     unsettled layout or an unresolved page reference fails the build
   - cli: --out, --fonts, --assets, --check, and --verbose; exits 0-3 and 130;
