@@ -4,6 +4,28 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.10.3
+------
+
+  - ry-verify: 7.260.0 logs parse as 7.258.0 logs do, every cross-check
+    matching; its sharper lapse wording keeps read errors out of the count
+  - cli: the PDF and the summary go to scratch files made exclusively under
+    unpredictable names, so a link planted beside an output redirects nothing
+  - cli: the PDF renders in memory, and the scratch files get the permissions
+    a new file gets there, from the umask or a default ACL, as before
+  - cli: a signal that lands as cleanup starts, or once the PDF is written,
+    leaves no scratch file either
+  - layout: U+FFFD in monospace fills one character cell, so a full line no
+    longer wraps: Plex Mono's own glyph where the face has one, else Plex
+    Sans's, scaled to the cell
+  - rules: the bug report's text is joined for requires patterns only when a
+    rule has one
+  - code: the early and the late signal lists name each other; a shared
+    constant would sit between the imports
+  - docs: README names ry-verify 7.260.0 as tested and says how the outputs
+    are written
+
+
 7.10.2
 ------
 

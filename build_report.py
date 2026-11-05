@@ -28,7 +28,7 @@ if __name__ == "__main__":
             os.write(2, b"build_report.py: interrupted; nothing written\n")
         os._exit(130)  # no teardown, where a C extension caught half loaded could crash
 
-    for _name in ("SIGINT", "SIGTERM", "SIGHUP"):
+    for _name in ("SIGINT", "SIGTERM", "SIGHUP"):  # as SIGNALS names them; a shared constant would precede imports
         if hasattr(signal, _name):
             signal.signal(getattr(signal, _name), _quit)
 
@@ -36,6 +36,7 @@ import argparse
 import datetime as dt
 import hashlib
 import importlib.util
+import io
 import itertools
 import json
 import math
@@ -48,7 +49,7 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -64,7 +65,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.10.2"
+__version__ = "7.10.3"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -95,6 +96,7 @@ FONT_FILES = {
 # The pacman package of each module beyond reportlab: an import error names it, and the preflight checks all three.
 MODULES = {"matplotlib": "python-matplotlib", "svglib": "python-svglib", "PIL": "python-pillow"}
 MAX_PASSES = 6  # layout passes allowed before the page references must have settled
+SCRATCH_TRIES = 100  # scratch names write_scratch() tries; of 64 random bits each, the first all but always serves
 EPOCH_MAX = 253402300799  # 9999-12-31 23:59:59 UTC, the last second a PDF date can hold
 HEADING_TOP_BAND = 70.0  # pt below the frame top within which a section heading opens its page
 
@@ -778,7 +780,7 @@ PHASE_BANNER = re.compile(r"^INFO: (?:Static|Runtime) verification \(")  # a pha
 # ry-verify's signal handler logs this through _log, which counts nothing: no result either.
 SIGNAL_NOTICE = re.compile(r"^WARN: Caught (?:SIG[A-Z]+|exit) — cleaning up")
 # ERR lines ry-verify logs without counting them: continuations of a counted ERR, and two notes its callers grade,
-# which 7.257.0 and 7.258.0 log as INFO.
+# which it logs as INFO from 7.257.0 on.
 UNCOUNTED_ERR = re.compile(
     r"^ERR: (?:sudo required for verification$|\s+(?:Checking gfx1151/Strix Halo expectations "
     r"|Override \(at your risk\): |ESP autodetect failed AND /boot is not a directory))"
@@ -1252,6 +1254,7 @@ CONTROL = re.compile(
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff"
     r"\ufff9-\ufffb\ud800-\udfff]"
 )
+FFFD = "\ufffd"  # the replacement character: a control above, or a byte that is not UTF-8, reads as it
 
 
 def mask(text: str) -> str:
@@ -1269,7 +1272,7 @@ def mask(text: str) -> str:
 
 def sanitize(text: str) -> str:
     """Return text with ANSI escapes removed, then masked, with controls and lone surrogates shown as U+FFFD."""
-    return CONTROL.sub("\ufffd", mask(ANSI_ESCAPE.sub("", text)))
+    return CONTROL.sub(FFFD, mask(ANSI_ESCAPE.sub("", text)))
 
 
 def quote(text: str) -> str:
@@ -1480,7 +1483,9 @@ def error_findings(m: Model) -> list[Finding]:
 
 
 def applicable_rules(br: BugReport) -> list[Rule]:
-    """Return the rules whose `requires` pattern (if any) occurs in the bug report."""
+    """Return the rules whose `requires` pattern (if any) occurs in the bug report; the text joins only for one."""
+    if not any(r.requires for r in RULES):
+        return list(RULES)
     text = "\n".join(br.lines)
     return [r for r in RULES if not r.requires or re.search(r.requires, text)]
 
@@ -3363,10 +3368,10 @@ def journal_bars(times: Sequence[dt.datetime], start: dt.datetime | None) -> tup
 
 
 def journal_axis(ax: Axes, xs: Sequence[Any], width: int, unit: tuple[float, str] | None) -> None:
-    """Label a journal timeline panel's time axis; a span under two bars widens to one bar, at least a minute, a side.
+    """Label a journal timeline panel's time axis; a span under two bars widens by one bar a side.
 
     A panel timed from the kernel start counts in unit, as (seconds per unit, name); without one, it reads the wall
-    clock. width is the bar width in seconds.
+    clock, where a bar counts as at least a minute. width is the bar width in seconds.
     """
     import matplotlib.dates as mdates
 
@@ -3489,7 +3494,7 @@ EVIDENCE_LINES = 8  # evidence lines quoted per card; the Lines row gives their 
 CODE_SIZE = 7.3  # monospace size of command blocks
 CODE_MIN_SIZE = 6.0  # smallest size a command block shrinks to before a line wraps
 MONO_ADVANCE = 0.6  # em; every IBM Plex Mono glyph is 600 units wide
-CODE_ROOM = FW - 16  # pt a command block's line takes: the frame less the block's padding
+CODE_ROOM = FW - 16  # pt a command block's line takes: the frame less 7 pt padding left, 6 right, and 3 to spare
 COMMAND_WIDTH = int((CODE_ROOM - 0.5) / (CODE_MIN_SIZE * MONO_ADVANCE))  # characters a block line holds unwrapped
 VERIFY_RECORDS = 20  # rows the ry-verify failures table lists per section; a last row counts the records past them
 NOTE_ROWS = UNIT_ROWS = 40  # rows the ry-verify notes and the unit failures tables list; a last row counts the rest
@@ -3617,10 +3622,22 @@ def lit(text: object) -> str:
 def esc(text: str) -> str:
     """Escape text for a Paragraph; U+FFFD switches to Plex Sans, as the condensed faces have no glyph for it.
 
-    Monospace text takes the switch too: older Plex Mono builds (Debian's 6.1) have no glyph for it either.
+    Inline code takes the switch too; a monospace line takes mono_esc(), which keeps the character grid.
     """
-    mark = "\ufffd"  # the replacement character
-    return escape(text).replace(mark, f'<font name="Plex">{mark}</font>')
+    return escape(text).replace(FFFD, f'<font name="Plex">{FFFD}</font>')
+
+
+def mono_esc(text: str, size: float) -> str:
+    """Escape a monospace line of size for a Paragraph; U+FFFD fills one 0.6 em cell, as every other character does.
+
+    Plex Mono's own glyph serves where the face has one. Older builds (Debian's 6.1) have none, and Plex Sans's, a
+    full em wide, stands in at the size that makes it one cell.
+    """
+    out = escape(text)
+    if FFFD not in out or ord(FFFD) in pdfmetrics.getFont("PlexM").face.charToGlyph:
+        return out
+    cell = size * MONO_ADVANCE / stringWidth(FFFD, "Plex", 1)
+    return out.replace(FFFD, f'<font name="Plex" size="{cell:.3f}">{FFFD}</font>')
 
 
 def fmt(text: str, st: ParagraphStyle | None = None) -> str:
@@ -3665,7 +3682,7 @@ def mono_markup(text: str, width: float, size: float) -> str:
 
     def keep(line: str) -> str:
         """Escape a line; a run of spaces turns into no-break spaces but its last, and leading spaces all."""
-        line = re.sub(r"^ +", lambda m: NBSP * len(m.group(0)), esc(line))
+        line = re.sub(r"^ +", lambda m: NBSP * len(m.group(0)), mono_esc(line, size))
         return re.sub(r" {2,}", lambda m: NBSP * (len(m.group(0)) - 1) + " ", line)
 
     return "<br/>".join(keep(line) for line in lines)
@@ -5955,10 +5972,10 @@ def report_name() -> str:
 class Doc(BaseDocTemplate):
     """US Letter document with cover and body page templates and the report metadata."""
 
-    def __init__(self, filename: str, m: Model) -> None:
-        """Set the metadata, frames, and page templates."""
+    def __init__(self, output: BinaryIO, m: Model) -> None:
+        """Set the metadata, frames, and page templates; the PDF goes to output, a binary stream."""
         super().__init__(
-            filename, pagesize=letter, leftMargin=LM, rightMargin=RM, topMargin=TOPM, bottomMargin=BOTM,
+            output, pagesize=letter, leftMargin=LM, rightMargin=RM, topMargin=TOPM, bottomMargin=BOTM,
             title=f"{report_name()} · {m.facts.get('machine', UNKNOWN_MACHINE)} ({capture_day(m)})",
             lang="en-US",
             displayDocTitle=True,
@@ -6187,13 +6204,18 @@ def render_figures(m: Model) -> int:
     return sum(1 for v in STATE.charts.values() if v)
 
 
-def layout(path: Path, m: Model, log: Callable[[str], None]) -> None:
-    """Lay the story out until anchors, page count, and headers repeat; raise on drift or unresolved references."""
+def layout(m: Model, log: Callable[[str], None]) -> bytes:
+    """Lay the story out in memory until anchors, page count, and headers repeat, and return that pass's PDF.
+
+    Raise on drift or unresolved references.
+    """
+    pdf = io.BytesIO()
     for n in range(1, MAX_PASSES + 1):
         STATE.anchors.clear()
         STATE.h1pos.clear()
         STATE.unresolved.clear()
-        doc = Doc(str(path), m)
+        pdf = io.BytesIO()
+        doc = Doc(pdf, m)
         doc.build(story(m))
         total = doc.page
         sections = page_sections(total)
@@ -6221,6 +6243,7 @@ def layout(path: Path, m: Model, log: Callable[[str], None]) -> None:
     if STATE.unresolved:
         msg = "unresolved page references: " + ", ".join(sorted(STATE.unresolved))
         raise RuntimeError(msg)
+    return pdf.getvalue()
 
 
 def stated_zone(date_text: str) -> dt.tzinfo | None:
@@ -6319,35 +6342,66 @@ def build(args: argparse.Namespace, font_dir: Path, *, verbose: bool = False) ->
 
 
 def write_outputs(m: Model, out: Path, target: Path | None, log: Callable[[str], None]) -> None:
-    """Lay the report out under a scratch name beside out, then replace out with it, and target with the summary.
+    """Lay the report out, write it and the summary to scratch files beside out and target, then replace both.
 
     A signal cannot split the replacing step. The PDF is dated by SOURCE_DATE_EPOCH, which the capture time sets for
     this build unless the environment does.
     """
-    tmp = out.with_name(f".build_report-{os.getpid()}.tmp")  # short, so any output name the system allows fits
-    sidecar = target.with_name(f".build_report-{os.getpid()}.json.tmp") if target else None
     epoch = os.environ.get("SOURCE_DATE_EPOCH")  # ReportLab dates the PDF from it; set for this build only
     if epoch is None:
         os.environ["SOURCE_DATE_EPOCH"] = str(source_epoch(m))
     try:
-        render_report(tmp, m, log)
-        if sidecar:
-            sidecar.write_text(json.dumps(summary(m), indent=1) + "\n", encoding="utf-8")
+        tmp = write_scratch(out, ".tmp", render_report(m, log))
+        sidecar = None
+        if target:
+            sidecar = write_scratch(target, ".json.tmp", (json.dumps(summary(m), indent=1) + "\n").encode())
         with interrupts_deferred():  # the PDF replaces its target and is recorded as written, or neither happens
             if INTERRUPTED:  # an interrupt raised inside a callback that Python swallowed
                 raise KeyboardInterrupt
             tmp.replace(out)
+            SCRATCH.remove(tmp)
             WRITTEN.append(out)
             if target and sidecar:
                 sidecar.replace(target)
+                SCRATCH.remove(sidecar)
     finally:
         with interrupts_deferred():  # a signal or a failed unlink leaves no scratch file and the epoch restored
-            for path in (tmp, sidecar):
-                if path:
-                    with contextlib.suppress(OSError):
-                        path.unlink(missing_ok=True)
+            remove_scratch()
             if epoch is None:
                 os.environ.pop("SOURCE_DATE_EPOCH", None)
+
+
+def write_scratch(beside: Path, suffix: str, data: bytes) -> Path:
+    """Write data to a new scratch file beside a target, record it in SCRATCH, and return its path.
+
+    The file is created exclusively under an unpredictable name, so no link planted in the directory redirects the
+    write, and gets the permissions open() gives a new file there, from the umask or the directory's default ACL.
+    """
+    for _ in range(SCRATCH_TRIES):
+        path = beside.with_name(f".build_report-{os.urandom(8).hex()}{suffix}")
+        with interrupts_deferred():  # the file is made, opened, and recorded for cleanup, or none of these
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)  # as open(path, "xb") would
+            except FileExistsError:  # the name is taken: draw another
+                continue
+            SCRATCH.append(path)
+            f = os.fdopen(fd, "wb")  # an interrupt raised as the block ends leaves the file object to close the fd
+        with f:
+            f.write(data)
+        return path
+    msg = f"{beside.parent}: no unused scratch name in {SCRATCH_TRIES} tries"
+    raise FileExistsError(msg)
+
+
+def remove_scratch() -> None:
+    """Unlink the scratch files not yet renamed over their targets; one that cannot be unlinked is let be.
+
+    Each leaves the record only once unlinked, so an interrupt that lands in between, and unlinks the rest, misses none.
+    """
+    while SCRATCH:
+        with contextlib.suppress(OSError):
+            SCRATCH[-1].unlink(missing_ok=True)
+        SCRATCH.pop()
 
 
 def library_versions() -> str:
@@ -6364,8 +6418,8 @@ def library_versions() -> str:
     return ", ".join([f"Python {sys.version.split()[0]}", *found])
 
 
-def render_report(path: Path, m: Model, log: Callable[[str], None]) -> None:
-    """Render the figures into a scratch directory and lay the report out into path."""
+def render_report(m: Model, log: Callable[[str], None]) -> bytes:
+    """Render the figures into a scratch directory and return the laid-out PDF."""
     with tempfile.TemporaryDirectory(prefix="postboot-report-") as tmp_dir:
         STATE.chart_dir = Path(tmp_dir)
         with warnings.catch_warnings(record=True) as caught:  # matplotlib warns about tick choices, say
@@ -6374,7 +6428,7 @@ def render_report(path: Path, m: Model, log: Callable[[str], None]) -> None:
         for warning in caught:
             log(f"figure warning: {warning.message}")
         log(f"{plural(drawn, 'chart')} rendered")
-        layout(path, m, log)
+        return layout(m, log)
 
 
 def summary_path(args: argparse.Namespace, out: Path) -> Path | None:
@@ -6465,7 +6519,11 @@ def read_summary(path: Path) -> dict[str, Any]:
 
 
 def output_path(args: argparse.Namespace, m: Model) -> Path:
-    """Return the PDF's absolute path; raise OSError when it names an input or its directory takes no new file."""
+    """Return the PDF's absolute path.
+
+    Raise OSError when the default name is taken by a directory or no regular file, the path names an input, or its
+    directory takes no new file.
+    """
     default = f"post-boot-log-analysis-{capture_day(m)}{'-brief' if STATE.brief else ''}.pdf"
     out = (args.out or Path(default)).resolve()
     if args.out is None and (kind := out_kind(out)):  # check_args() has checked an --out the user gave
@@ -6486,8 +6544,12 @@ def silence(stream: TextIO) -> None:
 
 
 INTERRUPTED: list[int] = []  # the signals received; write_outputs() checks before the PDF replaces its target
-DEFERRING: list[bool] = []  # set while the PDF replaces its target and once the run is over: interrupts wait
+# Set while a scratch file is made, while the outputs replace their targets, during cleanup, and once the run is
+# over: an interrupt waits.
+DEFERRING: list[bool] = []
 WRITTEN: list[Path] = []  # the PDF once it has replaced its target, which a later interrupt leaves in place
+SCRATCH: list[Path] = []  # the scratch files not yet renamed over their targets, which cleanup and interrupts unlink
+# The signals that end a run with exit 130, the three the early handler at the top of the file names too.
 SIGNALS = tuple(getattr(signal, n) for n in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, n))
 
 
@@ -6508,17 +6570,17 @@ def interrupts_deferred() -> Generator[None]:
 
 
 def interrupt(signum: int, _frame: object) -> None:
-    """Record the signal and raise KeyboardInterrupt, so the build cleans up and exits 130.
+    """Record the signal, unlink the scratch files, and raise KeyboardInterrupt, so the build exits 130.
 
-    While the PDF replaces its target, the raise waits for that step to end; once the run is over, the signal is
-    only recorded. Once the PDF is written, nothing is left to clean up, and the process ends at once with exit 130,
-    the message written straight to the descriptor (a print could meet the one it interrupted). The record outlasts an
-    interrupt Python swallows (raised in a weakref callback) or turns into another error (raised while a C extension
-    loads).
+    While DEFERRING is set, the rest waits for the step under way to end; once the run is over, the signal is only
+    recorded. Once the PDF is written, the process ends at once with exit 130, the message written straight to the
+    descriptor (a print could meet the one it interrupted). The record outlasts an interrupt Python swallows (raised
+    in a weakref callback) or turns into another error (raised while a C extension loads).
     """
     INTERRUPTED.append(signum)
     if DEFERRING:
         return
+    remove_scratch()  # here too, as a signal can land after a failure, before the cleanup that it skips
     if WRITTEN:
         with contextlib.suppress(OSError):  # stderr may be closed
             os.write(2, f"build_report.py: interrupted after writing {WRITTEN[0]}\n".encode(errors="surrogateescape"))
@@ -6538,7 +6600,7 @@ def main(argv: list[str] | None = None) -> int:
     Once the run is over, a signal is only recorded: the exit code reports it if it came in time, else the result
     stands.
     """
-    for record in (INTERRUPTED, DEFERRING, WRITTEN):
+    for record in (INTERRUPTED, DEFERRING, WRITTEN, SCRATCH):
         record.clear()
     parser = build_parser()
     args = _ARGS if argv is None and _ARGS is not None else parser.parse_args(argv)

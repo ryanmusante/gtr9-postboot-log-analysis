@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.10.2** · [Changelog](CHANGELOG.md)
+**Version 7.10.3** · [Changelog](CHANGELOG.md)
 
 Builds a PDF report from a `cachyos-bugreport.log` and a ry-verify JSONL log: the findings with their evidence and the commands they call for, system health, the boot, dmesg, the journal, and the ry-verify results. Every finding, quote, count, and figure comes from the two inputs on each run; the script holds analysis rules, never results.
 
@@ -28,7 +28,7 @@ sudo cachyos-bugreport.sh
 
 ## Usage
 
-- `--out PATH` — output PDF; default `./post-boot-log-analysis-<capture date>.pdf` (the ry-verify start date when the bug report states none, else `undated`), with `-brief` before `.pdf` under `--brief`
+- `--out PATH` — output PDF; default `./post-boot-log-analysis-<capture date>.pdf` (the ry-verify start date when the bug report states none, else `undated`), with `-brief` before `.pdf` under `--brief`; the PDF and the JSON summary are written to scratch files beside their targets, created exclusively under unpredictable names, then renamed over them, and get the permissions a new file gets there, from the umask or the directory's default ACL
 - `--brief` — the cover and Sections 1 to 3 only, about six pages for paper; a reference to a later section names the full report, and the PDF's title says brief
 - `--json PATH` — also write the findings as a JSON summary (below), replaced in the same step as the PDF
 - `--compare PATH` — an earlier run's JSON summary: the register gains a Change column (new, worse, better, or same; findings match by rule, ry-verify findings by status, phase, and section, and one that was INFO is new), a line under it names the findings resolved since (gone, or lowered to INFO) by title and earlier ID, the verdict counts the new and the resolved findings, and a summary from another machine is named as such
@@ -114,7 +114,7 @@ Every `pdffonts` row shows `yes` in its `emb` column, and `pdfdetach` lists the 
 - Python 3.12 or newer; tested on 3.12, 3.13, and 3.14, which build the same PDF, byte for byte where they link the same zlib (zlib-ng compresses it to other bytes)
 - ReportLab 5.1.0, matplotlib 3.11.2, svglib 2.3.2, and Pillow 13.0.0 as tested; the script metadata requires at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12, which on Python 3.12 build the same PDF
 - IBM Plex TTF files, the 9 named at the top of the script; `ttf-ibm-plex` on Arch, `fonts-ibm-plex` on Debian
-- Inputs from `cachyos-bugreport.sh` (cachyos-settings 1:1.4.1-1 and the CachyOS-Settings tree after it, as tested) and ry-verify 7.258.0 as tested
+- Inputs from `cachyos-bugreport.sh` (cachyos-settings 1:1.4.1-1 and the CachyOS-Settings tree after it, as tested) and ry-verify 7.258.0 and 7.260.0 as tested
 - To run the Section 3 commands: fish, and systemd's `systemctl`, `journalctl`, and `coredumpctl`
 - To lint: ruff 0.17.3 and ty 0.0.96 as tested
 - Quick Start and Verify run as written on Arch Linux with its own packages (Python 3.14, fish 4.9), all but `cachyos-bugreport.sh`, which CachyOS's `cachyos-settings` ships
