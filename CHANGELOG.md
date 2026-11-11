@@ -4,6 +4,57 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.11.0
+------
+
+  - actions: every HIGH, MED, and LOW finding is on the checklist; one that
+    no failure action answers gets its rule's task, commands, and test, so
+    a LOW finding no longer meets "The findings call for no action."
+  - actions: tasks for a unit failed under a redacted name, the Wi-Fi P2P
+    device, a HID joystick, and jack2, their commands built from the
+    evidence; an action without commands points at its finding's card
+  - rules: usb-volume is INFO, as the kernel warns on every probe whatever
+    the mixer and no action cleared it; --compare against a 7.10.3 summary
+    names it resolved
+  - rules: Linux 7.3's hung-task line ("blocked in I/O wait for more than")
+    is a kernel splat, and KWin 6.8's "Atomic commit failed: EACCESS" the
+    refused commit of the session switch
+  - rules: "Failed to start dbus-:<email-address-redacted>" belongs to the
+    redacted D-Bus unit, so it raises no unit-failure action
+  - rules: a GPU hang claims the "device wedged" line after its reset; a
+    FAT volume not cleanly unmounted is a watch item, and the DRM panic
+    screen's boot line boilerplate
+  - boot: where dmesg lacks systemd's "Switching root", which goes to the
+    journal, the stop of the initrd's journald before systemd's banner is
+    the root switch, so a systemd initrd shows its phases
+  - analysis: a kernel message printed between the initrd's journald and
+    the root's bounds the kernel start from above only, so one such line
+    no longer voids the estimate
+  - checks: B.2 compares the kernel command line tokens ry-verify checked
+    with the bug report's cmdline line, and ry-verify's start with the
+    kernel start; cachyos-settings 1.4.2 redacts the root UUID
+  - report: a ry-verify log from another kernel command line lowers no
+    finding, as one from another machine or root file system; the verdict
+    and the key facts name it, and a run from before the captured boot
+  - ry-verify: the result goes by the counts, as its --report words it: a
+    run whose HTML report was not written keeps its PASS, and the exit
+    text and B.1 say why
+  - ry-verify: 7.262.0 logs parse as 7.260.0 logs do, every cross-check
+    matching; a fix named mid-clause ("... until sudo systemctl restart")
+    is listed, and a hint is quoted without its arrow
+  - report: the health table names the CPU scheduler: BORE with its
+    version, sched_ext with its state or loaded scheduler
+  - dmesg: more boot prefixes belong to their subsystem instead of Other:
+    secureboot, SMBIOS, PM, kfence, raid6, libata, io scheduler, and others
+  - parsing: a separator line with blanks at its end still splits sections
+  - layout: a field of thousands of characters no longer fails the build:
+    a fact is cut as a quote is, a ry-verify version or profile at 40, a
+    section name at 60, and the HTML report's name at 255
+  - docs: README names cachyos-settings 1.4.2 to 1.4.4 and ry-verify
+    7.262.0, and describes the tasks, the pairing checks, the root switch,
+    and the task fields of a rule
+
+
 7.10.3
 ------
 

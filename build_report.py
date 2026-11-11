@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.10.3"
+__version__ = "7.11.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -285,7 +285,7 @@ STATE = BuildState()
 
 # ── INPUT ─────────────────────────────────────────────────────────────
 # Parsers for the two capture formats: cachyos-bugreport.sh output and ry-verify JSONL.
-SEPARATOR = re.compile(r"^(?:_{44}|-{44})$")  # the bare 44-character rules cachyos-bugreport.sh writes
+SEPARATOR = re.compile(r"^(?:_{44}|-{44})[ \t]*$")  # the 44-character rules cachyos-bugreport.sh writes, padded or not
 # Matched ignoring case: the CachyOS-Settings tree after 1.4.1 lowercases the two "Getting" titles.
 SECTION_TITLES = {
     "Start of CachyOS bug report log file": "header",
@@ -394,9 +394,9 @@ class VerifyLog:
     events: dict[str, tuple[int, str]] = field(default_factory=dict)  # first KEY: event of each key, line and text
 
     def meta(self, key: str) -> str:
-        """Return a header field for display: sanitized, or "?" when the log does not state it."""
+        """Return a header field for display: sanitized and cut to META_CLIP, or "?" when the log does not state it."""
         value = self.header.get(key)
-        return "?" if value is None else sanitize(str(value))
+        return "?" if value is None else clip(sanitize(str(value)), META_CLIP)
 
     @property
     def started(self) -> dt.datetime | None:
@@ -451,8 +451,10 @@ class VerifyLog:
     def status(self) -> tuple[str, str]:
         """Return the verdict in ry-verify's words with the exit text, interrupted, or unknown (no footer or exit).
 
-        Exit 3 is PREFLIGHT, a gate that stopped the run; any other failing exit is FAIL; a passing run with a WARN
-        is PASS-WITH-WARNINGS, as ry-verify's --report words them.
+        As ry-verify's --report words them: exit 3 is PREFLIGHT, a gate that stopped the run; a counted FAIL or
+        GEN_FAIL is FAIL, and so is a failing exit the counts do not explain; a pass with a WARN is
+        PASS-WITH-WARNINGS. A --report run whose checks passed but whose HTML report could not be written exits 1:
+        it keeps its verdict, and the exit text says why.
         """
         if not self.footer:
             return "unknown", "no footer"
@@ -463,9 +465,11 @@ class VerifyLog:
             return "interrupted", f"exit {code}"
         if code == VERIFY_PREFLIGHT:
             return "PREFLIGHT", f"exit {code}"
-        if code:
+        totals, unwritten = self.totals, "REPORT_WRITE_FAIL" in self.events
+        if totals["fail"] or totals["gen_fail"] or (code and not unwritten):
             return "FAIL", f"exit {code}"
-        return ("PASS-WITH-WARNINGS" if self.totals["warn"] else "PASS"), f"exit {code}"
+        why = ": its HTML report was not written" if code else ""
+        return ("PASS-WITH-WARNINGS" if totals["warn"] else "PASS"), f"exit {code}{why}"
 
     @property
     def stopped(self) -> VerifyItem | None:
@@ -789,14 +793,20 @@ COUNTS = re.compile(r"\b(ok|fail|warn|gen_fail)=(\d{1,9})\b")
 SCOPE = re.compile(r"\bscope=(static|runtime)\b")  # the phase a VERIFY_RESULT record closes (ry-verify 7.258.0)
 EVENT = re.compile(r"^([A-Z][A-Z0-9_]*): (.*)$", re.DOTALL)  # a structured record, as ROOT_UUID_OK: uuid=…
 RESULT_MODES = ("verify", "report")  # the ry-verify modes whose logs hold check results; --check logs none
+META_CLIP = 40  # characters of a header field the report shows: a version, a profile, or a mode
+SECTION_CLIP = 60  # characters of a section name kept; ry-verify's longest is 21
 FOOTER_NUMBERS = ("pass", "fail", "warn", "gen_fail", "exit_code")  # footer fields the report reads as integers
 FOOTER_FIELDS = {"OK": "pass", "FAIL": "fail", "WARN": "warn", "GEN_FAIL": "gen_fail"}  # status: the footer's count
 FOOTER_LIMIT = 10**9  # footer counts lie from 0 up to this, as the VERIFY_RESULT counts (COUNTS) do
 FOOTER_COUNTS_ALL = (7, 257, 0)  # from this ry-verify on, an interrupted run's footer counts every section's rows
 VERIFY_PREFLIGHT = 3  # ry-verify's exit when a gate stops the run: missing sudo, a dependency, or a validator
 SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify skipped as its sudo cache lapsed
-# A fix a FAIL or WARN record names at its end, after a dash, a parenthesis, or a semicolon: — sudo chown …
-FIX_COMMAND = re.compile(r"(?:—|\(|;)\s*(?:(?:sudo )?(?:systemctl|chown|chmod|iw|mount)\s|restart \S)")
+# A fix a FAIL or WARN record names in its last clause, after a dash, a parenthesis, or a semicolon: — sudo chown …,
+# — inbound ping blocked until sudo systemctl restart …, (re-login or systemctl --user daemon-reload)
+FIX_VERB = r"(?:systemctl|chown|chmod|iw|mount)"  # as a bare word after other words, only systemctl names a command
+FIX_COMMAND = re.compile(
+    rf"(?:—|\(|;)\s*(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
+)
 RUN_HINT = re.compile(r"\b(?:Run|Install missing): (?=\S)")  # an INFO record that names its fix: Run: sudo …
 
 
@@ -854,7 +864,7 @@ class VerifyCursor:
             self.last_phase, self.section, self.heading = m.group(1).lower(), "BEFORE THE FIRST SECTION", ""
             return True
         if m := re.match(r"^ECHO: ([A-Z][A-Z0-9 /&-]+)$", data):
-            self.section, self.heading = m.group(1), ""
+            self.section, self.heading = clip(m.group(1), SECTION_CLIP), ""  # names findings, anchors, and table rows
             return True
         if m := re.match(r"^ECHO: ─+ (.+?) ─+$", data):
             self.heading = m.group(1)
@@ -964,6 +974,8 @@ class Rule:
     context: tuple[str, ...] = ()  # an event's other lines, claimed within CONTEXT_SPAN lines of it from its source
     lead: tuple[str, ...] = ()  # context only while the event's last line is a match: a timeout's process line
     cites: str = ""  # ry-verify records about the same setting; the notes cite the last that matches
+    task: str = ""  # the checklist's action for a finding that calls for one; RULE_COMMANDS holds its commands
+    done: str = ""  # the task's completion test
 
 
 # Block-layer names for failed I/O besides "I/O" (blk_errors[]); "critical nexus" is "reservation conflict" since 6.5.
@@ -987,7 +999,8 @@ RULES = (
     # The five kernel error classes read dmesg only, so a program that prints "Oops" is not taken for the kernel.
     R("kernel-splat", "Kernel oops, BUG, or warning splat", "Kernel", "HIGH", ("dmesg",),
       (r"\bOops\b", r"\bBUG: ", r"kernel BUG at ", r"^general protection fault",
-       r"^WARNING: (?:CPU: \d+ PID: \d+ |.*, CPU#\d+: )", r"^UBSAN: ", r"INFO: task .+ blocked for more than",
+       r"^WARNING: (?:CPU: \d+ PID: \d+ |.*, CPU#\d+: )", r"^UBSAN: ",
+       r"INFO: task .+ blocked(?: in I/O wait)? for more than",  # 7.3 names the wait
        r"detected hard LOCKUP", r"detected (?:expedited )?stalls? on CPU", r"\birq \d+: nobody cared"),
       "The kernel reached an unexpected state and printed a splat; the lines after the first match name the "
       "module and function involved.",
@@ -1006,7 +1019,7 @@ RULES = (
       "Note the process the evidence names, if any, and check the amdgpu lines around the timeout or reset.",
       lead=(r"\bProcess .+? pid \d+ thread ",),  # a later page fault prints the same line
       context=(r"\bStarting \S+ ring reset\b", r"\bRing reset disabled by debug mask",
-               r"\bRing \S+ reset (?:succeeded|failed|failure)\b")),
+               r"\bRing \S+ reset (?:succeeded|failed|failure)\b", r"\bdevice wedged\b")),
     R("storage-errors", "Storage or file-system errors", "Storage", "HIGH", ("dmesg",),
       (r"I/O error", rf"\b{BLOCK_ERRORS} error, dev ", r"EXT4-fs error", r"BTRFS (?:error|critical)",
        r"XFS .*[Cc]orruption",
@@ -1034,13 +1047,15 @@ RULES = (
       "meet the shutdown transaction, D-Bus refuses activations, and PipeWire clients lose their server.",
       window="shutdown"),
     R("redacted-dbus-unit", "A D-Bus-activated unit failed under a redacted name", "Services", "INFO",
-      ("journal",), (r"dbus-:<email-address-redacted>: Failed with result",),
+      ("journal",),
+      (r"dbus-:<email-address-redacted>: Failed with result", r"Failed to start dbus-:<email-address-redacted>"),
       "cachyos-bugreport.sh redacts the name, which reads as an email address; on-demand services fail this way "
       "when they exit on start, as KWallet's do with it off.", f"{NAME_REDACTED}.", idents=r"systemd"),
     R("redacted-unit", "A unit failed under a redacted name", "Services", "LOW", ("journal",),
       (r"<email-address-redacted>: Failed with result", r"Failed to start <email-address-redacted>"),
       "A unit failed under a name cachyos-bugreport.sh redacted: template units such as getty@tty1.service read "
-      "as email addresses.", f"{NAME_REDACTED}, then inspect it with `systemctl status`.", idents=r"systemd"),
+      "as email addresses.", f"{NAME_REDACTED}, then inspect it with `systemctl status`.", idents=r"systemd",
+      task="Name the redacted unit and inspect it", done="The unit is named and no longer fails"),
     R("kwallet-off", "ksecretd started without the PAM login handoff", "Session / KWallet", "INFO", ("journal",),
       (r"Lacking a socket, pipe",),
       "The login passed ksecretd no PAM socket, so the wallet stays locked; with the wallet disabled, ksecretd "
@@ -1059,7 +1074,7 @@ RULES = (
       ("journal",), (r"plasmalogin-helper exited with 255",),
       "The greeter's helper exits with 255 when the greeter stops after a successful handoff to the session."),
     R("kwin-commit", "KWin atomic commit refused at the session switch", "Desktop / KWin", "INFO", ("journal",),
-      (r"atomic commit failed: Permission denied",),
+      (r"(?i)atomic commit failed: (?:Permission denied|EACCESS)",),  # KWin 6.8 names the error code
       "The outgoing compositor loses DRM master during the greeter-to-session switch and logs the refused commit.",
       "None unless a login glitch appears."),
     R("kwin-killer", "KWin discards an unfinished kill prompt", "Desktop / KWin", "INFO", ("journal",),
@@ -1091,7 +1106,8 @@ RULES = (
     R("nm-p2p", "NetworkManager warns on the Wi-Fi P2P device", "Network / NetworkManager", "LOW", ("journal",),
       (r"p2p-dev-\w+.*(?:forwarding|No such file or directory)",),
       "NetworkManager configures a P2P device that has no kernel network device and logs the failure.",
-      "Unmanage `type:wifi-p2p` devices in a NetworkManager conf.d drop-in.", mitigated_by=r"(?i)p2p"),
+      "Unmanage `type:wifi-p2p` devices in a NetworkManager conf.d drop-in.", mitigated_by=r"(?i)p2p",
+      task="Unmanage the Wi-Fi P2P device", done="NetworkManager reads the device unmanaged and logs no warning"),
     R("zswap-pool", "zswap pool initialized", "Memory / zswap", "INFO", ("dmesg",), (r"zswap: loaded using pool",),
       "A write to zswap's `enabled` parameter (CachyOS's zram udev rule) set up the pool; zswap stays as the "
       "command line configures it."),
@@ -1125,14 +1141,18 @@ RULES = (
       ("dmesg",), (r"Joystick \[Keychron",),
       "The device presents a joystick interface that SDL and Proton games can take for a game controller.",
       "Add the device's VID/PID pairs to SDL_GAMECONTROLLER_IGNORE_DEVICES for the session.",
-      mitigated_by=r"SDL_GAMECONTROLLER_IGNORE_DEVICES", covers="ids"),
-    R("usb-volume", "USB audio device reports a tiny hardware volume range", "Audio / USB", "LOW", ("dmesg",),
+      mitigated_by=r"SDL_GAMECONTROLLER_IGNORE_DEVICES", covers="ids",
+      task="Hide the HID joystick from SDL",
+      done="ry-verify reports each device's IDs in SDL_GAMECONTROLLER_IGNORE_DEVICES"),
+    R("usb-volume", "USB audio device reports a tiny hardware volume range", "Audio / USB", "INFO", ("dmesg",),
       (r"Unlikely small volume range",),
-      "The device's hardware volume control spans so little that the slider has almost no effect.",
-      "Enable WirePlumber's soft mixer (api.alsa.soft-mixer) for the card."),
+      "The device states a volume range under 1 dB, so the kernel takes its scale for linear or custom and warns on "
+      "every probe, whatever the mixer; WirePlumber's soft mixer (api.alsa.soft-mixer) takes over a slider that "
+      "barely acts."),
     R("jack-server", "jack2 is installed beside PipeWire", "Audio / JACK", "LOW", ("inxi",), (r"Server-\d+: JACK",),
       "jack2 provides libjack, so JACK clients bypass PipeWire.",
-      "Replace jack2 with pipewire-jack.", mitigated_by=r"pipewire-jack"),
+      "Replace jack2 with pipewire-jack.", mitigated_by=r"pipewire-jack",
+      task="Replace jack2 with pipewire-jack", done="inxi lists no JACK server"),
     R("wifi-tx-cap", "Wi-Fi TX power capped by the access point", "Network / Wi-Fi", "WATCH", ("dmesg",),
       (r"Limiting TX power to \d+",),
       "The access point advertises a transmit-power limit and the driver applies it.",
@@ -1147,6 +1167,11 @@ RULES = (
       (r"\b(?:eth|en)\w*: (?:NIC )?Link is Down",),
       "A port that later logs `Link is Up` was negotiating; one that never does has no cable or link partner.",
       "Watch for a cabled port that stays down."),
+    R("fat-dirty", "FAT volume not cleanly unmounted", "Storage / FAT", "WATCH", ("dmesg",),
+      (r"FAT-fs \([^)]+\): Volume was not properly unmounted",),
+      "The volume's dirty flag was set at mount: the session before did not unmount it, or the flag was never "
+      "cleared; the EFI system partition is the usual one.",
+      "Watch for it on every boot; `fsck.fat -a` on the unmounted volume clears a stale flag."),
     R("ipv6-off", "IPv6 administratively disabled", "Network / IPv6", "SETTING", ("dmesg",),
       (r"IPv6: Loaded, but administratively disabled",), "ipv6.disable=1 on the kernel command line."),
     R("cstate-cap", "CPU idle states limited", "CPU / idle", "SETTING", ("dmesg",),
@@ -1170,6 +1195,9 @@ RULES = (
       "Posture lines printed on every boot; inxi's Vulnerabilities block summarizes them."),
     R("xhci-quirks", "xHCI quirk masks", "USB", "NOTE", ("dmesg",), (r"xhci_hcd .*(?:hcc params|quirks)",),
       "Boilerplate printed on every boot."),
+    R("drm-panic", "DRM panic screen registered", "GPU / DRM", "NOTE", ("dmesg",),
+      (r"Registered \d+ planes with drm panic",),
+      "Boilerplate printed on every boot by a kernel built with the DRM panic screen."),
     R("amdgpu-optional", "amdgpu optional features", "GPU / amdgpu", "NOTE", ("dmesg",),
       ((r"\bamdgpu\b(?!.*(?:\*ERROR\*|in kfd)).*(?:not supported|is not available|runtime pm is manually disabled)"),
        r'Optional firmware "[^"]+" was not found'),
@@ -1776,6 +1804,57 @@ def other_root(br: BugReport, vj: VerifyLog) -> int | None:
     return vj.events["ROOT_UUID_OK"][0] if ours and theirs and ours != theirs else None
 
 
+CMDLINE_ROW = re.compile(r"(\S+): (active|NOT in cmdline)")  # ry-verify's /proc/cmdline rows, one per managed token
+
+
+def cmdline_rows(br: BugReport, vj: VerifyLog) -> tuple[int, list[VerifyItem]]:
+    """Return how many command line tokens ry-verify checked and its rows the bug report's command line contradicts.
+
+    ry-verify reads /proc/cmdline in its runtime phase: a token it found that the bug report's cmdline: line lacks,
+    or the reverse, shows two boots or two machines. Where the bug report redacts a token other than root=, a token
+    ry-verify found is not held against the line; without that line nothing is compared.
+    """
+    tokens = set(br.cmdline.split())
+    here = [i for i in vj.items if (i.phase, i.section, i.heading) == ("runtime", "KERNEL CMDLINE", "")]
+    rows = [(i, hit) for i in here if (hit := CMDLINE_ROW.fullmatch(i.text))]
+    if not tokens:
+        return 0, []
+    redacted = any(PLACEHOLDER.search(t) and not t.startswith("root=") for t in tokens)
+    differing = [
+        i for i, hit in rows if (hit[1] in tokens) != (hit[2] == "active") and not (redacted and hit[2] == "active")
+    ]
+    return len(rows), differing
+
+
+def other_cmdline(br: BugReport, vj: VerifyLog) -> VerifyItem | None:
+    """Return ry-verify's first command line row that the bug report's command line contradicts, else None.
+
+    None also when the bug report states no command line or ry-verify checked none.
+    """
+    return next(iter(cmdline_rows(br, vj)[1]), None)
+
+
+def ran_before_boot(m: Model) -> float | None:
+    """Return how many seconds before the captured boot's kernel start ry-verify started; None when it did not.
+
+    The estimate's half-width and the second a journal stamp rounds away count as slack; None also without an
+    estimate or a ry-verify start time.
+    """
+    if not (m.kernel_start and m.vj.started):
+        return None
+    start, half = m.kernel_start
+    early = (start - m.vj.started.replace(tzinfo=None)).total_seconds() - half - 1
+    return early if early > 0 else None
+
+
+def duration_text(seconds: float) -> str:
+    """Return a duration in the largest unit that holds two of it: 45 s, 12 min, 3 h, or 2 d."""
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "min")):
+        if seconds >= 2 * size:
+            return f"{seconds / size:,.0f}{NBSP}{unit}"
+    return f"{seconds:,.0f}{NBSP}s"
+
+
 def register_order(f: Finding) -> tuple[int, int, int, str]:
     """Return a finding's place in the register: severity, then the first line its First line column shows."""
     br, vj = f.line_numbers()
@@ -1801,6 +1880,22 @@ MILESTONES = (
 )
 
 
+SYSTEMD_BANNER = re.compile(r"systemd\[1\]: systemd \S+ running in system mode")  # PID 1's first line in a root
+
+
+def switch_stop(br: BugReport) -> list[DmesgEntry]:
+    """Return the stop of the initrd's journald, when systemd starts again after it: the root switch as dmesg has it.
+
+    systemd logs "Switching root" to that journald, so dmesg seldom holds the line; it holds the journald's own last
+    line, a moment before systemd's banner in the root file system. A journald stopped later, with no banner after
+    it, is no switch.
+    """
+    for k, e in enumerate(br.dmesg):
+        if (hit := JOURNALD_LINE.match(e.text)) and hit[2]:
+            return [e] if any(SYSTEMD_BANNER.match(later.text) for later in br.dmesg[k + 1 :]) else []
+    return []
+
+
 QUIET_MIN = 1.0  # s; a shorter stretch without output before the root mount is no quiet gap (pauses: PAUSE_MIN)
 BOOT_FIRST = 1.0  # s; a ring buffer whose first line comes later has lost the start of the boot
 
@@ -1813,9 +1908,10 @@ def holds_boot(br: BugReport) -> bool:
 def timeline(br: BugReport) -> tuple[dict[str, float], tuple[float, float] | None]:
     """Return boot milestones (seconds since kernel start) and the longest quiet gap up to the root mount.
 
-    The root mount is the mount that names the root UUID; failing that, the first mount up to switch-root that names
-    no other UUID. The gap ends at the root mount, else at switch-root, and lasts QUIET_MIN at least. A ring buffer
-    that has lost the boot (holds_boot()) yields neither.
+    The root switch is systemd's own line, else the stop of the initrd's journald (switch_stop()). The root mount is
+    the mount that names the root UUID; failing that, the first mount up to switch-root that names no other UUID.
+    The gap ends at the root mount, else at switch-root, and lasts QUIET_MIN at least. A ring buffer that has lost
+    the boot (holds_boot()) yields neither.
     """
     marks: dict[str, float] = {}
     if not holds_boot(br):
@@ -1823,6 +1919,8 @@ def timeline(br: BugReport) -> tuple[dict[str, float], tuple[float, float] | Non
     root = root_uuid(br)
     for name, pattern in MILESTONES:
         hits = [e for e in br.dmesg if re.search(pattern, e.text)]
+        if name == "Switching root" and not hits:
+            hits = switch_stop(br)
         if name == "Root mounted":
             own = [e for e in hits if root and root in e.text]
             switch = marks.get("Switching root", float("inf"))
@@ -1837,28 +1935,44 @@ def timeline(br: BugReport) -> tuple[dict[str, float], tuple[float, float] | Non
     return marks, quiet
 
 
-JOURNALD_LINE = re.compile(r"systemd-journald\[\d+\]: ")  # journald's own first line: it reads kmsg from here on
+# A journald instance's line in dmesg, by PID; group 2 marks the signal that stops it.
+JOURNALD_LINE = re.compile(r"systemd-journald\[(\d+)\]: (Received SIG(?:TERM|INT)\b)?")
 SUSPEND_LINE = re.compile(r"PM: suspend entry")  # dmesg time stops while the system sleeps
+
+
+def journald_spans(br: BugReport) -> list[tuple[float, float]]:
+    """Return when a journald read kmsg, by dmesg time: each instance from its first line to the signal that ends it.
+
+    The initrd's journald stops at the root switch and the root's starts a moment later; an instance without a
+    stop line reads to the end. No journald line at all yields no span.
+    """
+    spans: dict[str, tuple[float, float]] = {}
+    for e in br.dmesg:
+        if hit := JOURNALD_LINE.match(e.text):
+            start, end = spans.get(hit[1], (e.t, math.inf))
+            spans[hit[1]] = (start, min(end, e.t) if hit[2] else end)
+    return list(spans.values())
 
 
 def kernel_pairs(br: BugReport) -> list[tuple[float, dt.datetime, bool]]:
     """Return the kernel messages logged once in dmesg and once in the current journal, before the first suspend.
 
     Each gives its dmesg time, its journal time, and whether it bounds the kernel start from below as well: journald
-    stamps a kernel message when it reads it, so one printed before journald's first line in dmesg carries a later
-    time. Messages after the first suspend are left out, as dmesg time stops while the system sleeps.
+    stamps a kernel message when it reads it, so one printed while no journald ran (before the first, or between
+    the initrd's and the root's) carries a later time. Messages after the first suspend are left out, as dmesg time
+    stops while the system sleeps.
     """
     kernel = [e for e in br.journal if e.boot == "current" and e.ident == "kernel"]
     in_dmesg, in_journal = Counter(e.text for e in br.dmesg), Counter(e.text for e in kernel)
     offsets = {e.text: e.t for e in br.dmesg if in_dmesg[e.text] == 1}
-    reads = next((e.t for e in br.dmesg if JOURNALD_LINE.match(e.text)), None)
+    reading = journald_spans(br)
     sleeps = next((e.t for e in br.dmesg if SUSPEND_LINE.match(e.text)), None)
     pairs = []
     for e in kernel:
         t = offsets.get(e.text)
         if in_journal[e.text] != 1 or t is None or (sleeps is not None and t >= sleeps):
             continue
-        pairs.append((t, e.when, reads is None or t >= reads))
+        pairs.append((t, e.when, not reading or any(a <= t <= b for a, b in reading)))
     return pairs
 
 
@@ -2002,8 +2116,8 @@ def dmesg_facts(br: BugReport) -> dict[str, str]:
     out = {}
     probes = (
         ("microcode", r"microcode: (?:updated early|Current revision):? (?:0x[0-9a-f]+ -> )?(0x[0-9a-f]+)"),
-        ("vram", r"(\d+)M of VRAM memory ready"),
-        ("gtt", r"(\d+)M of GTT memory ready"),
+        ("vram", r"(?<!\d)(\d{1,9})M of VRAM memory ready"),  # MiB the report prints as numbers: 9 digits at most
+        ("gtt", r"(?<!\d)(\d{1,9})M of GTT memory ready"),
         ("dmub", r"DMUB firmware.*version[=:]\s*(0x[0-9a-fA-F]+)"),
         ("vcn", r"VCN firmware Version ENC: ([\d.]+) DEC: (\d+)"),
         ("secure-boot", SECURE_BOOT),
@@ -2014,6 +2128,31 @@ def dmesg_facts(br: BugReport) -> dict[str, str]:
             out[key] = " / ".join(m.groups())
     out["smu"] = "initialized" if "SMU is initialized" in text else ""
     return {k: v for k, v in out.items() if v}
+
+
+SCHED_PROBES = (  # the bug report's scheduler section: /sys/kernel/sched_ext, then the kernel lines naming a scheduler
+    ("bore", r"\bBORE \(.+?\) CPU Scheduler modification (\S+)"),
+    ("ext-ops", r"^/sys/kernel/sched_ext/root/ops:(\S+)$"),
+    ("ext-state", r"^/sys/kernel/sched_ext/state:(\w+)$"),
+    ("ext-absent", r"^(sched_ext not available)$"),
+)
+
+
+def scheduler_facts(br: BugReport) -> dict[str, str]:
+    """Return what the scheduler section states, keyed "bore" (its version) and "sched-ext" (its scheduler and state).
+
+    sched_ext reads as its loaded scheduler with the state, the state alone, or not available; absent facts are left
+    out.
+    """
+    text = "\n".join(line.strip() for _, line in section_slice(br.lines, br.sections, "sched"))
+    found = {key: hit[1] for key, pattern in SCHED_PROBES if (hit := re.search(pattern, text, re.MULTILINE))}
+    out = {"bore": found["bore"]} if "bore" in found else {}
+    ops, state = found.get("ext-ops", ""), found.get("ext-state", "")
+    if ops or state:
+        out["sched-ext"] = f"{ops} ({state})" if ops and state else ops or state
+    elif "ext-absent" in found:
+        out["sched-ext"] = "not available"
+    return out
 
 
 def verify_summary(vj: VerifyLog) -> str:
@@ -2087,19 +2226,22 @@ def sensor_temps(text: str) -> list[str]:
 
 
 def hardware_health(m: Model) -> list[tuple[str, str, str, str]]:
-    """Return the firmware, CPU, memory, sensor, and drive health rows."""
+    """Return the firmware, CPU, scheduler, memory, sensor, and drive health rows."""
     f, rows = m.facts, []
     for key, label in (
         ("firmware", "Firmware"),
         ("secure-boot", "Secure Boot"),
         ("microcode", "CPU microcode"),
         ("vulnerabilities", "CPU vulnerabilities"),
+        ("scheduler", "CPU scheduler"),
         ("memory", "Memory"),
         ("swap", "Swap"),
         ("temperatures", "Temperatures"),
         ("fans", "Fan speeds"),
     ):
-        if key in f and f[key] != "N/A":  # inxi's N/A states nothing to check
+        if key == "scheduler":
+            rows += scheduler_health(f, label)
+        elif key in f and f[key] != "N/A":  # inxi's N/A states nothing to check
             value = f[key]
             if key == "temperatures":
                 value = ", ".join(sensor_temps(value)) or value
@@ -2108,6 +2250,14 @@ def hardware_health(m: Model) -> list[tuple[str, str, str, str]]:
         detail = " · ".join(x for x in (f.get("drive-temp", ""), f.get("written", "")) if x)
         rows.append((f"Drive {f['drive']}", f.get("smart", "") or "no SMART data", detail, "inxi"))
     return rows
+
+
+def scheduler_health(facts: Mapping[str, str], label: str) -> list[tuple[str, str, str, str]]:
+    """Return the CPU scheduler row when the scheduler section names BORE or sched_ext: BORE first, sched_ext beside."""
+    ext = f"sched_ext {facts['sched-ext']}" if "sched-ext" in facts else ""
+    if "bore" in facts:
+        return [(label, f"BORE {facts['bore']}", ext, "scheduler")]
+    return [(label, ext, "", "scheduler")] if ext else []
 
 
 def health_rows(m: Model) -> list[tuple[str, str, str, str]]:
@@ -2130,22 +2280,24 @@ def keyword_entries(br: BugReport, boilerplate: set[int]) -> dict[str, int]:
 
 # dmesg subsystems: the first whose pattern matches a message's whole prefix, lowercased, claims it; else Other.
 SUBSYSTEMS = (
-    ("GPU", ("amdgpu", "drm", "radeon", "i915", "xe", "nouveau", r"nvidia\w*", "simpledrm", "efifb", "fbcon",
-             "vgaarb")),
+    ("GPU", ("amdgpu", "drm", "radeon", "i915", "xe", "nouveau", r"nvidia\w*", "simpledrm", "simple-framebuffer",
+             "efifb", "fbcon", "vgaarb", "kfd")),
     ("USB and input", (r"usb\w*", "usb-storage", "hub", "xhci_hcd", r"[eo]hci\w*", r"hid\w*", r"hid-[\w-]+", "input",
-                       r"i2c_hid\w*", "i8042", "psmouse", "atkbd", r"serio\d*", "uas", r"typec\w*", r"ucsi\w*",
-                       "thunderbolt")),
+                       r"i2c_hid\w*", "i8042", "psmouse", "atkbd", "mousedev", r"serio\d*", "uas", r"typec\w*",
+                       r"ucsi\w*", "thunderbolt")),
     ("Storage", (r"nvme\d*(?:n\d+)?", r"ata\d*", "scsi", "sd", "sr", "block", "ext4-fs", "xfs", "btrfs", "f2fs-fs",
                  "fat-fs", "squashfs", r"zram\d*", r"dm-\d+", "device-mapper", r"md\d*", r"loop\d*", "virtio_blk",
-                 r"[sv]d[a-z]+", "fuse", "blk_update_request", "print_req_error")),
+                 r"[sv]d[a-z]+", "fuse", "blk_update_request", "print_req_error", "io", "adaptive", "raid6",
+                 "libata")),
     ("Network", (r"r81\d\d", "igc", "igb", "e1000e?", r"mt7\w+", "iwlwifi", r"ath\d+k\w*", r"rtw\w+", "brcmfmac",
                  "cfg80211", "mac80211", r"wlan\d+", r"wl[opsx]\w+", r"en[opsx]\w+", r"eth\d+", "net", "ipv6",
                  "netlabel", r"nf_\w+", r"xt_\w+", "bridge", "tun", "wireguard", "virtio_net", "tcp", r"tcp_\w+",
-                 "udp", "udp-lite", "ip", "mptcp", "table-perturb")),
+                 "udp", "udp-lite", "ip", "mptcp", "table-perturb", "mctp", "drop_monitor")),
     ("Bluetooth", ("bluetooth", r"bt\w+", r"hci\d+")),
-    ("ACPI and platform", ("acpi", "dmi", "secure", "pnp", "system", "platform", r"thermal\w*", "button", "battery",
-                           "ac", "amd_pmc", "amd_pmf", r"sp5100[-_]tco", "efi", r"tpm\w*", "ccp", "rtc_cmos",
-                           r"i2c_designware\w*")),
+    ("ACPI and platform", ("acpi", "dmi", "smbios", "secure", "secureboot", "pnp", "system", "platform",
+                           r"thermal\w*", "button", "battery", "ac", "amd_pmc", "amd_pmf", r"sp5100[-_]tco", "efi",
+                           "efivars", r"tpm\w*", "ccp", "rtc_cmos", r"i2c_designware\w*", "piix4_smbus", "pinctrl",
+                           "pm")),
     ("Audio", (r"snd\w*", r"acp(?!i)\w*", r"soundwire\w*", r"sof-audio\w*")),
     ("PCI and IOMMU", (r"pci\w*", "pci-dma", "pcieport", "acpiphp", "amd-vi", "amd_iommu", "iommu", "dmar",
                        "virtio-pci")),
@@ -2159,14 +2311,15 @@ SUBSYSTEMS = (
                         "using", "last", "zone", "dma", "dma32", "normal", "device", "on", "node", "node_data",
                         "initmem", "early", "movable", "fallback", "built", "policy", "mem", "slub", "last_pfn",
                         "ramdisk", "faking", "dentry", "inode-cache", "mount-cache", "mountpoint-cache", "workingset",
-                        "free", "demotion")),
+                        "free", "demotion", "kfence", "lvt", "process", r"hpet\d*", "resctrl", "ras", "amd_atl",
+                        r"intel_rapl\w*", "adding")),
     ("systemd and audit", (r"systemd(?:-[\w-]+)?", "audit", r"kauditd\w*")),
     ("Kernel core", ("linux", "command", "kernel", "booting", "console", "printk", "random", "ftrace", "lsm",
-                     "landlock", "selinux", "apparmor", "yama", "bpf", "key", "io", "vfs", "devtmpfs", "pid_max",
+                     "landlock", "selinux", "apparmor", "yama", "bpf", "key", "vfs", "devtmpfs", "pid_max",
                      "signal", "timer", "posixtimers", "dynamic", "nr_irqs", "run", "write", "freeing",
                      "workqueue", "clk", "sched_clock", "integrity", "ima", "evm", "deferred_init", "pps_core", "ptp",
                      "clockevents", "hrtimer", "watchdog", "nmi", "trace", "rodata_test", "futex", "unpacking",
-                     "pvm-pv")),
+                     "pvm-pv", "kprobes", r"ledtrig-\w+", "loaded", "trying", "non-volatile", "mc")),
 )  # fmt: skip
 SUBSYSTEM_RES = tuple((name, re.compile("|".join(patterns))) for name, patterns in SUBSYSTEMS)
 OTHER = "Other"
@@ -2188,8 +2341,8 @@ DMESG_WORDING = (
                 r"|page_reporting|\S+ \(\d+\): drop_caches: "), "CPU and memory"),  # memory set-up and cache drops
     (re.compile(r"Initiali[sz]e system trusted keyrings|Asymmetric key parser|Loading compiled-in X\.509"
                 r"|registered taskstats|Serial: 8250|\S+: ttyS\d+ at "), "Kernel core"),  # keys, accounting, serial
-    (re.compile(r"Mirror/redirect action on|u32 classifier|Actions configured|Initializing XFRM netlink socket"),
-     "Network"),  # traffic control and IPsec set-up
+    (re.compile(r"Mirror/redirect action on|u32 classifier|Actions configured|Initializing XFRM netlink socket"
+                r"|warning: `\S+' uses wireless extensions"), "Network"),  # traffic control, IPsec set-up, and wext
     (SPLAT_LINE, "Kernel core"),  # a splat and its lines: banner, task, registers
 )  # fmt: skip
 DMESG_PREFIXES = (
@@ -2318,7 +2471,8 @@ def verify_action(m: Model) -> Action | None:
     cmds = comment(f"ry-verify stopped (VJ {stop.no}): {clip(quote(stop.text), QUOTE_CLIP)}") if stop else []
     tips = sorted({i.no: i for i in (*m.vj.hints, *m.vj.fixes)}.values(), key=lambda i: i.no)  # in log order
     for tip in tips[:MAX_LISTED]:  # a record that names its fix keeps its end, where the fix stands
-        text = clip(quote(tip.text), QUOTE_CLIP) if tip.status == "INFO" else clip_start(sanitize(tip.text), QUOTE_CLIP)
+        hint = tip.text.removeprefix("↳").lstrip()  # the arrow ties a hint to its record in ry-verify's own output
+        text = clip(quote(hint), QUOTE_CLIP) if tip.status == "INFO" else clip_start(sanitize(tip.text), QUOTE_CLIP)
         line = f"ry-verify suggests (VJ {tip.no}): {text}"
         cmds += comment(line, fix_start(line))
     if rest := tips[MAX_LISTED:]:
@@ -2405,9 +2559,83 @@ def id_ranges(ids: Sequence[str]) -> str:
     return ", ".join(f"{r[0][0]}-{r[0][1]}" + (f"–{r[-1][0]}-{r[-1][1]}" if len(r) > 1 else "") for r in runs) or "—"
 
 
+def redacted_unit_commands(m: Model, f: Finding) -> list[str]:
+    """Return a journal search per boot and manager of the finding's entries; it names the unit redacted here."""
+    entries = {e.no: e for e in m.br.journal}
+    found = {(e.boot, bool(e.pid) and e.pid != "1") for mt in f.matches if (e := entries.get(mt.no))}
+    return [
+        f"journalctl {'-b -1' if boot == 'previous' else '-b'} {'--user ' if user else ''}"
+        "-o cat -p warning -g 'Failed with result'"
+        for boot, user in sorted(found, key=lambda k: (k[0] != "current", k[1]))
+    ]
+
+
+def p2p_commands(_m: Model, f: Finding) -> list[str]:
+    """Return the restart and the state check of each P2P device in the evidence, under the drop-in that unmanages."""
+    devices = sorted({d for mt in f.matches for d in re.findall(r"\bp2p-dev-\w+", mt.text)})
+    return [
+        *comment("a conf.d drop-in unmanages it: a [device-*] section with match-device=type:wifi-p2p and managed=0"),
+        "sudo systemctl restart NetworkManager.service",
+        *[f"nmcli -g GENERAL.STATE device show {fish_quote(d)}" for d in devices[:MAX_LISTED]],
+    ]
+
+
+def joystick_commands(_m: Model, f: Finding) -> list[str]:
+    """Return the session-environment check under the evidence's device IDs, written as SDL lists them."""
+    found = [ids for mt in f.matches for ids in USB_ID.findall(mt.text)]
+    ids = list(dict.fromkeys(f"0x{vendor}/0x{product}".lower() for vendor, product in found))
+    lead = "SDL_GAMECONTROLLER_IGNORE_DEVICES takes vendor/product IDs, comma-separated"
+    more = f" and {len(ids) - MAX_LISTED:,} more" if len(ids) > MAX_LISTED else ""
+    named = f"{lead}; the evidence names {','.join(ids[:MAX_LISTED]) if ids else 'none'}{more}"
+    return [
+        *comment(named, len(lead) + 2 if ids else -1),
+        "systemctl --user show-environment | string match 'SDL_GAMECONTROLLER_IGNORE_DEVICES=*'",
+    ]
+
+
+def jack_commands(_m: Model, _f: Finding) -> list[str]:
+    """Return the package swap; pacman asks to remove jack2, which conflicts with pipewire-jack."""
+    return [*comment("pacman asks to remove jack2, which conflicts"), "sudo pacman -Syu --needed pipewire-jack"]
+
+
+# The commands of each rule's task, built from its finding's evidence; a task without an entry has none.
+RULE_COMMANDS: dict[str, Callable[[Model, Finding], list[str]]] = {
+    "redacted-unit": redacted_unit_commands,
+    "nm-p2p": p2p_commands,
+    "hid-joystick": joystick_commands,
+    "jack-server": jack_commands,
+}
+NO_TASK = "The finding no longer shows"  # the completion test of a finding whose rule names no task
+
+
+def rule_actions(m: Model, answered: set[str]) -> list[Action]:
+    """Return an action for each finding that calls for one and that no action in answered covers, in register order.
+
+    The finding's rule names the task, its completion test, and through RULE_COMMANDS its commands; a rule without a
+    task still gets an action that points at the finding's card, so the checklist leaves no such finding out.
+    """
+    rules = {r.key: r for r in RULES}
+    acts = []
+    for f in m.findings:
+        if f.severity == "INFO" or f.fid in answered:
+            continue
+        rule = rules.get(f.key)
+        task = rule.task if rule and rule.task else f"Act on {f.fid} as its card says"
+        build = RULE_COMMANDS.get(f.key)
+        why = f"{f.fid} in {section_ref('sub-2.1')}"
+        done = (rule.done if rule else "") or NO_TASK
+        acts.append(Action("", task, why, build(m, f) if build else [], done, [f.fid]))
+    return acts
+
+
 def plan_actions(m: Model) -> list[Action]:
-    """Return the actions the findings call for, each with commands and a completion test."""
+    """Return the actions the findings call for, each with commands and a completion test.
+
+    The failure actions come first, then one per finding they leave unanswered: every HIGH, MED, and LOW finding
+    is on the checklist.
+    """
     acts = failure_actions(m)
+    acts += rule_actions(m, {fid for a in acts for fid in a.findings})
     for n, a in enumerate(acts, 1):
         a.aid = f"A-{n}"
     return acts
@@ -2416,13 +2644,15 @@ def plan_actions(m: Model) -> list[Action]:
 def analyze(br: BugReport, vj: VerifyLog) -> Model:
     """Run every analysis step and return the model the report is built from."""
     STATE.root_uuid = root_uuid(br) or vj.root_uuid  # ry-verify's, where the bug report redacts it
-    facts = {**inxi_facts(br), **dmesg_facts(br)}
+    facts = {**inxi_facts(br), **dmesg_facts(br), **scheduler_facts(br)}
     if "kernel" not in facts and (release := re.match(r"Linux \S+ (\S+)", br.uname)):
         facts["kernel"] = release.group(1)  # the report header's uname line stands in for a missing inxi block
-    facts = {k: sanitize(v) for k, v in facts.items()}  # shown on the cover and in every running header
+    # Shown on the cover, in the health table, and in every running header; cut so a table row fits a page.
+    facts = {k: clip(sanitize(v), QUOTE_LIMIT) for k, v in facts.items()}
     rules = applicable_rules(br)
     found = attribute(br, rules)
-    if not other_machine(vj, facts.get("cpu", "")) and other_root(br, vj) is None:  # another system's say nothing
+    foreign = other_machine(vj, facts.get("cpu", "")) or other_root(br, vj) is not None or other_cmdline(br, vj)
+    if not foreign:  # another system's records, or another boot's, say nothing of this one
         apply_mitigations(found, vj)
         cite_records(found, vj)
     findings = [f for f in found.values() if f.severity in FINDING_LEVELS] + verify_findings(vj)
@@ -4340,12 +4570,15 @@ def verdict(m: Model) -> tuple[str, str]:
 
 
 def verify_target(m: Model) -> str:
-    """Return the verdict's sentence on what the ry-verify log ran on when that is not this machine, else ""."""
+    """Return the verdict's sentence on what the ry-verify log ran on when that is not this boot's system, else ""."""
     if foreign := other_machine(m.vj, m.facts.get("cpu", "")):
         item, theirs, ours = foreign
         return f" Its log comes from another machine (VJ {item.no}: {theirs} CPU, not {ours}), so it lowers no finding."
     if (line := other_root(m.br, m.vj)) is not None:
         return f" Its log comes from another root file system (VJ {line}), so it lowers no finding."
+    if row := other_cmdline(m.br, m.vj):
+        where = f"VJ {row.no}: kernel command line"
+        return f" Its log comes from another boot or machine ({where}), so it lowers no finding."
     mismatch = hardware_mismatch(m.vj)
     return f" Its {lit(m.vj.meta('profile'))} profile targets other hardware (VJ {mismatch.no})." if mismatch else ""
 
@@ -4688,7 +4921,8 @@ def key_facts(m: Model) -> list[str]:
 def verify_fact(m: Model) -> str:
     """Return the ry-verify key fact: version, profile, mode, and result, then its notes.
 
-    The notes name another machine or root file system the log comes from, and the preamble's FAIL and WARN records.
+    The notes name another machine, root file system, or kernel command line the log comes from, a run from before
+    the captured boot, and the preamble's FAIL and WARN records.
     """
     vj = m.vj
     verdict_, exit_ = vj.status
@@ -4702,6 +4936,10 @@ def verify_fact(m: Model) -> str:
         ryv += f"; run on another machine (VJ {item.no}: {theirs} CPU, not {ours})"
     if (line := other_root(m.br, vj)) is not None:
         ryv += f"; run on another root file system than the bug report's (VJ {line})"
+    if row := other_cmdline(m.br, vj):
+        ryv += f"; run on another kernel command line than the bug report's (VJ {row.no})"
+    if (early := ran_before_boot(m)) is not None:
+        ryv += f"; started {duration_text(early)} before the kernel start of the boot the bug report captures"
     preamble = [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]
     if preamble:
         logged = Counter(i.status for i in preamble)
@@ -4820,6 +5058,9 @@ def tick_box() -> Table:
     return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
 
 
+NAME_MAX = 255  # a file name's limit on Linux, in bytes; a longer name a log states is cut to as many characters
+
+
 def inputs_table(m: Model) -> list[Flowable]:
     """Return the inputs table: sizes, line counts, content, and full SHA256 of both files."""
     vj = m.vj
@@ -4827,7 +5068,10 @@ def inputs_table(m: Model) -> list[Flowable]:
     phases = ", ".join(p for p in ("static", "runtime") if any(i.phase == p for i in vj.items))
     line, written = vj.events.get("REPORT_WRITTEN", (0, ""))  # --report names the HTML report beside its log
     html = re.match(r"path=(.+?) bytes=\d", written)
-    html_cell = f"; its HTML report `{lit(file_name(Path(html[1])))}` (VJ {line})" if html else ""
+    named = clip(file_name(Path(html[1])), NAME_MAX) if html else ""  # the log's word for it, not a file read here
+    html_cell = f"; its HTML report `{lit(named)}` (VJ {line})" if html else ""
+    if not html and (failed := vj.events.get("REPORT_WRITE_FAIL")):
+        html_cell = f"; its HTML report was not written (VJ {failed[0]})"
     rows: list[list[object]] = [
         [
             f"`{lit(file_name(m.br.path))}`",
@@ -4858,55 +5102,57 @@ def inputs_table(m: Model) -> list[Flowable]:
     )
 
 
+# Appendix B.3: how the report reads its inputs; the last note is on the failure keywords, which the README lists.
+METHOD = (
+    "The bug report splits at its separator lines; quotes keep line numbers; counts are of messages.",
+    (
+        f"{len(RULES)} rules recognize message classes; the first matching rule claims a line, and a rule for an event "
+        "the lines that follow it, such as a GPU timeout's process and ring-reset lines."
+    ),
+    (
+        "A dmesg line belongs to the subsystem its prefix or wording names, an indented line to the message above; a "
+        "journal entry belongs to its process."
+    ),
+    (
+        "Boot phases: the kernel until it starts init, the initrd until the root switch (systemd's line, else the stop "
+        f"of the initrd's journald), userspace until the dmesg burst ends at its first {BOOT_PAUSE:g} s pause after "
+        "the last milestone."
+    ),
+    (
+        "ry-verify FAIL and GEN_FAIL records become MED findings and WARN records LOW ones, one per phase, section, "
+        "and status; an ERR record ry-verify counts is a FAIL and a generator failure a GEN_FAIL; the "
+        "hardware-mismatch warning is no finding."
+    ),
+    (
+        f"The previous boot's last {SHUTDOWN_WINDOW} s of journal entries also meet the shutdown-noise patterns when "
+        "they hold a line only a stop sequence logs."
+    ),
+    (
+        "A ry-verify OK record showing a mitigation lowers its finding to INFO, unless another record contradicts it, "
+        "it leaves out a device the evidence comes from or the evidence names none, or the log comes from another "
+        "machine, root file system, or kernel command line."
+    ),
+    (
+        "Each kernel message logged once in both dmesg and the current journal bounds the kernel start to one second, "
+        "from above only when no journald ran as it printed; the estimate is the middle of the window they share, "
+        "± half its width."
+    ),
+    "Every HIGH, MED, and LOW finding is answered by an action on the checklist.",
+    (
+        "Repeated warnings group messages that match but for their numbers and hex values after the first word, which "
+        "names the driver or device."
+    ),
+    "Severity follows the observed impact on this host, not the log level.",
+    (
+        f"{len(KEYWORDS)} failure keywords, which the README lists, match case-insensitively as whole words; a line a "
+        "NOTE rule claims is not counted."
+    ),
+)
+
+
 def method_bullets() -> list[Flowable]:
-    """Return the method bullets, the last of them on the failure keywords, which the README lists."""
-    return [
-        *bullet_paragraphs(
-            (
-                "The bug report splits at its separator lines; quotes keep line numbers; counts are of messages.",
-                (
-                    f"{len(RULES)} rules recognize message classes; the first matching rule claims a line, and a rule "
-                    "for an event the lines that follow it, such as a GPU timeout's process and ring-reset lines."
-                ),
-                (
-                    "A dmesg line belongs to the subsystem its prefix or wording names, an indented line to the "
-                    "message above; a journal entry belongs to its process."
-                ),
-                (
-                    "Boot phases: the kernel until it starts init, the initrd until the root switch, userspace until "
-                    f"the dmesg burst ends at its first {BOOT_PAUSE:g} s pause after the last milestone."
-                ),
-                (
-                    "ry-verify FAIL and GEN_FAIL records become MED findings and WARN records LOW ones, one per "
-                    "phase, section, and status; an ERR record ry-verify counts is a FAIL and a generator failure a "
-                    "GEN_FAIL; the hardware-mismatch warning is no finding."
-                ),
-                (
-                    f"The previous boot's last {SHUTDOWN_WINDOW} s of journal entries also meet the shutdown-noise "
-                    "patterns when they hold a line only a stop sequence logs."
-                ),
-                (
-                    "A ry-verify OK record showing a mitigation lowers its finding to INFO, unless another record "
-                    "contradicts it, it leaves out a device the evidence comes from or the evidence names none, or "
-                    "the log comes from another machine or root file system."
-                ),
-                (
-                    "Each kernel message logged once in both dmesg and the current journal bounds the kernel start to "
-                    "one second; the estimate is the middle of the window they share, ± half its width."
-                ),
-                (
-                    "Repeated warnings group messages that match but for their numbers and hex values after the first "
-                    "word, which names the driver or device."
-                ),
-                "Severity follows the observed impact on this host, not the log level.",
-                (
-                    f"{len(KEYWORDS)} failure keywords, which the README lists, match case-insensitively as whole "
-                    "words; a line a NOTE rule claims is not counted."
-                ),
-            ),
-            keep=True,
-        ),
-    ]
+    """Return the method notes as bullets."""
+    return [*bullet_paragraphs(METHOD, keep=True)]
 
 
 def timeline_rows(m: Model) -> list[list[str]]:
@@ -5872,7 +6118,7 @@ RANGES_CLIP = 36  # characters of the unread lines' ranges a cross-check cites: 
 
 
 def cross_checks(m: Model) -> list[list[str]]:
-    """Return checks of the parse against the inputs: the totals they state, root UUIDs, journal lines, kernel times.
+    """Return checks of the parse against the inputs: their totals, the logs' pairing, journal lines, kernel times.
 
     The last check counts the bug report's sections against those cachyos-bugreport.sh writes.
     """
@@ -5900,10 +6146,7 @@ def cross_checks(m: Model) -> list[list[str]]:
         said, gave = (", ".join(f"{d[k]:,}{NBSP}{k}" for k in keys) for d in (stated, found))
         result = "match" if all(found[k] == stated[k] for k in stated) else f"differs: records give {gave}"
         out.append([f"ry-verify records match its footer ({said})", result])
-    if root_uuid(m.br) and m.vj.root_uuid:
-        line = other_root(m.br, m.vj)
-        result = "match" if line is None else f"differs: VJ {line}"
-        out.append(["ry-verify's root file system is the bug report's (root UUID)", result])
+    out += pairing_checks(m)
     unparsed = m.br.journal_unparsed
     read = "match"
     if unparsed:
@@ -5923,6 +6166,30 @@ def cross_checks(m: Model) -> list[list[str]]:
     return out
 
 
+def pairing_checks(m: Model) -> list[list[str]]:
+    """Return the checks that both logs describe one system in one boot, each where the inputs allow it.
+
+    They compare the root UUID, the kernel command line tokens ry-verify checked, and the ry-verify start with the
+    captured boot's kernel start.
+    """
+    out = []
+    if root_uuid(m.br) and m.vj.root_uuid:
+        line = other_root(m.br, m.vj)
+        result = "match" if line is None else f"differs: VJ {line}"
+        out.append(["ry-verify's root file system is the bug report's (root UUID)", result])
+    checked, differing = cmdline_rows(m.br, m.vj)
+    if checked:
+        result = "match"
+        if differing:
+            result = f"differs: VJ {clip(ranges([i.no for i in differing]), RANGES_CLIP)}"
+        out.append([f"ry-verify's kernel command line is the bug report's ({plural(checked, 'token')})", result])
+    if m.kernel_start and m.vj.started:
+        early = ran_before_boot(m)
+        result = "match" if early is None else f"differs: {duration_text(early)} before it"
+        out.append(["ry-verify started after the kernel start of the boot the bug report captures", result])
+    return out
+
+
 def _story_actions(m: Model) -> list[Flowable]:
     """Return Section 3: the commands for each action; the checklist with each completion test is on the cover."""
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-3")]
@@ -5930,16 +6197,10 @@ def _story_actions(m: Model) -> list[Flowable]:
         return [*out, para("The findings call for no action.")]
     lead = "Fish commands for each action, one per line; tick it on the cover ({p:act-list}) once its test passes."
     out.append(para(lead, sty_lead))
-    out.extend(
-        KeepTogether(
-            [
-                Anchor(f"act-{a.aid}"),
-                para(f"**{a.aid}** — {a.title}: {a.why}."),
-                *code_block(f"{a.aid} COMMANDS", a.commands),
-            ]
-        )
-        for a in m.actions
-    )
+    for a in m.actions:
+        block = code_block(f"{a.aid} COMMANDS", a.commands) if a.commands else []
+        none = "" if a.commands else f"; no command applies ({{p:card-{a.findings[0]}}})" if a.findings else ""
+        out.append(KeepTogether([Anchor(f"act-{a.aid}"), para(f"**{a.aid}** — {a.title}: {a.why}{none}."), *block]))
     return out
 
 
