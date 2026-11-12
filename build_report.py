@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.11.0"
+__version__ = "7.12.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -113,7 +113,7 @@ OPTIONS: tuple[tuple[str, dict[str, Any]], ...] = (  # in the README's order
     ("--bugreport", {"type": Path, "required": True, "metavar": "PATH",
                      "help": "cachyos-bugreport.log from cachyos-bugreport.sh"}),
     ("--verify", {"type": Path, "required": True, "metavar": "PATH",
-                  "help": "ry-verify JSONL log (verify-*.jsonl or report-*.jsonl)"}),
+                  "help": "ry-verify JSONL log (verify-*.jsonl)"}),
     ("--out", {"type": out_path, "metavar": "PATH",
                "help": "output PDF (default: ./post-boot-log-analysis-<capture date>.pdf, -brief.pdf under --brief)"}),
     ("--brief", {"action": "store_true", "help": "build the cover and Sections 1 to 3 only, for paper"}),
@@ -286,7 +286,7 @@ STATE = BuildState()
 # ── INPUT ─────────────────────────────────────────────────────────────
 # Parsers for the two capture formats: cachyos-bugreport.sh output and ry-verify JSONL.
 SEPARATOR = re.compile(r"^(?:_{44}|-{44})[ \t]*$")  # the 44-character rules cachyos-bugreport.sh writes, padded or not
-# Matched ignoring case: the CachyOS-Settings tree after 1.4.1 lowercases the two "Getting" titles.
+# Matched ignoring case: cachyos-settings 1.4.2 and later lowercase the two "Getting" titles.
 SECTION_TITLES = {
     "Start of CachyOS bug report log file": "header",
     "Getting Hardware Information": "inxi",
@@ -449,12 +449,10 @@ class VerifyLog:
 
     @property
     def status(self) -> tuple[str, str]:
-        """Return the verdict in ry-verify's words with the exit text, interrupted, or unknown (no footer or exit).
+        """Return the verdict in ry-install's words with the exit text, interrupted, or unknown (no footer or exit).
 
-        As ry-verify's --report words them: exit 3 is PREFLIGHT, a gate that stopped the run; a counted FAIL or
-        GEN_FAIL is FAIL, and so is a failing exit the counts do not explain; a pass with a WARN is
-        PASS-WITH-WARNINGS. A --report run whose checks passed but whose HTML report could not be written exits 1:
-        it keeps its verdict, and the exit text says why.
+        Exit 3 is PREFLIGHT, a gate that stopped the run; a counted FAIL or GEN_FAIL is FAIL, and so is a failing exit
+        the counts do not explain; a pass with a WARN is PASS-WITH-WARNINGS.
         """
         if not self.footer:
             return "unknown", "no footer"
@@ -465,11 +463,10 @@ class VerifyLog:
             return "interrupted", f"exit {code}"
         if code == VERIFY_PREFLIGHT:
             return "PREFLIGHT", f"exit {code}"
-        totals, unwritten = self.totals, "REPORT_WRITE_FAIL" in self.events
-        if totals["fail"] or totals["gen_fail"] or (code and not unwritten):
+        totals = self.totals
+        if totals["fail"] or totals["gen_fail"] or code:
             return "FAIL", f"exit {code}"
-        why = ": its HTML report was not written" if code else ""
-        return ("PASS-WITH-WARNINGS" if totals["warn"] else "PASS"), f"exit {code}{why}"
+        return ("PASS-WITH-WARNINGS" if totals["warn"] else "PASS"), f"exit {code}"
 
     @property
     def stopped(self) -> VerifyItem | None:
@@ -492,9 +489,8 @@ class VerifyLog:
     def hints(self) -> list[VerifyItem]:
         """Return the INFO records in which ry-verify suggests a fix, in log order.
 
-        As ry-verify's --report reads them, a ↳ line logged right after a FAIL, WARN, or ERR record of the same
-        section and sub-heading is that record's hint; an INFO record that names its fix (Run: …, Install
-        missing: …) is one too, as older logs word them.
+        A ↳ line logged right after a FAIL, WARN, or ERR record of the same section and sub-heading is that record's
+        hint; an INFO record that names its fix (Run: …, Install missing: …) is one too, as older logs word them.
         """
         out = []
         for n, item in enumerate(self.items):
@@ -792,7 +788,7 @@ UNCOUNTED_ERR = re.compile(
 COUNTS = re.compile(r"\b(ok|fail|warn|gen_fail)=(\d{1,9})\b")
 SCOPE = re.compile(r"\bscope=(static|runtime)\b")  # the phase a VERIFY_RESULT record closes (ry-verify 7.258.0)
 EVENT = re.compile(r"^([A-Z][A-Z0-9_]*): (.*)$", re.DOTALL)  # a structured record, as ROOT_UUID_OK: uuid=…
-RESULT_MODES = ("verify", "report")  # the ry-verify modes whose logs hold check results; --check logs none
+RESULT_MODE = "verify"  # the ry-verify mode whose logs hold check results; --check logs none
 META_CLIP = 40  # characters of a header field the report shows: a version, a profile, or a mode
 SECTION_CLIP = 60  # characters of a section name kept; ry-verify's longest is 21
 FOOTER_NUMBERS = ("pass", "fail", "warn", "gen_fail", "exit_code")  # footer fields the report reads as integers
@@ -875,15 +871,15 @@ class VerifyCursor:
 def verify_frame(name: str, records: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return a ry-verify log's header and footer ({} without one); raise InputError when they show no such log.
 
-    The header must state a version and, when it names a mode, --verify's or --report's, as only those log results;
-    every footer count must be a whole number.
+    The header must state a version and, when it names a mode, --verify's, as only that one logs results; every
+    footer count must be a whole number.
     """
     header = next((r for r in records if r.get("event") == "header"), None)
     if header is None or "version" not in header:
         msg = f"{name}: not a ry-verify log (no header record with a version)"
         raise InputError(msg)
-    if "mode" in header and header["mode"] not in RESULT_MODES:
-        msg = f"{name}: not a --verify or --report log (mode {clip(repr(header['mode']), 40)}); it holds no results"
+    if "mode" in header and header["mode"] != RESULT_MODE:
+        msg = f"{name}: not a --verify log (mode {clip(repr(header['mode']), 40)})"
         raise InputError(msg)
     foot = next((r for r in reversed(records) if r.get("event") == "footer"), {})
     for key in FOOTER_NUMBERS:
@@ -1798,7 +1794,7 @@ def root_uuid(br: BugReport) -> str:
 def other_root(br: BugReport, vj: VerifyLog) -> int | None:
     """Return the line of ry-verify's root UUID record when it names another root file system than the bug report's.
 
-    None when the two agree or either leaves the UUID out, as the CachyOS-Settings tree after 1.4.1 redacts it.
+    None when the two agree or either leaves the UUID out, as cachyos-settings 1.4.2 and later redact it.
     """
     ours, theirs = root_uuid(br).lower(), vj.root_uuid
     return vj.events["ROOT_UUID_OK"][0] if ours and theirs and ours != theirs else None
@@ -3256,14 +3252,15 @@ UPTIME_MARKERS = {"ry-verify": ("D", 3.8), "bug report": ("s", 4.5)}  # marker a
 def uptime_captures(m: Model) -> dict[str, float]:
     """Return the captures the uptime strip marks, in seconds since kernel start: the ry-verify run and the bug report.
 
-    The run is marked at its middle, as the boot chart marks it, or at its start when the log has no end.
+    The run is marked at its middle, as the boot chart marks it, or at its start when the log has no end; a capture
+    before UPTIME_MIN is marked at the strip's edge, as a log axis cannot place it.
     """
     points, out = capture_points(m), {}
     if (start := points.get("ry-verify starts")) is not None:
         out["ry-verify"] = (start + points.get("ry-verify ends", start)) / 2
     if (capture := points.get("bug report")) is not None:
         out["bug report"] = capture
-    return out
+    return {name: max(x, UPTIME_MIN) for name, x in out.items()}
 
 
 def label_edges(center: float, text: str, span: tuple[float, float], per: float) -> tuple[float, float]:
@@ -3286,6 +3283,26 @@ def capture_labels(marks: dict[str, float], span: tuple[float, float], per: floa
         a, b = label_edges((spots[0][0] + spots[1][0]) / 2, text, span, per)
         return [((a + b) / 2, text)]
     return [((a + b) / 2, name) for (a, b), (_, name) in zip(edges, spots, strict=True)]
+
+
+def strip_phases(phases: Sequence[tuple[str, float, float]]) -> list[tuple[str, float, float]]:
+    """Return the phases the uptime strip draws, from UPTIME_MIN on; one that ends by that edge is left out."""
+    return [(name, max(a, UPTIME_MIN), b) for name, a, b in phases if b > UPTIME_MIN]
+
+
+def captures_drop(caps: Sequence[tuple[float, str]], shown: Sequence[tuple[str, float, float]], per: float) -> int:
+    """Return 1 when a capture label would meet a phase name on the row they share under the band, else 0.
+
+    The capture labels then stand a row lower, clear of the names.
+    """
+
+    def edges(center: float, text: str) -> tuple[float, float]:
+        half = text_points(text, CHART_NOTE) / per / 2
+        return center - half, center + half
+
+    names = [edges(math.log10(lo * b) / 2, name) for name, lo, b in shown]  # a name centers on its bar, in decades
+    pad = UPTIME_PAD / per
+    return int(any(a < q + pad and p < b + pad for a, b in (edges(c, t) for c, t in caps) for p, q in names))
 
 
 def fig_uptime(m: Model) -> str | None:
@@ -3315,16 +3332,19 @@ def fig_uptime(m: Model) -> str | None:
     span = (math.log10(UPTIME_MIN), math.log10(xmax))
     labels, levels = uptime_labels(events, span, per)
     rows = max(levels, default=-1) + 1
-    fig.set_size_inches(CW, 0.7 + 0.14 * rows)
-    ax.set_ylim(-1.3, 0.75 + 0.55 * rows)
-    uptime_phases(fig, ax, phases)
+    shown, caps = strip_phases(phases), capture_labels(marks, span, per)
+    drop = captures_drop(caps, shown, per)  # rows the capture labels stand below the phase names: 0 or 1
+    fig.set_size_inches(CW, 0.7 + 0.14 * (rows + drop))
+    ax.set_ylim(-1.3 - 0.55 * drop, 0.75 + 0.55 * rows)
+    uptime_phases(fig, ax, shown)
     if marks:
         ax.plot([phases[-1][2] if phases else UPTIME_MIN, max(marks.values())], [0, 0], color=C_MID, lw=0.9, zorder=1)
-        for name, x in marks.items():
+        style = {"mfc": "white", "mew": 0.8, "color": C_INK, "ls": "none", "clip_on": False, "zorder": 3}
+        for name, x in marks.items():  # unclipped, so a mark at the strip's edge is drawn whole
             marker, size = UPTIME_MARKERS[name]
-            ax.plot([x], [0], marker=marker, ms=size, mfc="white", mew=0.8, color=C_INK, ls="none", zorder=3)
-        for center, text in capture_labels(marks, span, per):
-            ax.text(10**center, -0.55, text, ha="center", va="top", fontsize=CHART_NOTE)
+            ax.plot([x], [0], marker=marker, ms=size, **style)
+        for center, text in caps:
+            ax.text(10**center, -0.55 - 0.55 * drop, text, ha="center", va="top", fontsize=CHART_NOTE)
     for (x, text, a, b), level in zip(labels, levels, strict=True):
         top = 0.62 + 0.55 * level
         ax.plot([10**x, 10**x], [0.36, top], color=C_INK, lw=0.6)
@@ -3409,12 +3429,8 @@ def stack_labels(labels: Sequence[Label], covers: Sequence[set[int]], pad: float
     return [levels[k] for k in range(len(labels))]
 
 
-def uptime_phases(fig: Figure, ax: Axes, phases: Sequence[tuple[str, float, float]]) -> None:
-    """Draw the boot phases as the uptime strip's band, each named below it, with the boot chart's styles.
-
-    A phase that ends by UPTIME_MIN, the strip's left edge, is not drawn.
-    """
-    shown = [(name, max(a, UPTIME_MIN), b) for name, a, b in phases if b > UPTIME_MIN]
+def uptime_phases(fig: Figure, ax: Axes, shown: Sequence[tuple[str, float, float]]) -> None:
+    """Draw the phases strip_phases() keeps as the uptime strip's band, named below it, in the boot chart's styles."""
     for name, lo, b in shown:
         ax.barh(0, b - lo, left=lo, height=UPTIME_BAR, **PHASE_STYLE[name])
         ax.text(math.sqrt(lo * b), -0.55, name, ha="center", va="top", fontsize=CHART_NOTE)
@@ -5058,20 +5074,11 @@ def tick_box() -> Table:
     return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
 
 
-NAME_MAX = 255  # a file name's limit on Linux, in bytes; a longer name a log states is cut to as many characters
-
-
 def inputs_table(m: Model) -> list[Flowable]:
     """Return the inputs table: sizes, line counts, content, and full SHA256 of both files."""
     vj = m.vj
     br_secs = ", ".join(SECTION_LABELS[n] for n in SECTION_TITLES.values() if n in m.br.sections)
     phases = ", ".join(p for p in ("static", "runtime") if any(i.phase == p for i in vj.items))
-    line, written = vj.events.get("REPORT_WRITTEN", (0, ""))  # --report names the HTML report beside its log
-    html = re.match(r"path=(.+?) bytes=\d", written)
-    named = clip(file_name(Path(html[1])), NAME_MAX) if html else ""  # the log's word for it, not a file read here
-    html_cell = f"; its HTML report `{lit(named)}` (VJ {line})" if html else ""
-    if not html and (failed := vj.events.get("REPORT_WRITE_FAIL")):
-        html_cell = f"; its HTML report was not written (VJ {failed[0]})"
     rows: list[list[object]] = [
         [
             f"`{lit(file_name(m.br.path))}`",
@@ -5086,7 +5093,7 @@ def inputs_table(m: Model) -> list[Flowable]:
             f"{len(text_lines(vj.raw)):,}",
             (
                 f"{plural(len(vj.records), 'record')}; ry-verify {lit(vj.meta('version'))}, profile "
-                f"{lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; phases: {phases or 'none'}{html_cell}"
+                f"{lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; phases: {phases or 'none'}"
             ),
         ],
         [Paragraph("SHA256", sty_label), Paragraph(hashlib.sha256(vj.raw).hexdigest(), sty_td_mono), "", ""],
@@ -6117,6 +6124,21 @@ def unit_failure_rows(m: Model) -> list[list[object]]:
 RANGES_CLIP = 36  # characters of the unread lines' ranges a cross-check cites: two lines of its Result column
 
 
+def exit_check(vj: VerifyLog) -> list[list[str]]:
+    """Return the check of a finished run's exit code against its counts: 1 with a FAIL or GEN_FAIL, else 0.
+
+    A gate's exit 3 and an interrupted run's code say nothing of the counts, so neither gets the row.
+    """
+    code = vj.footer.get("exit_code")
+    if code is None or code == VERIFY_PREFLIGHT or vj.interrupted:
+        return []
+    totals = vj.totals
+    failed = totals["fail"] + totals["gen_fail"]
+    odd = f"differs: exit {code} with {failed:,} counted" if failed else f"differs: exit {code} without one"
+    result = "match" if code == (1 if failed else 0) else odd
+    return [["ry-verify's exit code fits its counts (1 with a FAIL or GEN_FAIL, else 0)", result]]
+
+
 def cross_checks(m: Model) -> list[list[str]]:
     """Return checks of the parse against the inputs: their totals, the logs' pairing, journal lines, kernel times.
 
@@ -6146,7 +6168,7 @@ def cross_checks(m: Model) -> list[list[str]]:
         said, gave = (", ".join(f"{d[k]:,}{NBSP}{k}" for k in keys) for d in (stated, found))
         result = "match" if all(found[k] == stated[k] for k in stated) else f"differs: records give {gave}"
         out.append([f"ry-verify records match its footer ({said})", result])
-    out += pairing_checks(m)
+    out += exit_check(m.vj) + pairing_checks(m)
     unparsed = m.br.journal_unparsed
     read = "match"
     if unparsed:

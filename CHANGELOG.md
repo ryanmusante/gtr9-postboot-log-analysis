@@ -4,77 +4,71 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.12.0
+------
+
+  - ry-verify: follows 7.264.0, which dropped --report and its HTML report: a
+    report-*.jsonl log is refused; B.1 and --help name no report
+  - ry-verify: 7.264.0 logs parse as 7.262.0 logs do
+  - checks: B.2 checks a finished run's exit code against its counts: 1 with a
+    FAIL or GEN_FAIL, else 0
+  - figures: the uptime strip marks a capture within 0.1 s of the kernel start
+    at its left edge; one at 0 s no longer fails the build
+  - figures: its capture labels stand a row below the phase names when one
+    would print over a name
+  - docs: README names ry-verify 7.264.0, svglib 2.4.0, ruff 0.17.4, and ty
+    0.0.101 as tested
+  - changelog: 7.11.0's bullets fit two lines; earlier releases keep no docs
+    or code bullets
+
+
 7.11.0
 ------
 
-  - actions: every HIGH, MED, and LOW finding is on the checklist; one that
-    no failure action answers gets its rule's task, commands, and test, so
-    a LOW finding no longer meets "The findings call for no action."
+  - actions: every HIGH, MED, and LOW finding is on the checklist; one that no
+    failure action answers gets its rule's task, commands, and test
   - actions: tasks for a unit failed under a redacted name, the Wi-Fi P2P
-    device, a HID joystick, and jack2, their commands built from the
-    evidence; an action without commands points at its finding's card
-  - rules: usb-volume is INFO, as the kernel warns on every probe whatever
-    the mixer and no action cleared it; --compare against a 7.10.3 summary
-    names it resolved
-  - rules: Linux 7.3's hung-task line ("blocked in I/O wait for more than")
-    is a kernel splat, and KWin 6.8's "Atomic commit failed: EACCESS" the
-    refused commit of the session switch
+    device, a HID joystick, and jack2; one without commands points at its card
+  - rules: usb-volume is INFO, as the kernel warns on every probe whatever the
+    mixer; --compare against a 7.10.3 summary names it resolved
+  - rules: Linux 7.3's hung-task line ("blocked in I/O wait") is a kernel
+    splat; KWin 6.8's "Atomic commit failed: EACCESS" a refused commit
   - rules: "Failed to start dbus-:<email-address-redacted>" belongs to the
     redacted D-Bus unit, so it raises no unit-failure action
-  - rules: a GPU hang claims the "device wedged" line after its reset; a
-    FAT volume not cleanly unmounted is a watch item, and the DRM panic
-    screen's boot line boilerplate
-  - boot: where dmesg lacks systemd's "Switching root", which goes to the
-    journal, the stop of the initrd's journald before systemd's banner is
-    the root switch, so a systemd initrd shows its phases
-  - analysis: a kernel message printed between the initrd's journald and
-    the root's bounds the kernel start from above only, so one such line
-    no longer voids the estimate
-  - checks: B.2 compares the kernel command line tokens ry-verify checked
-    with the bug report's cmdline line, and ry-verify's start with the
-    kernel start; cachyos-settings 1.4.2 redacts the root UUID
+  - rules: a GPU hang claims the "device wedged" line; a FAT volume not
+    cleanly unmounted is a watch item, the DRM panic boot line boilerplate
+  - boot: where dmesg lacks systemd's "Switching root", the stop of the
+    initrd's journald before systemd's banner is the root switch
+  - analysis: a kernel message printed between the initrd's journald and the
+    root's bounds the kernel start from above only
+  - checks: B.2 compares ry-verify's kernel command line with the bug report's
+    and its start with the kernel start; cachyos-settings 1.4.2 redacts UUIDs
   - report: a ry-verify log from another kernel command line lowers no
-    finding, as one from another machine or root file system; the verdict
-    and the key facts name it, and a run from before the captured boot
-  - ry-verify: the result goes by the counts, as its --report words it: a
-    run whose HTML report was not written keeps its PASS, and the exit
-    text and B.1 say why
-  - ry-verify: 7.262.0 logs parse as 7.260.0 logs do, every cross-check
-    matching; a fix named mid-clause ("... until sudo systemctl restart")
-    is listed, and a hint is quoted without its arrow
+    finding; the verdict names it, and a run from before the captured boot
   - report: the health table names the CPU scheduler: BORE with its
     version, sched_ext with its state or loaded scheduler
+  - ry-verify: the result goes by the counts: a --report run whose HTML report
+    was not written keeps its PASS
+  - ry-verify: 7.262.0 logs parse as 7.260.0 logs do; a fix named mid-clause
+    is listed, and a hint is quoted without its arrow
   - dmesg: more boot prefixes belong to their subsystem instead of Other:
     secureboot, SMBIOS, PM, kfence, raid6, libata, io scheduler, and others
   - parsing: a separator line with blanks at its end still splits sections
-  - layout: a field of thousands of characters no longer fails the build:
-    a fact is cut as a quote is, a ry-verify version or profile at 40, a
-    section name at 60, and the HTML report's name at 255
-  - docs: README names cachyos-settings 1.4.2 to 1.4.4 and ry-verify
-    7.262.0, and describes the tasks, the pairing checks, the root switch,
-    and the task fields of a rule
+  - layout: a field of thousands of characters no longer fails the build: a
+    fact is cut at 400, a version or profile at 40, a section name at 60
 
 
 7.10.3
 ------
 
-  - ry-verify: 7.260.0 logs parse as 7.258.0 logs do, every cross-check
-    matching; its sharper lapse wording keeps read errors out of the count
+  - ry-verify: 7.260.0 logs parse as 7.258.0 logs do; its sharper lapse
+    wording keeps read errors out of the count
   - cli: the PDF and the summary go to scratch files made exclusively under
     unpredictable names, so a link planted beside an output redirects nothing
-  - cli: the PDF renders in memory, and the scratch files get the permissions
-    a new file gets there, from the umask or a default ACL, as before
-  - cli: a signal that lands as cleanup starts, or once the PDF is written,
-    leaves no scratch file either
+  - cli: the scratch files get the permissions a new file gets there, from the
+    umask or a default ACL; a signal as cleanup starts leaves none
   - layout: U+FFFD in monospace fills one character cell, so a full line no
-    longer wraps: Plex Mono's own glyph where the face has one, else Plex
-    Sans's, scaled to the cell
-  - rules: the bug report's text is joined for requires patterns only when a
-    rule has one
-  - code: the early and the late signal lists name each other; a shared
-    constant would sit between the imports
-  - docs: README names ry-verify 7.260.0 as tested and says how the outputs
-    are written
+    longer wraps
 
 
 7.10.2
@@ -83,8 +77,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - privacy: email masking covers domains of several labels, as in
     a.b@mail.example.co.uk; a nil UUID in a unit name stays readable
   - ry-verify: a record whose text spans lines stays a result
-  - report: 8.2's lead stands only above a cut section and counts rows, so
-    records that merge into one row no longer get it
+  - report: 8.2's lead stands only above a cut section and counts rows
   - report: the verdict and B.3 treat a ry-verify log from another root file
     system as they treat one from another machine
   - report: shutdown noise names a reboot or power-off, and bt-esco the
@@ -103,10 +96,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     a summary that fails after the PDF names it; cleanup survives signals
   - cli: --brief titles the PDF brief; a relative XDG_DATA_HOME is ignored;
     the font error says missing or unreadable
-  - code: shared constants and helpers replace repeated values and logic;
-    docstrings, comments, and ruff.toml's notes match the code
-  - docs: README says the attachments carry the inputs unmasked and fixes
-    exit codes, uptime labels, result values, and JSON fields
 
 
 7.10.1
@@ -116,8 +105,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     working directory, $MATPLOTLIBRC, or ~/.config/matplotlib changes nothing
   - actions: a command ry-verify suggests starts a comment line of its own
     when a line break would split it
-  - docs: README reads tighter and names ty 0.0.96 as tested; Quick Start
-    (all but cachyos-bugreport.sh) and Verify run as written on Arch Linux
 
 
 7.10.0
@@ -125,10 +112,10 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 
   - ry-verify: a run or phase stopped at a gate reads as stopped; 7.257.0
     logs an INFO hint under the gate's ERR
-  - ry-verify: from 7.257.0 an interrupted run's footer counts every
-    section, so it gives the totals; older logs rebuild them from the phases
-  - ry-verify: VERIFY_RESULT counts belong to the phase scope= names; the
-    result reads PASS, PASS-WITH-WARNINGS, FAIL, or PREFLIGHT
+  - ry-verify: from 7.257.0 an interrupted run's footer counts every section;
+    older logs rebuild the totals from the phases
+  - ry-verify: VERIFY_RESULT counts belong to the phase scope= names
+    (7.258.0); the result reads PASS, PASS-WITH-WARNINGS, FAIL, or PREFLIGHT
   - cli: a ry-verify log of another mode, such as --check, holds no results
     and is refused with exit 1
   - actions: ry-verify's hints are read as its --report reads them, and a
@@ -145,8 +132,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     hands-free (HFP/HSP) voice links it affects
   - parsing: section titles match in any case, as CachyOS-Settings after
     1.4.1 lowercases two; ry-verify's root UUID stands in for a redacted one
-  - docs: README names ry-verify 7.258.0 and ty 0.0.95 as tested and ties
-    byte-identical PDFs to one zlib build
 
 
 7.9.2
@@ -154,21 +139,13 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 
   - rules: storage-errors matches the block layer's device offline and
     reservation conflict errors (critical nexus before 6.5)
-  - report: Section 6.2 names a block-layer error's source by its device,
-    as it does for an I/O error
-  - report: Appendix B.3 names the lines a rule claims for an event
-  - figures: axis titles share one type size, and text inside a chart
-    another
+  - report: Section 6.2 names a block-layer error's source by its device;
+    Appendix B.3 names the lines a rule claims for an event
+  - figures: axis titles share one type size, text inside a chart another
   - cli: --help lists the options in the README's order with PATH and DIR
-    values, --help last
-  - cli: a preflight error names why an input or a font file cannot be read
+    values; a preflight error names why an input or font cannot be read
   - cli: --verbose names the font directory and the Python and library
-    versions, under --check too
-  - cli: --verbose names the --compare summary read and the JSON summary
-    written
-  - code: two comments, a plain-string regex, and two docstrings corrected
-  - docs: README covers lead patterns and the tested svglib 2.3.2 and ty
-    0.0.93; the minimum versions build the same PDF
+    versions, under --check too, and the summaries read and written
 
 
 7.9.1
@@ -182,16 +159,12 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     HIGH, MED, and LOW tally always shows
   - report: --compare names a summary from another machine as such; a
     finding INFO then counts as new, one INFO now as resolved
-  - report: --compare names resolved findings by title and earlier ID, as
-    IDs shift between runs
-  - figures: an uptime label stands above the ticks it reaches, so no tick
-    crosses a label; labels that reach each other's ticks merge
-  - figures: the uptime axis writes 1,000,000 s, not 1e+06 s
-  - cli: --compare rejects a pipe, a device, or JSON nested too deeply
-    with exit 1
-  - cli: --json writes ASCII and adds ry_verify.exit_code, a number or null
+  - report: --compare names resolved findings by title and earlier ID
+  - figures: an uptime label stands above the ticks it reaches; labels that
+    reach each other's ticks merge; the axis writes 1,000,000 s, not 1e+06 s
+  - cli: --compare rejects a pipe, a device, or JSON nested too deeply with
+    exit 1; --json writes ASCII and adds ry_verify.exit_code
   - parsing: a lone surrogate from a JSON escape shows as U+FFFD
-  - docs: README covers lead patterns, exit_code, and what --compare reads
 
 
 7.9.0
@@ -203,20 +176,18 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     beside the levels, and each running header tallies HIGH, MED, and LOW
   - report: the footer names each input's SHA256 prefix; the PDF opens with
     its bookmarks, states en-US, and names the machine in its title
-  - report: the PDF carries both inputs as attachments unless --no-attach
+  - report: the PDF carries both inputs as attachments unless --no-attach; B.3
+    counts the failure keywords
   - cli: --brief builds the cover and Sections 1 to 3; a reference past
     them names the full report
   - cli: --json writes a summary and --compare reads one: the register
     marks findings new, worse, better, or same and names those resolved
   - rules: gpu-hang claims the process and ring-reset lines of its event;
     a WATCH rule covers MT79xx firmware timeouts and cites ry-verify's ASPM
-  - figures: WARN, GEN_FAIL, and the initrd phase are striped, as svglib
-    drops hatching and close grays blur in black-and-white print
+  - figures: WARN, GEN_FAIL, and the initrd phase are striped
   - layout: ry-verify records that share a template are one row; 6.3 drops
     its table when the after-boot table lists every repeat
   - layout: a word too wide for a table cell breaks after a separator
-  - docs: README lists the failure keywords, which B.3 now counts, and
-    covers the new options, the JSON summary, and rule context and cites
 
 
 7.8.1
@@ -238,12 +209,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     where ry-verify's README clones it, not ~/ry-install/ry-verify.fish
   - rules: usb-volume loses its soft-mixer mitigation, which no ry-verify
     record has named since 7.229.0; mitigations name devices by USB ID
-  - ry-verify: ERR lines it logs without counting them (continuations,
-    the boot-path note) are no results, so the cross-checks agree
-  - code: comments are single lines and the year-fallback docstring says
-    1972; status, pairs, and a generator's _ no longer reuse names
-  - docs: README runs ~/ry-verify/ry-verify.fish and names ry-verify
-    7.256.0, ReportLab 5.1.0, ruff 0.17.3, and ty 0.0.92 as tested
+  - ry-verify: ERR lines it logs without counting them (continuations, the
+    boot-path note) are no results; 7.256.0 as tested
 
 
 7.7.0
@@ -255,6 +222,10 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     the checklist; Section 3 keeps each action's commands
   - report: the verdict no longer repeats the tiles' note on a journal
     that was not read when no error class was seen
+  - report: times since the kernel start use thousands separators in the
+    dmesg tables, pauses, milestones, and chart labels too
+  - report: a ry-verify run whose ends round to the same tenth of a
+    second shows one time in the timeline table and the boot chart
   - dmesg: one table in 6.1 replaces the boot phases table of 5.2, the
     dmesg overview, and the subsystem table of 6.2, now By source
   - dmesg: it counts each subsystem's lines per boot phase and after the
@@ -263,18 +234,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     boot; otherwise the boot and after-boot charts show when it logs
   - boot: 5.2 is Milestones and captures; when dmesg has lost the boot,
     5.1 alone says where it starts
-  - report: times since the kernel start use thousands separators in the
-    dmesg tables, pauses, milestones, and chart labels too
-  - report: a ry-verify run whose ends round to the same tenth of a
-    second shows one time in the timeline table and the boot chart
   - actions: a script path with whitespace other than a space (a tab, a
     line break) reruns ry-verify as ~/ry-install/ry-verify.fish
-  - code: one formatter prints seconds; helpers build Matched by cells and
-    NOTE line sets; the rendered charts live in the build state
-  - code: docstrings follow ry-verify 7.254.0's counting of stopped,
-    finished, and interrupted runs
-  - docs: README lists the report by section and splits How It Works by
-    input, subsystem, count, and boot
 
 
 7.6.0
@@ -288,15 +249,10 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     chart's legend; During boot shows only when phases leave lines out
   - report: system health keeps the ry-verify result and the hardware
     checks; error classes, dmesg, and unit failures have their own tables
-  - report: the error-class lead names journal lines that could not be
-    read, as the health rows that said so are gone
-  - report: the verdict no longer repeats the error classes its tile names
+  - report: the error-class lead names journal lines that could not be read;
+    the verdict no longer repeats the error classes its tile names
   - actions: the ry-verify rerun names the script by the absolute path in
     the log's header, a home directory as ~, else ~/ry-install/ry-verify.fish
-  - code: ty 0.0.90 passes; four functions over 50 lines are split, and a
-    local no longer shadows run()
-  - docs: README follows the new layout and names the versions tested;
-    ruff.toml lists DTZ901 among the rules left out of select
 
 
 7.5.1
@@ -316,8 +272,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     measured spans, and a cut userspace reads as a lower bound
   - boot: the chart names later milestones, states a cut burst, draws
     the ry-verify run as a bar, and shows short phases on long axes
-  - report: a journal boot that could not be read counts as not read
-  - report: the verdict adds only what its head line and tiles omit
+  - report: a journal boot that could not be read counts as not read; the
+    verdict adds only what its head line and tiles omit
   - report: the quiet gap reads as the longest silence, with its span
   - report: templates keep placeholders; counts and section numbers
     stay with their labels; six tables have clearer titles
@@ -326,7 +282,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - parsing: continuation lines join in linear time; absurd dmesg
     stamps, dates, and zone offsets no longer stop a build
   - ry-verify: a footer count outside 0 to 999,999,999 is an input error
-  - docs: README follows the new behavior
 
 
 7.5.0
@@ -339,12 +294,10 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     previous boot did not log, numbers aside, the 10 most frequent
   - report: system health gives each check's result, detail, and source
     in columns; ry-verify's totals name GEN_FAIL only when counted
-  - report: a message logged once is quoted as logged; only repeats read
-    as their template
-  - report: 6.2 is now By subsystem and source, 7.5 Boot comparison
+  - report: a message logged once is quoted as logged, repeats as their
+    template; 6.2 is now By subsystem and source, 7.5 Boot comparison
   - text: the verdict, key facts, reading guide, severity levels, leads,
     captions, Method, and rule explanations are shorter
-  - docs: README describes the new tables and the source of a dmesg line
 
 
 7.4.0
@@ -370,9 +323,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     repeat with other numbers, boilerplate aside, the 10 most frequent
   - dmesg: common boot lines (keyrings, taskstats, serial ports, NUMA,
     XFRM, traffic control, cache drops) leave Other for their subsystems
-  - journal: a table of repeated warnings per process, with entries per
-    boot and the rules they match
-  - journal: the process table counts entries with failure keywords
+  - journal: a table of repeated warnings per process, with entries per boot
+    and their rules; the process table counts entries with failure keywords
   - journal: the current boot's timeline counts in seconds, minutes, or
     hours by its span; a long uptime no longer reads as an offset
   - cli: an interrupt while the PDF replaces its target waits for the
@@ -383,8 +335,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     the jack2 explanation no longer narrates inxi
   - text: rule explanations, watch-item meanings, captions, and Method say
     the same in fewer words; the key facts name the bug report, not inxi
-  - docs: README describes the new order, repeated warnings, the kernel
-    start, and the eight figures
 
 
 7.3.0
@@ -400,9 +350,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     subsections leave the section and the contents
   - report: the boot key fact gives the kernel and initrd phases; the
     verdict drops the error-class list the health table holds
-  - report: a timeline row inside the ry-verify run steps from its start,
-    so no step reads negative
-  - report: a unit failure's result is printed as logged, never as markup
+  - report: a timeline row inside the ry-verify run steps from its start; a
+    unit failure's result is printed as logged, never as markup
   - boot: the boot chart draws a band of the phases: the kernel until init,
     the initrd until the switch to the root file system, then userspace
   - boot: a phases table gives each phase's span, duration, and dmesg lines;
@@ -450,10 +399,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     an interrupt after the PDF has replaced its target names it
   - cli: the temporary file has a short name, so any output name fits;
     SOURCE_DATE_EPOCH takes at most 20 digits
-  - code: table() loses the hold option with its last caller, and ruff's
-    max-args returns to 8
-  - docs: README describes the new order, the boot phases, and the seven
-    figures
 
 
 7.2.1
@@ -531,12 +476,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     names its own package
   - cli: --help says --check exits 0 once the inputs parse; --verbose
     counts message classes
-  - code: comments and docstrings match the code; limits are named and
-    explained; an unknown section key fails the build
-  - code: dead code goes: the card's Note row, table totals, the bugreport
-    count, the unused chart faces, and a section reader
-  - docs: README installs the Verify block's tools, covers GEN_FAIL and the
-    40-range cap, and drops the same-path condition for byte identity
 
 
 7.2.0
@@ -552,6 +491,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     table lists the five longest pauses in dmesg during the boot
   - report: Section 5 adds dmesg lines by subsystem, journal entries by
     process, and every unit failure systemd logged in either boot
+  - report: the journal attribution cross-check leaves with the
+    unclassified list
   - figures: new Figure 2 draws boot activity by subsystem, one tick per
     dmesg line, aligned under the boot timeline; later figures renumber
   - figures: new Figure 5 compares journal entries per process across the
@@ -560,10 +501,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - figures: charts use the IBM Plex files the report text uses, even where
     another copy of the family is installed
   - actions: no command names an input file, so sed is no longer needed
-  - report: the journal attribution cross-check leaves with the
-    unclassified list
-  - docs: README describes Section 5 Logs, the six figures, and the pause
-    table; the identifier and unclassified-line texts are gone
 
 
 7.1.0
@@ -672,8 +609,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     date line dates the PDF; figure warnings go to the verbose log
   - cli: start-up skips the slow xml.sax import, so Ctrl-C at launch exits
     without a traceback
-  - docs: README covers check failures under exit 1, VJ numbering, the
-    redaction checks, the new figures and appendix, and the fallbacks
 
 
 7.0.0
@@ -711,8 +646,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     shifts the hold once per command list); a short table moves whole
   - layout: running headers name the section at the top of each page;
     contents columns end clear of their rule and inside the frame
-  - layout: U+FFFD in condensed text is drawn in Plex Sans, as the
-    condensed faces have no glyph for it
+  - layout: U+FFFD in condensed text is drawn in Plex Sans
   - figures: the boot timeline ends at the first 30 s pause after the last
     milestone, so later lines cannot squeeze the boot; the caption counts them
   - figures: boot timeline bars narrow with the span shown, 0.01 to 5 s;
@@ -753,17 +687,11 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     -b -1 or --user-unit; unclassified lines are printed by number
   - actions: core dumps get coredumpctl commands; an OOM kill joins the
     kernel errors to investigate
-  - cli: --check also runs the parser cross-checks and names any that differ
-  - cli: Ctrl-C during start-up exits 130 without a Python traceback
+  - cli: --check also runs the parser cross-checks and names any that differ;
+    Ctrl-C during start-up exits 130 without a traceback
   - cli: SOURCE_DATE_EPOCH past 9999-12-31 is a usage error; importing the
     script leaves the caller's Ctrl-C handling alone
   - cli: a second build in the same process starts from a clean state
-  - docs: Quick Start runs chmod +x first and finds the newest ry-verify log
-    with fish's path sort; ls -t fails where ls is CachyOS's eza alias
-  - docs: the Verify block finds the newest ry-verify log the same way
-    instead of naming a verify.jsonl that does not exist
-  - docs: README describes the new sections, figures, and appendices; its
-    section references follow the new numbering
 
 
 6.1.0
