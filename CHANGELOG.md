@@ -4,6 +4,29 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.13.0
+------
+
+  - ry-verify: follows 7.265.0, which logs the kernel release it runs on; a
+    log from another kernel than the bug report's lowers no finding
+  - ry-verify: the CPU its hardware gate detected is read from HARDWARE_MATCH
+    (7.251.0) too, not only from the mismatch warning
+  - ry-verify: a mismatch warning that holds 100,000 blanks is read at once;
+    --check took 20 s over it
+  - report: a run from before the captured boot lowers no finding and cites
+    no record, as a log from another machine does; the verdict names it
+  - report: the health table's ry-verify row names a log from another machine
+    or boot as such
+  - checks: B.2 compares the CPU vendor and the kernel release, so --check
+    names a log from another machine or another kernel
+  - figures: the run of a ry-verify log from another machine or boot is on no
+    chart; the timeline lists it without a time since the kernel start
+  - docs: README names ry-verify 7.265.0, ruff 0.17.5, and ty 0.0.102 as
+    tested
+  - changelog: 7.11.0 named a run from before the captured boot in the key
+    facts, not in the verdict, and its bullet says so
+
+
 7.12.0
 ------
 
@@ -16,10 +39,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     at its left edge; one at 0 s no longer fails the build
   - figures: its capture labels stand a row below the phase names when one
     would print over a name
-  - docs: README names ry-verify 7.264.0, svglib 2.4.0, ruff 0.17.4, and ty
-    0.0.101 as tested
-  - changelog: 7.11.0's bullets fit two lines; earlier releases keep no docs
-    or code bullets
 
 
 7.11.0
@@ -44,7 +63,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - checks: B.2 compares ry-verify's kernel command line with the bug report's
     and its start with the kernel start; cachyos-settings 1.4.2 redacts UUIDs
   - report: a ry-verify log from another kernel command line lowers no
-    finding; the verdict names it, and a run from before the captured boot
+    finding; the verdict names it, the key facts a run from before the boot
   - report: the health table names the CPU scheduler: BORE with its
     version, sched_ext with its state or loaded scheduler
   - ry-verify: the result goes by the counts: a --report run whose HTML report

@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.12.0"
+__version__ = "7.13.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -523,6 +523,16 @@ class VerifyLog:
         found = re.fullmatch(rf"uuid=({UUID})", self.events.get("ROOT_UUID_OK", (0, ""))[1])
         return found[1].lower() if found else ""
 
+    @property
+    def kernel(self) -> str:
+        """Return the kernel release ry-verify ran on (its KERNEL_RELEASE record, from 7.265.0), or "" without one.
+
+        ry-verify logs the word unknown for a release it cannot read, which names none; nor does a value that is no
+        single word of at most RELEASE_LIMIT characters.
+        """
+        found = re.fullmatch(rf"\S{{1,{RELEASE_LIMIT}}}", self.events.get("KERNEL_RELEASE", (0, ""))[1].strip())
+        return found[0] if found and found[0] != "unknown" else ""
+
     def outside_totals(self) -> list[str]:
         """Return the preamble FAIL and WARN records the totals leave out, as ["2 WARN"], judged by the totals.
 
@@ -790,6 +800,7 @@ SCOPE = re.compile(r"\bscope=(static|runtime)\b")  # the phase a VERIFY_RESULT r
 EVENT = re.compile(r"^([A-Z][A-Z0-9_]*): (.*)$", re.DOTALL)  # a structured record, as ROOT_UUID_OK: uuid=…
 RESULT_MODE = "verify"  # the ry-verify mode whose logs hold check results; --check logs none
 META_CLIP = 40  # characters of a header field the report shows: a version, a profile, or a mode
+RELEASE_LIMIT = 64  # characters a kernel release holds at most (the kernel's utsname field), and the report shows
 SECTION_CLIP = 60  # characters of a section name kept; ry-verify's longest is 21
 FOOTER_NUMBERS = ("pass", "fail", "warn", "gen_fail", "exit_code")  # footer fields the report reads as integers
 FOOTER_FIELDS = {"OK": "pass", "FAIL": "fail", "WARN": "warn", "GEN_FAIL": "gen_fail"}  # status: the footer's count
@@ -1412,6 +1423,9 @@ class Action:
     findings: list[str] = field(default_factory=list)  # the IDs of the findings the action answers
 
 
+Estimate = tuple[dt.datetime, float]  # the kernel start as estimated, and the estimate's half-width in seconds
+
+
 @dataclass
 class Model:
     """Everything the report shows, derived from the two inputs."""
@@ -1422,12 +1436,13 @@ class Model:
     others: list[Finding]  # WATCH, SETTING, NOTE
     milestones: dict[str, float]
     quiet_gap: tuple[float, float] | None
-    kernel_start: tuple[dt.datetime, float] | None  # (estimate, half-width in seconds)
+    kernel_start: Estimate | None
     verify_sections: list[tuple[str, str, dict[str, int]]]
     facts: dict[str, str]
     health: list[tuple[str, str, str, str]]
     keyword_entries: dict[str, int]  # journal entries with failure keywords per boot
     actions: list[Action]
+    foreign: list[tuple[str, str]]  # why the ry-verify log is not this boot's: foreign_log(), [] when it is
 
 
 def consecutive_runs(numbers: Iterable[int]) -> list[tuple[int, int]]:
@@ -1704,18 +1719,30 @@ def cpu_vendor(cpu: str) -> str:
     return next((name for name, pattern in CPU_VENDORS if pattern.search(cpu)), "")
 
 
-def other_machine(vj: VerifyLog, cpu: str) -> tuple[VerifyItem, str, str] | None:
-    """Return the hardware-mismatch record with its CPU vendor and the bug report's when the two vendors differ.
+def detected_cpu(vj: VerifyLog) -> tuple[int, str] | None:
+    """Return the line and CPU model of the record in which ry-verify names the CPU it detected, or None without one.
 
-    ry-verify names the CPU it detected when its profile targets other hardware; a vendor other than the one in the
-    bug report's inxi block shows that the two logs come from different machines.
+    Its hardware-mismatch warning names it when the profile targets other hardware, and its HARDWARE_MATCH record
+    when the profile matches (7.251.0).
     """
     item = hardware_mismatch(vj)
-    detected = re.search(r"\bdetected: (.+?)(?:\s+—\s|$)", item.text) if item else None
-    if item is None or detected is None:
+    if item and (warned := re.search(r"\bdetected: ([^—]+)", item.text)):  # up to the dash before ry-verify's remark
+        return item.no, warned[1].strip()
+    line, text = vj.events.get("HARDWARE_MATCH", (0, ""))
+    matched = re.search(r"\bdetected=(.+)", text)
+    return (line, matched[1]) if matched else None
+
+
+def other_machine(vj: VerifyLog, cpu: str) -> tuple[int, str, str] | None:
+    """Return the line of ry-verify's CPU record with its CPU vendor and the bug report's when the two vendors differ.
+
+    A vendor other than the one in the bug report's inxi block shows that the two logs come from different machines.
+    """
+    found = detected_cpu(vj)
+    if found is None:
         return None
-    theirs, ours = cpu_vendor(detected.group(1)), cpu_vendor(cpu)
-    return (item, theirs, ours) if theirs and ours and theirs != ours else None
+    theirs, ours = cpu_vendor(found[1]), cpu_vendor(cpu)
+    return (found[0], theirs, ours) if theirs and ours and theirs != ours else None
 
 
 def verify_findings(vj: VerifyLog) -> list[Finding]:
@@ -1800,6 +1827,46 @@ def other_root(br: BugReport, vj: VerifyLog) -> int | None:
     return vj.events["ROOT_UUID_OK"][0] if ours and theirs and ours != theirs else None
 
 
+KERNEL_FIELD = r"Kernel:\s*(\S+)"  # the kernel release in inxi's System block, which INXI_FACTS reads too
+
+
+def kernel_release(br: BugReport) -> str:
+    """Return the kernel release the bug report names, as written: inxi's, else the uname line's; "" without one."""
+    found = re.search(KERNEL_FIELD, inxi_blocks(br).get("System", "")) or re.match(r"Linux \S+ (\S+)", br.uname)
+    return found[1] if found else ""
+
+
+def fits_redacted(parts: Sequence[str], text: str) -> bool:
+    """Return whether text is the parts in order with some text between each two, where a placeholder hid it.
+
+    Each part takes the first place where it fits, which finds a fit whenever there is one, with no backtracking.
+    """
+    if len(parts) == 1:
+        return text == parts[0]
+    if not (text.startswith(parts[0]) and text.endswith(parts[-1])):
+        return False
+    at, end = len(parts[0]), len(text) - len(parts[-1])
+    for part in parts[1:-1]:
+        found = text.find(part, at + 1, end)
+        if found < 0:
+            return False
+        at = found + len(part)
+    return at < end
+
+
+def other_kernel(br: BugReport, vj: VerifyLog) -> tuple[int, str, str] | None:
+    """Return the line of ry-verify's kernel release record with its release and the bug report's when they differ.
+
+    None when the two agree or either names none. A placeholder cachyos-bugreport.sh wrote into the release, for a
+    host or user name that is one of its words, stands for any text.
+    """
+    ours, theirs = kernel_release(br), vj.kernel
+    if not (ours and theirs):
+        return None
+    same = fits_redacted(PLACEHOLDER.split(ours), theirs)
+    return None if same else (vj.events["KERNEL_RELEASE"][0], theirs, ours)
+
+
 CMDLINE_ROW = re.compile(r"(\S+): (active|NOT in cmdline)")  # ry-verify's /proc/cmdline rows, one per managed token
 
 
@@ -1830,17 +1897,44 @@ def other_cmdline(br: BugReport, vj: VerifyLog) -> VerifyItem | None:
     return next(iter(cmdline_rows(br, vj)[1]), None)
 
 
-def ran_before_boot(m: Model) -> float | None:
+def ran_before_boot(start: Estimate | None, vj: VerifyLog) -> float | None:
     """Return how many seconds before the captured boot's kernel start ry-verify started; None when it did not.
 
     The estimate's half-width and the second a journal stamp rounds away count as slack; None also without an
     estimate or a ry-verify start time.
     """
-    if not (m.kernel_start and m.vj.started):
+    if not (start and vj.started):
         return None
-    start, half = m.kernel_start
-    early = (start - m.vj.started.replace(tzinfo=None)).total_seconds() - half - 1
+    early = (start[0] - vj.started.replace(tzinfo=None)).total_seconds() - start[1] - 1
     return early if early > 0 else None
+
+
+def foreign_log(br: BugReport, vj: VerifyLog, cpu: str, start: Estimate | None) -> list[tuple[str, str]]:
+    """Return why ry-verify's records say nothing of the captured boot, as (the verdict's words, the key fact's).
+
+    The log comes from another machine (its CPU vendor), another installation (its root UUID), or another boot (its
+    kernel release, its kernel command line, a start before the kernel start); [] when no such check differs. The
+    words are house markup.
+    """
+    out = []
+    if machine := other_machine(vj, cpu):
+        cite = f"VJ {machine[0]}: {machine[1]} CPU, not {machine[2]}"
+        out.append((f"another machine ({cite})", f"run on another machine ({cite})"))
+    if (line := other_root(br, vj)) is not None:
+        fact = f"run on another root file system than the bug report's (VJ {line})"
+        out.append((f"another root file system (VJ {line})", fact))
+    if kernel := other_kernel(br, vj):
+        theirs, ours = (lit(clip(sanitize(release), RELEASE_LIMIT)) for release in kernel[1:])
+        words = f"another boot or machine (VJ {kernel[0]}: kernel {theirs}, not {ours})"
+        out.append((words, f"run on another kernel than the bug report's (VJ {kernel[0]}: {theirs})"))
+    if row := other_cmdline(br, vj):
+        fact = f"run on another kernel command line than the bug report's (VJ {row.no})"
+        out.append((f"another boot or machine (VJ {row.no}: kernel command line)", fact))
+    if (early := ran_before_boot(start, vj)) is not None:
+        ago = duration_text(early)
+        fact = f"started {ago} before the kernel start of the boot the bug report captures"
+        out.append((f"an earlier boot (started {ago} before this boot's kernel start)", fact))
+    return out
 
 
 def duration_text(seconds: float) -> str:
@@ -1983,7 +2077,7 @@ def kernel_bounds(pairs: Sequence[tuple[float, dt.datetime, bool]]) -> tuple[dt.
     return lo, hi
 
 
-def kernel_start(br: BugReport) -> tuple[dt.datetime, float] | None:
+def kernel_start(br: BugReport) -> Estimate | None:
     """Estimate the wall-clock kernel start from kernel messages found once in dmesg and once in the journal.
 
     The estimate is the middle of the window every pair allows, with half its width; a message printed more than once
@@ -2017,7 +2111,7 @@ INXI_FACTS = (  # (key, inxi block, pattern, template); patterns run on the bloc
         "{0}: {1} {2} ({3})",
     ),
     ("cpu", "CPU", r"\bmodel:\s*(.+?)\s+bits:", "{0}"),
-    ("kernel", "System", r"Kernel:\s*(\S+)", "{0}"),
+    ("kernel", "System", KERNEL_FIELD, "{0}"),
     ("distro", "System", r"Distro:\s*(.+?)(?:\s+base:.*)?$", "{0}"),
     ("desktop", "System", r"Desktop:\s*(.+?)\s+v:\s*(\S+)", "{0} {1}"),
     ("gpu", "Graphics", r"Device-1:\s*(.+?)\s+(?:vendor|driver):", "{0}"),  # -x adds the board vendor before driver
@@ -2181,13 +2275,14 @@ def verify_summary(vj: VerifyLog) -> str:
 
 
 def verify_health(m: Model) -> list[tuple[str, str, str, str]]:
-    """Return the ry-verify health row: check, result, detail, source.
+    """Return the ry-verify health row: check, result, detail, source; the detail names a foreign log as such.
 
     The error classes, the kernel ring buffer, and the unit failures have tables of their own, in Sections 4.2, 6.1,
     and 7.6, so the health table leaves them out.
     """
     verdict_, exit_ = m.vj.status
-    return [(f"ry-verify {m.vj.meta('version')}", f"{verdict_}, {exit_}", verify_summary(m.vj), "ry-verify log")]
+    detail = verify_summary(m.vj) + (f"; its log comes from {m.foreign[0][0]}" if m.foreign else "")
+    return [(f"ry-verify {m.vj.meta('version')}", f"{verdict_}, {exit_}", detail, "ry-verify log")]
 
 
 def unit_failures(m: Model) -> list[tuple[str, str]] | None:
@@ -2641,13 +2736,14 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
     """Run every analysis step and return the model the report is built from."""
     STATE.root_uuid = root_uuid(br) or vj.root_uuid  # ry-verify's, where the bug report redacts it
     facts = {**inxi_facts(br), **dmesg_facts(br), **scheduler_facts(br)}
-    if "kernel" not in facts and (release := re.match(r"Linux \S+ (\S+)", br.uname)):
-        facts["kernel"] = release.group(1)  # the report header's uname line stands in for a missing inxi block
+    if "kernel" not in facts and (release := kernel_release(br)):
+        facts["kernel"] = release  # the report header's uname line stands in for a missing inxi block
     # Shown on the cover, in the health table, and in every running header; cut so a table row fits a page.
     facts = {k: clip(sanitize(v), QUOTE_LIMIT) for k, v in facts.items()}
     rules = applicable_rules(br)
     found = attribute(br, rules)
-    foreign = other_machine(vj, facts.get("cpu", "")) or other_root(br, vj) is not None or other_cmdline(br, vj)
+    start = kernel_start(br)
+    foreign = foreign_log(br, vj, facts.get("cpu", ""), start)
     if not foreign:  # another system's records, or another boot's, say nothing of this one
         apply_mitigations(found, vj)
         cite_records(found, vj)
@@ -2669,12 +2765,13 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
         others,
         marks,
         quiet,
-        kernel_start(br),
+        start,
         verify_sections(vj),
         facts,
         [],
         keyword_entries(br, note_lines(others)),
         [],
+        foreign,
     )
     m.health = health_rows(m)
     m.actions = plan_actions(m)
@@ -2891,13 +2988,15 @@ def align_x(figs: Sequence[Figure]) -> None:
 def capture_points(m: Model) -> dict[str, float]:
     """Return the capture times as seconds since kernel start, when the kernel start is known.
 
-    A time before the kernel start (the clock set back since) is left out.
+    A time before the kernel start (the clock set back since) is left out, and so is the run of a ry-verify log from
+    another machine, installation, or boot (m.foreign), which did not take place in this one.
     """
     if not m.kernel_start:
         return {}
     start = m.kernel_start[0]
     out = {}
-    for label, when in (("ry-verify starts", m.vj.started), ("ry-verify ends", m.vj.finished)):
+    runs = () if m.foreign else (("ry-verify starts", m.vj.started), ("ry-verify ends", m.vj.finished))
+    for label, when in runs:
         if when:
             out[label] = (when.replace(tzinfo=None) - start).total_seconds()
     if m.br.captured:
@@ -4586,15 +4685,12 @@ def verdict(m: Model) -> tuple[str, str]:
 
 
 def verify_target(m: Model) -> str:
-    """Return the verdict's sentence on what the ry-verify log ran on when that is not this boot's system, else ""."""
-    if foreign := other_machine(m.vj, m.facts.get("cpu", "")):
-        item, theirs, ours = foreign
-        return f" Its log comes from another machine (VJ {item.no}: {theirs} CPU, not {ours}), so it lowers no finding."
-    if (line := other_root(m.br, m.vj)) is not None:
-        return f" Its log comes from another root file system (VJ {line}), so it lowers no finding."
-    if row := other_cmdline(m.br, m.vj):
-        where = f"VJ {row.no}: kernel command line"
-        return f" Its log comes from another boot or machine ({where}), so it lowers no finding."
+    """Return the verdict's sentence on what the ry-verify log ran on when that is not this boot's system, else "".
+
+    It names the first of foreign_log()'s reasons; the key facts name them all.
+    """
+    if m.foreign:
+        return f" Its log comes from {m.foreign[0][0]}, so it lowers no finding."
     mismatch = hardware_mismatch(m.vj)
     return f" Its {lit(m.vj.meta('profile'))} profile targets other hardware (VJ {mismatch.no})." if mismatch else ""
 
@@ -4937,8 +5033,8 @@ def key_facts(m: Model) -> list[str]:
 def verify_fact(m: Model) -> str:
     """Return the ry-verify key fact: version, profile, mode, and result, then its notes.
 
-    The notes name another machine, root file system, or kernel command line the log comes from, a run from before
-    the captured boot, and the preamble's FAIL and WARN records.
+    The notes name why the log is not this boot's (foreign_log(): another machine, root file system, kernel, or
+    kernel command line, or a run from before the captured boot) and the preamble's FAIL and WARN records.
     """
     vj = m.vj
     verdict_, exit_ = vj.status
@@ -4947,15 +5043,7 @@ def verify_fact(m: Model) -> str:
     ryv = (
         f"ry-verify {lit(vj.meta('version'))}: profile {lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; {result}"
     )
-    if foreign := other_machine(vj, m.facts.get("cpu", "")):
-        item, theirs, ours = foreign
-        ryv += f"; run on another machine (VJ {item.no}: {theirs} CPU, not {ours})"
-    if (line := other_root(m.br, vj)) is not None:
-        ryv += f"; run on another root file system than the bug report's (VJ {line})"
-    if row := other_cmdline(m.br, vj):
-        ryv += f"; run on another kernel command line than the bug report's (VJ {row.no})"
-    if (early := ran_before_boot(m)) is not None:
-        ryv += f"; started {duration_text(early)} before the kernel start of the boot the bug report captures"
+    ryv += "".join(f"; {fact}" for _, fact in m.foreign)
     preamble = [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]
     if preamble:
         logged = Counter(i.status for i in preamble)
@@ -5136,8 +5224,8 @@ METHOD = (
     ),
     (
         "A ry-verify OK record showing a mitigation lowers its finding to INFO, unless another record contradicts it, "
-        "it leaves out a device the evidence comes from or the evidence names none, or the log comes from another "
-        "machine, root file system, or kernel command line."
+        "it leaves out a device the evidence comes from or the evidence names none, or a pairing check in "
+        "{s:sub-B.2} shows the log comes from another machine, installation, or boot."
     ),
     (
         "Each kernel message logged once in both dmesg and the current journal bounds the kernel start to one second, "
@@ -5368,23 +5456,30 @@ def burst_text(m: Model, xmax: float) -> str:
 
 
 def captures_left(m: Model, drawn: dict[str, float]) -> str:
-    """Return the boot caption's sentence on the captures it leaves to the timeline table, or "" when none."""
+    """Return the boot caption's sentence on the captures it leaves to the timeline table, or "" when none.
+
+    With the kernel start known, it names the run of a foreign ry-verify log, which no chart places in this boot.
+    """
     known = [k for k, when in (("ry-verify starts", m.vj.started), ("bug report", m.br.captured)) if when]
     if not (left := [k for k in known if k not in drawn]):
         return ""
-    timed = capture_points(m)  # a capture timed before the kernel start is left out of it
-    early = m.kernel_start is not None and any(k not in timed for k in left)
-    late = any(k in timed for k in left)
-    one = len(left) == 1
+    timed = capture_points(m)  # without a capture timed before the kernel start, and without a foreign run
+    foreign = bool(m.foreign and m.kernel_start) and "ry-verify starts" in left
+    rest = [k for k in left if not (foreign and k == "ry-verify starts")]
+    early = m.kernel_start is not None and any(k not in timed for k in rest)
+    late = any(k in timed for k in rest)
     if early and late:
-        which = "Captures from before this boot and later ones"
+        which = "captures from before this boot and later ones"
     elif early:
-        which = "A capture from before this boot" if one else "Captures from before this boot"
-    elif drawn:
-        which = "A later capture" if one else "Later captures"
+        which = "a capture from before this boot" if len(rest) == 1 else "captures from before this boot"
+    elif late and (drawn or foreign):
+        which = "a later capture" if len(rest) == 1 else "later captures"
     else:
-        which = "The capture" if one else "The captures"
-    return f" {which} {'appears' if one else 'appear'} in {section_ref('sub-5.2')} only."
+        which = ("the capture" if len(rest) == 1 else "the captures") if rest else ""
+    if foreign:
+        which = "the ry-verify run, from another boot or machine," + (f" and {which}" if which else "")
+    verb = "appears" if len(left) == 1 else "appear"
+    return f" {which[0].upper()}{which[1:]} {verb} in {section_ref('sub-5.2')} only."
 
 
 def _story_health(m: Model) -> list[Flowable]:
@@ -6191,14 +6286,20 @@ def cross_checks(m: Model) -> list[list[str]]:
 def pairing_checks(m: Model) -> list[list[str]]:
     """Return the checks that both logs describe one system in one boot, each where the inputs allow it.
 
-    They compare the root UUID, the kernel command line tokens ry-verify checked, and the ry-verify start with the
-    captured boot's kernel start.
+    They compare the CPU vendor, the root UUID, the kernel release, the kernel command line tokens ry-verify
+    checked, and the ry-verify start with the captured boot's kernel start; one that differs is a reason
+    foreign_log() gives.
     """
     out = []
+    cpu, ours = detected_cpu(m.vj), cpu_vendor(m.facts.get("cpu", ""))
+    if cpu and ours and (theirs := cpu_vendor(cpu[1])):
+        result = "match" if theirs == ours else f"differs: VJ {cpu[0]}, {theirs}"
+        out.append([f"ry-verify's CPU vendor is the bug report's ({ours})", result])
     if root_uuid(m.br) and m.vj.root_uuid:
         line = other_root(m.br, m.vj)
         result = "match" if line is None else f"differs: VJ {line}"
         out.append(["ry-verify's root file system is the bug report's (root UUID)", result])
+    out += kernel_check(m.br, m.vj)
     checked, differing = cmdline_rows(m.br, m.vj)
     if checked:
         result = "match"
@@ -6206,10 +6307,24 @@ def pairing_checks(m: Model) -> list[list[str]]:
             result = f"differs: VJ {clip(ranges([i.no for i in differing]), RANGES_CLIP)}"
         out.append([f"ry-verify's kernel command line is the bug report's ({plural(checked, 'token')})", result])
     if m.kernel_start and m.vj.started:
-        early = ran_before_boot(m)
+        early = ran_before_boot(m.kernel_start, m.vj)
         result = "match" if early is None else f"differs: {duration_text(early)} before it"
         out.append(["ry-verify started after the kernel start of the boot the bug report captures", result])
     return out
+
+
+def kernel_check(br: BugReport, vj: VerifyLog) -> list[list[str]]:
+    """Return the check of ry-verify's kernel release (logged from 7.265.0) against the bug report's, as a row.
+
+    No row unless both name a release.
+    """
+    ours, theirs = kernel_release(br), vj.kernel
+    if not (ours and theirs):
+        return []
+    shown, other = (lit(clip(sanitize(release), RELEASE_LIMIT)) for release in (ours, theirs))
+    differing = other_kernel(br, vj)
+    result = "match" if differing is None else f"differs: VJ {differing[0]}, {other}"
+    return [[f"ry-verify's kernel release is the bug report's ({shown})", result]]
 
 
 def _story_actions(m: Model) -> list[Flowable]:
@@ -6960,7 +7075,7 @@ def check(args: argparse.Namespace) -> int:
         f"cross-checks: {len(checks) - len(differing)} of {len(checks)} match)"
     )
     for name, result in differing:
-        say(f"cross-check: {name}: {result}".replace(NBSP, " "))
+        say(f"cross-check: {name}: {result}".translate(UNLITERAL).replace(NBSP, " "))
     return EXIT_OK
 
 
