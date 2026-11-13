@@ -4,6 +4,25 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.14.0
+------
+
+  - report: a ry-verify log from another machine or boot makes one LOW
+    finding in place of its records' own; its FAIL and WARN records make none
+  - report: the verdict counts no failure or GEN_FAIL of such a log, and
+    Section 8 opens with a sentence on where the log comes from
+  - actions: such a log gets one action, first on the checklist: a run of
+    ry-verify in the captured boot; no action fixes another boot's checks
+  - cli: --compare counts the earlier run's ry-verify findings as not
+    compared, not as resolved, while this run's log is from another boot
+  - cli: --verbose names where a ry-verify log from another boot or machine
+    comes from; --json lists it as the one finding verify-pairing
+  - rules: the rules read a message's first 4,096 characters; a line of
+    200,000 characters of one rule's keyword took --check 64 s
+  - checks: a bug report dated before its own kernel start shows a clock set
+    back since the boot; a ry-verify start before it then claims nothing
+
+
 7.13.0
 ------
 
@@ -21,10 +40,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     names a log from another machine or another kernel
   - figures: the run of a ry-verify log from another machine or boot is on no
     chart; the timeline lists it without a time since the kernel start
-  - docs: README names ry-verify 7.265.0, ruff 0.17.5, and ty 0.0.102 as
-    tested
-  - changelog: 7.11.0 named a run from before the captured boot in the key
-    facts, not in the verdict, and its bullet says so
 
 
 7.12.0

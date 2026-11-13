@@ -49,7 +49,7 @@ import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, TextIO
+from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, TextIO
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.13.0"
+__version__ = "7.14.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -392,6 +392,7 @@ class VerifyLog:
     phase_results: dict[str, dict[str, int]]  # phase -> counts from its VERIFY_RESULT record
     combined: dict[str, int]
     events: dict[str, tuple[int, str]] = field(default_factory=dict)  # first KEY: event of each key, line and text
+    header_no: int = 0  # the header record's line
 
     def meta(self, key: str) -> str:
         """Return a header field for display: sanitized and cut to META_CLIP, or "?" when the log does not state it."""
@@ -934,7 +935,8 @@ def parse_verify(path: Path) -> VerifyLog:
                 items.append(VerifyItem(n, at.phase, at.section, m.group(1), m.group(2).strip(), at.heading))
         elif (e := EVENT.match(data)) and e[1] != "ECHO":
             events.setdefault(e[1], (n, e[2]))
-    return VerifyLog(path, raw, records, header, foot, items, phase_results, combined, events)
+    header_no = next(n for n, rec in numbered if rec is header)
+    return VerifyLog(path, raw, records, header, foot, items, phase_results, combined, events, header_no)
 
 
 # ── RULES ─────────────────────────────────────────────────────────────
@@ -1426,6 +1428,14 @@ class Action:
 Estimate = tuple[dt.datetime, float]  # the kernel start as estimated, and the estimate's half-width in seconds
 
 
+class Foreign(NamedTuple):
+    """One pairing check that differs: where the ry-verify log comes from, as the report words it."""
+
+    words: str  # the verdict's, as house markup: another machine (VJ 4: Intel CPU, not AMD)
+    fact: str  # the key fact's: run on another machine (VJ 4: Intel CPU, not AMD)
+    line: int  # the ry-verify record that shows it; the header's for a start before the captured boot
+
+
 @dataclass
 class Model:
     """Everything the report shows, derived from the two inputs."""
@@ -1442,7 +1452,7 @@ class Model:
     health: list[tuple[str, str, str, str]]
     keyword_entries: dict[str, int]  # journal entries with failure keywords per boot
     actions: list[Action]
-    foreign: list[tuple[str, str]]  # why the ry-verify log is not this boot's: foreign_log(), [] when it is
+    foreign: list[Foreign]  # why the ry-verify log is not this boot's: foreign_log(), [] when it is
 
 
 def consecutive_runs(numbers: Iterable[int]) -> list[tuple[int, int]]:
@@ -1544,6 +1554,8 @@ def match_rule(
 
 
 CONTEXT_SPAN = 3  # lines after a match, or after a line claimed with it, that can belong to the same event
+# A pattern with a gap (amdgpu.*timeout) rescans a message once per keyword, so a message is read up to a limit.
+SCAN_LIMIT = 4096  # characters of a message the rules read: four times the kernel's longest record
 Event = tuple[Rule, str, int, bool]  # an open event: its rule, source, last line's index, and whether that matched
 
 
@@ -1579,7 +1591,8 @@ def claim(rules: Sequence[Rule], event: Event | None, index: int, text: str) -> 
 def attribute(br: BugReport, rules: Sequence[Rule]) -> dict[str, Finding]:
     """Attribute the dmesg lines, journal entries, and inxi lines a rule knows to that rule's finding.
 
-    A rule with context or lead patterns also claims the lines of the same event that follow a match (claim()).
+    A rule with context or lead patterns also claims the lines of the same event that follow a match (claim()). The
+    rules read the first SCAN_LIMIT characters of a dmesg line or journal entry.
     """
     found: dict[str, Finding] = {}
 
@@ -1592,20 +1605,21 @@ def attribute(br: BugReport, rules: Sequence[Rule]) -> dict[str, Finding]:
 
     event: Event | None = None
     for k, e in enumerate(br.dmesg):
-        rule, event = claim(rules, event, k, e.text)
+        rule, event = claim(rules, event, k, e.text[:SCAN_LIMIT])
         if rule:
             add(rule, Match("dmesg", e.no, quote(f"[{e.t:12.6f}] {e.text}")))
     previous = [e for e in br.journal if e.boot == "previous"]
     last_prev = max((e.when for e in previous), default=None)
     window = [e for e in previous if last_prev and (last_prev - e.when).total_seconds() <= SHUTDOWN_WINDOW]
-    tail = {e.no for e in window} if any(SHUTDOWN_MARK.search(e.text) for e in window) else set()
+    tail = {e.no for e in window} if any(SHUTDOWN_MARK.search(e.text, 0, SCAN_LIMIT) for e in window) else set()
     event, kernel, boot = None, 0, ""  # in the journal, an event's lines are counted among the kernel's entries
     for e in br.journal:
         if e.boot != boot:  # an event of the current boot's last entries never claims the previous boot's first
             event, boot = None, e.boot
-        rule = match_rule(rules, "journal", e.text, e.ident, shutdown=e.no in tail)
+        head = e.text[:SCAN_LIMIT]
+        rule = match_rule(rules, "journal", head, e.ident, shutdown=e.no in tail)
         if rule is None and e.ident == "kernel":  # kernel warnings repeat in the journal; dmesg rules know them
-            rule, event = claim(rules, event, kernel, e.text)
+            rule, event = claim(rules, event, kernel, head)
         if rule:
             add(rule, Match("journal", e.no, quote(e.line), e.boot, e.when))
         kernel += e.ident == "kernel"
@@ -1748,28 +1762,17 @@ def other_machine(vj: VerifyLog, cpu: str) -> tuple[int, str, str] | None:
 def verify_findings(vj: VerifyLog) -> list[Finding]:
     """Group ry-verify FAIL, GEN_FAIL, and WARN records into findings by status, phase, and section.
 
-    The hardware mismatch is not one.
+    The hardware mismatch is not one. Such a finding has no card: the register links to its section's rows in the
+    failures table, so it carries no explanation or action text.
     """
     groups: dict[tuple[str, str, str], list[VerifyItem]] = {}
     for item in actionable(vj):
         groups.setdefault((item.counted, item.phase, item.section), []).append(item)
     out = []
     for (status, phase, section), items in groups.items():
-        sev = "LOW" if status == "WARN" else "MED"
+        severity = "LOW" if status == "WARN" else "MED"
         title = f"ry-verify {status}: {section_title(section)} ({phase})"
-        what = (
-            f"it could not generate the expected content for these {phase} checks (GEN_FAIL)"
-            if status == "GEN_FAIL"
-            else f"these {phase} checks reported {status}"
-        )
-        f = Finding(
-            f"verify-{status}-{phase}-{section}",
-            title,
-            "ry-verify / " + section_title(section),
-            sev,
-            f"ry-verify {lit(vj.meta('version'))} checks the managed configuration; {what}.",
-            f"Fix each listed item, then run `{lit(verify_script(vj))} --verify` again.",
-        )
+        f = Finding(f"verify-{status}-{phase}-{section}", title, "ry-verify", severity, "", "")
         f.matches = [Match("verify", i.no, quote(f"{i.status}: {i.text}")) for i in items]
         f.anchor = verify_anchor(phase, section)
         out.append(f)
@@ -1897,44 +1900,77 @@ def other_cmdline(br: BugReport, vj: VerifyLog) -> VerifyItem | None:
     return next(iter(cmdline_rows(br, vj)[1]), None)
 
 
-def ran_before_boot(start: Estimate | None, vj: VerifyLog) -> float | None:
+def before_start(start: Estimate, when: dt.datetime) -> float:
+    """Return how many seconds before the estimated kernel start a wall-clock time lies; 0 or less when it does not.
+
+    The estimate's half-width and the second a journal stamp rounds away count as slack.
+    """
+    return (start[0] - when).total_seconds() - start[1] - 1
+
+
+def clock_set_back(start: Estimate, captured: dt.datetime | None) -> bool:
+    """Return whether the bug report's capture time lies before the kernel start of the boot it captures.
+
+    The wall clock was then set back since the boot (daylight saving time ended, the zone changed, the time was
+    stepped), so a wall-clock time taken later cannot be held against the kernel start.
+    """
+    return captured is not None and before_start(start, captured) > 0
+
+
+def ran_before_boot(start: Estimate | None, vj: VerifyLog, captured: dt.datetime | None) -> float | None:
     """Return how many seconds before the captured boot's kernel start ry-verify started; None when it did not.
 
-    The estimate's half-width and the second a journal stamp rounds away count as slack; None also without an
-    estimate or a ry-verify start time.
+    None also without an estimate or a ry-verify start time, and when the clock was set back since the boot
+    (clock_set_back()), as a run of the same boot then reads as started before it too.
     """
-    if not (start and vj.started):
+    if not (start and vj.started) or clock_set_back(start, captured):
         return None
-    early = (start[0] - vj.started.replace(tzinfo=None)).total_seconds() - start[1] - 1
+    early = before_start(start, vj.started.replace(tzinfo=None))
     return early if early > 0 else None
 
 
-def foreign_log(br: BugReport, vj: VerifyLog, cpu: str, start: Estimate | None) -> list[tuple[str, str]]:
-    """Return why ry-verify's records say nothing of the captured boot, as (the verdict's words, the key fact's).
+def foreign_log(br: BugReport, vj: VerifyLog, cpu: str, start: Estimate | None) -> list[Foreign]:
+    """Return why ry-verify's records say nothing of the captured boot, one Foreign per pairing check that differs.
 
     The log comes from another machine (its CPU vendor), another installation (its root UUID), or another boot (its
-    kernel release, its kernel command line, a start before the kernel start); [] when no such check differs. The
-    words are house markup.
+    kernel release, its kernel command line, a start before the kernel start); [] when no such check differs.
     """
     out = []
     if machine := other_machine(vj, cpu):
         cite = f"VJ {machine[0]}: {machine[1]} CPU, not {machine[2]}"
-        out.append((f"another machine ({cite})", f"run on another machine ({cite})"))
+        out.append(Foreign(f"another machine ({cite})", f"run on another machine ({cite})", machine[0]))
     if (line := other_root(br, vj)) is not None:
         fact = f"run on another root file system than the bug report's (VJ {line})"
-        out.append((f"another root file system (VJ {line})", fact))
+        out.append(Foreign(f"another root file system (VJ {line})", fact, line))
     if kernel := other_kernel(br, vj):
         theirs, ours = (lit(clip(sanitize(release), RELEASE_LIMIT)) for release in kernel[1:])
         words = f"another boot or machine (VJ {kernel[0]}: kernel {theirs}, not {ours})"
-        out.append((words, f"run on another kernel than the bug report's (VJ {kernel[0]}: {theirs})"))
+        fact = f"run on another kernel than the bug report's (VJ {kernel[0]}: {theirs})"
+        out.append(Foreign(words, fact, kernel[0]))
     if row := other_cmdline(br, vj):
         fact = f"run on another kernel command line than the bug report's (VJ {row.no})"
-        out.append((f"another boot or machine (VJ {row.no}: kernel command line)", fact))
-    if (early := ran_before_boot(start, vj)) is not None:
+        out.append(Foreign(f"another boot or machine (VJ {row.no}: kernel command line)", fact, row.no))
+    if (early := ran_before_boot(start, vj, br.captured)) is not None:
         ago = duration_text(early)
         fact = f"started {ago} before the kernel start of the boot the bug report captures"
-        out.append((f"an earlier boot (started {ago} before this boot's kernel start)", fact))
+        out.append(Foreign(f"an earlier boot (started {ago} before this boot's kernel start)", fact, vj.header_no))
     return out
+
+
+PAIRING = "verify-pairing"  # the key of the finding a foreign ry-verify log makes
+PAIRING_ANCHOR = "sec-8"  # where the register links it: Section 8, which opens with the sentence on the log
+
+
+def pairing_finding(vj: VerifyLog, foreign: Sequence[Foreign]) -> Finding:
+    """Return the LOW finding a foreign ry-verify log makes in place of its records' own, titled by its first reason.
+
+    Its evidence is the record that shows each reason, quoted as the log holds it.
+    """
+    lines = text_lines(vj.raw)
+    f = Finding(PAIRING, f"ry-verify log from {foreign[0].words.partition(' (')[0]}", "ry-verify", "LOW", "", "")
+    f.matches = [Match("verify", r.line, quote(lines[r.line - 1])) for r in foreign]
+    f.anchor = PAIRING_ANCHOR
+    return f
 
 
 def duration_text(seconds: float) -> str:
@@ -2281,7 +2317,7 @@ def verify_health(m: Model) -> list[tuple[str, str, str, str]]:
     and 7.6, so the health table leaves them out.
     """
     verdict_, exit_ = m.vj.status
-    detail = verify_summary(m.vj) + (f"; its log comes from {m.foreign[0][0]}" if m.foreign else "")
+    detail = verify_summary(m.vj) + (f"; its log comes from {m.foreign[0].words}" if m.foreign else "")
     return [(f"ry-verify {m.vj.meta('version')}", f"{verdict_}, {exit_}", detail, "ry-verify log")]
 
 
@@ -2553,6 +2589,8 @@ def verify_action(m: Model) -> Action | None:
 
     The rerun caches sudo first when a gate stopped ry-verify for want of sudo or its sudo cache lapsed mid-run.
     """
+    if m.foreign:  # another boot's or machine's failures: pairing_action() has the run that shows this boot's
+        return None
     fails = [f for f in m.findings if f.key.startswith("verify-")]
     shown, more = generator_failures(m.vj)
     if not fails and not more:
@@ -2586,9 +2624,24 @@ def verify_action(m: Model) -> Action | None:
     return Action("", "Fix the failing ry-verify checks", why, cmds, done, fids(fails))
 
 
+def pairing_action(m: Model) -> Action | None:
+    """Return the action for a foreign ry-verify log: a run in the captured boot, which a new report then reads."""
+    found = [f for f in m.findings if f.key == PAIRING]
+    if not found:
+        return None
+    why = f"{found[0].fid}, its log comes from {m.foreign[0].words}"
+    note = "after a reboot, capture the bug report again first (sudo cachyos-bugreport.sh); then build the report anew"
+    cmds = [*comment(note), f"{verify_script(m.vj)} --verify"]
+    done = "A new report no longer shows the finding"
+    return Action("", "Run ry-verify in the captured boot", why, cmds, done, fids(found))
+
+
 def failure_actions(m: Model) -> list[Action]:
-    """Return the actions for ry-verify failures, kernel errors, an abnormal reset, core dumps, and failed units."""
-    acts = [a for a in (verify_action(m),) if a]
+    """Return the actions for a foreign ry-verify log or ry-verify's failures, then those for the bug report's.
+
+    Those are kernel errors, an abnormal reset, core dumps, and failed units.
+    """
+    acts = [a for a in (pairing_action(m), verify_action(m)) if a]
     kernel = [f for f in m.findings if f.key in KERNEL_ERRORS]
     if kernel:
         boots = {mt.boot for f in kernel for mt in f.matches}  # "" for dmesg lines, which are the current boot
@@ -2747,7 +2800,8 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
     if not foreign:  # another system's records, or another boot's, say nothing of this one
         apply_mitigations(found, vj)
         cite_records(found, vj)
-    findings = [f for f in found.values() if f.severity in FINDING_LEVELS] + verify_findings(vj)
+    findings = [f for f in found.values() if f.severity in FINDING_LEVELS]
+    findings += [pairing_finding(vj, foreign)] if foreign else verify_findings(vj)
     findings.sort(key=register_order)
     counters: dict[str, int] = {}
     for f in findings:
@@ -4658,7 +4712,8 @@ def verdict(m: Model) -> tuple[str, str]:
     The summary adds what the head line leaves out: LOW findings beside HIGH and MED ones, the INFO findings, and the
     ry-verify run. The error-class and unit-failure tiles name the classes seen and a journal that was not read.
     """
-    c, (shown, gen) = severity_counts(m), generator_failures(m.vj)  # a GEN_FAIL record is a finding already
+    c = severity_counts(m)
+    shown, gen = (0, 0) if m.foreign else generator_failures(m.vj)  # a GEN_FAIL record is a finding already
     low = ""
     if c["HIGH"] or c["MED"] or gen:
         n, parts = c["HIGH"] + c["MED"], []
@@ -4687,10 +4742,11 @@ def verdict(m: Model) -> tuple[str, str]:
 def verify_target(m: Model) -> str:
     """Return the verdict's sentence on what the ry-verify log ran on when that is not this boot's system, else "".
 
-    It names the first of foreign_log()'s reasons; the key facts name them all.
+    It names the first of foreign_log()'s reasons and the finding they make; the key facts name them all.
     """
     if m.foreign:
-        return f" Its log comes from {m.foreign[0][0]}, so it lowers no finding."
+        fid = next(f.fid for f in m.findings if f.key == PAIRING)
+        return f" {fid}: its log comes from {m.foreign[0].words}, so none of its records makes or lowers a finding."
     mismatch = hardware_mismatch(m.vj)
     return f" Its {lit(m.vj.meta('profile'))} profile targets other hardware (VJ {mismatch.no})." if mismatch else ""
 
@@ -5043,7 +5099,7 @@ def verify_fact(m: Model) -> str:
     ryv = (
         f"ry-verify {lit(vj.meta('version'))}: profile {lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; {result}"
     )
-    ryv += "".join(f"; {fact}" for _, fact in m.foreign)
+    ryv += "".join(f"; {reason.fact}" for reason in m.foreign)
     preamble = [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]
     if preamble:
         logged = Counter(i.status for i in preamble)
@@ -5080,11 +5136,20 @@ def resolved(m: Model) -> list[dict[str, Any]]:
     """Return the --compare run's findings that called for action and no longer do, in its register order.
 
     A finding is resolved when no finding of its rule shows now, or the one that shows is INFO (a mitigation in place).
+    A foreign ry-verify log resolves none of that run's ry-verify findings: unjudged() counts them.
     """
     if STATE.compare is None:
         return []
-    now = {f.key for f in m.findings if f.severity != "INFO"}
+    now = {f.key for f in m.findings if f.severity != "INFO"} | {f["key"] for f in unjudged(m)}
     return [f for f in STATE.compare["findings"] if f["severity"] != "INFO" and f["key"] not in now]
+
+
+def unjudged(m: Model) -> list[dict[str, Any]]:
+    """Return the --compare run's ry-verify findings that a foreign log now leaves neither shown nor resolved."""
+    if STATE.compare is None or not m.foreign:
+        return []
+    old = [f for f in STATE.compare["findings"] if f["severity"] != "INFO"]
+    return [f for f in old if f["key"].startswith("verify-") and f["key"] != PAIRING]
 
 
 def compare_text(m: Model) -> str:
@@ -5102,6 +5167,9 @@ def compare_text(m: Model) -> str:
     ]
     more = f", and {len(gone) - RESOLVED_SHOWN:,} more" if len(gone) > RESOLVED_SHOWN else ""
     since = f"; {len(gone):,} resolved since: {', '.join(names)}{more}" if gone else "; none resolved since"
+    if left := len(unjudged(m)):  # the earlier run's ry-verify findings, which this run's log cannot judge
+        since += f"; {plural(left, 'ry-verify finding')} of that run not compared, as this run's log comes from "
+        since += "another boot or machine"
     return f"Compared with the summary of {compare_day(m)}: {said or 'no finding calls for action now'}{since}."
 
 
@@ -5201,8 +5269,9 @@ def inputs_table(m: Model) -> list[Flowable]:
 METHOD = (
     "The bug report splits at its separator lines; quotes keep line numbers; counts are of messages.",
     (
-        f"{len(RULES)} rules recognize message classes; the first matching rule claims a line, and a rule for an event "
-        "the lines that follow it, such as a GPU timeout's process and ring-reset lines."
+        f"{len(RULES)} rules recognize message classes, reading a message's first {SCAN_LIMIT:,} characters; the first "
+        "matching rule claims a line, and a rule for an event the lines that follow it, such as a GPU timeout's "
+        "process and ring-reset lines."
     ),
     (
         "A dmesg line belongs to the subsystem its prefix or wording names, an indented line to the message above; a "
@@ -5219,13 +5288,16 @@ METHOD = (
         "hardware-mismatch warning is no finding."
     ),
     (
+        "A ry-verify log that a pairing check in {s:sub-B.2} shows comes from another machine, installation, or boot "
+        "makes one LOW finding in place of its records' own: none of them is a finding, lowers one, or is cited."
+    ),
+    (
         f"The previous boot's last {SHUTDOWN_WINDOW} s of journal entries also meet the shutdown-noise patterns when "
         "they hold a line only a stop sequence logs."
     ),
     (
         "A ry-verify OK record showing a mitigation lowers its finding to INFO, unless another record contradicts it, "
-        "it leaves out a device the evidence comes from or the evidence names none, or a pairing check in "
-        "{s:sub-B.2} shows the log comes from another machine, installation, or boot."
+        "it leaves out a device the evidence comes from, or the evidence names none."
     ),
     (
         "Each kernel message logged once in both dmesg and the current journal bounds the kernel start to one second, "
@@ -5458,7 +5530,8 @@ def burst_text(m: Model, xmax: float) -> str:
 def captures_left(m: Model, drawn: dict[str, float]) -> str:
     """Return the boot caption's sentence on the captures it leaves to the timeline table, or "" when none.
 
-    With the kernel start known, it names the run of a foreign ry-verify log, which no chart places in this boot.
+    With the kernel start known, it names the run of a foreign ry-verify log, which no chart places in this boot;
+    another capture dated before the kernel start shows a clock set back since the boot (clock_set_back()).
     """
     known = [k for k, when in (("ry-verify starts", m.vj.started), ("bug report", m.br.captured)) if when]
     if not (left := [k for k in known if k not in drawn]):
@@ -5469,9 +5542,9 @@ def captures_left(m: Model, drawn: dict[str, float]) -> str:
     early = m.kernel_start is not None and any(k not in timed for k in rest)
     late = any(k in timed for k in rest)
     if early and late:
-        which = "captures from before this boot and later ones"
+        which = "captures the clock dates before this boot and later ones"
     elif early:
-        which = "a capture from before this boot" if len(rest) == 1 else "captures from before this boot"
+        which = f"{'a capture' if len(rest) == 1 else 'captures'} the clock dates before this boot"
     elif late and (drawn or foreign):
         which = "a later capture" if len(rest) == 1 else "later captures"
     else:
@@ -5580,8 +5653,11 @@ def _story_findings(m: Model) -> list[Flowable]:
     """Return Section 2: cards for the log findings that call for action, then the watch items and settings."""
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-2"), HPara("sub-2.1")]
     logged = [f for f in m.findings if f.severity != "INFO" and not f.key.startswith("verify-")]
-    checks = sum(1 for f in m.findings if f.key.startswith("verify-"))
-    where = f"; the ry-verify findings are in {section_ref('sub-8.2')}" if checks else ""
+    where = ""
+    if m.foreign:
+        where = f"; the finding on the ry-verify log is in {section_ref('sec-8')}"
+    elif any(f.key.startswith("verify-") for f in m.findings):
+        where = f"; the ry-verify findings are in {section_ref('sub-8.2')}"
     if logged:
         out += [para(f"Bug-report findings, by severity and first line{where}.", sty_lead)]
         out += [card(f) for f in logged]
@@ -5692,9 +5768,22 @@ def verify_caption(m: Model) -> str:
     return f"Records per section and status, {where}.{left_out}"
 
 
+def pairing_lead(m: Model) -> list[Flowable]:
+    """Return the sentence that opens Section 8 for a foreign ry-verify log, under the heading the register links."""
+    if not m.foreign:
+        return []
+    fid = next(f.fid for f in m.findings if f.key == PAIRING)
+    text = (
+        f"{fid}: this log comes from {series([reason.words for reason in m.foreign])}. Its records describe that "
+        "boot or machine, so none makes or lowers a finding of the captured boot; {s:sub-B.2} lists the pairing "
+        "checks."
+    )
+    return [para(text, sty_lead)]
+
+
 def _story_verify(m: Model) -> list[Flowable]:
     """Return Section 8: ry-verify results by section, its failures and warnings, and its notes."""
-    out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-8"), HPara("sub-8.1")]
+    out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-8"), *pairing_lead(m), HPara("sub-8.1")]
     out += svgfig(STATE.charts.get("verify"), "ry-verify results by section", verify_caption(m)) or [
         para("The log holds no result records from a verification phase.")
     ]
@@ -6287,8 +6376,8 @@ def pairing_checks(m: Model) -> list[list[str]]:
     """Return the checks that both logs describe one system in one boot, each where the inputs allow it.
 
     They compare the CPU vendor, the root UUID, the kernel release, the kernel command line tokens ry-verify
-    checked, and the ry-verify start with the captured boot's kernel start; one that differs is a reason
-    foreign_log() gives.
+    checked, and the ry-verify start with the captured boot's kernel start, unless the clock was set back since the
+    boot; one that differs is a reason foreign_log() gives.
     """
     out = []
     cpu, ours = detected_cpu(m.vj), cpu_vendor(m.facts.get("cpu", ""))
@@ -6306,8 +6395,8 @@ def pairing_checks(m: Model) -> list[list[str]]:
         if differing:
             result = f"differs: VJ {clip(ranges([i.no for i in differing]), RANGES_CLIP)}"
         out.append([f"ry-verify's kernel command line is the bug report's ({plural(checked, 'token')})", result])
-    if m.kernel_start and m.vj.started:
-        early = ran_before_boot(m.kernel_start, m.vj)
+    if m.kernel_start and m.vj.started and not clock_set_back(m.kernel_start, m.br.captured):
+        early = ran_before_boot(m.kernel_start, m.vj, m.br.captured)
         result = "match" if early is None else f"differs: {duration_text(early)} before it"
         out.append(["ry-verify started after the kernel start of the boot the bug report captures", result])
     return out
@@ -6689,6 +6778,11 @@ def say(message: str) -> bool:
     return True
 
 
+def plain(text: str) -> str:
+    """Return house-markup words as stderr prints them: input data as written, a no-break space as a space."""
+    return text.translate(UNLITERAL).replace(NBSP, " ")
+
+
 def parse_inputs(args: argparse.Namespace) -> tuple[BugReport, VerifyLog]:
     """Parse the ry-verify log, then the bug report, which reads its journal's times against the log's start."""
     vj = parse_verify(args.verify)
@@ -6712,6 +6806,8 @@ def load_model(args: argparse.Namespace, log: Callable[[str], None]) -> Model:
         log(f"compare: {args.compare}, {plural(len(STATE.compare['findings']), 'finding')}")
     others = plural(len(m.others), "other message class", "other message classes")
     log(f"analysis: {plural(len(m.findings), 'finding')}, {others}, {plural(len(m.actions), 'action')}")
+    if m.foreign:
+        log(f"pairing: the ry-verify log comes from {plain(series([reason.words for reason in m.foreign]))}")
     return m
 
 
@@ -7075,7 +7171,7 @@ def check(args: argparse.Namespace) -> int:
         f"cross-checks: {len(checks) - len(differing)} of {len(checks)} match)"
     )
     for name, result in differing:
-        say(f"cross-check: {name}: {result}".translate(UNLITERAL).replace(NBSP, " "))
+        say(plain(f"cross-check: {name}: {result}"))
     return EXIT_OK
 
 
