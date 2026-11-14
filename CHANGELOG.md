@@ -4,6 +4,54 @@ Changes for gtr9-postboot-log-analysis
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
 
+7.15.1
+------
+
+  - parsing: an inxi fact is read where its line first names its key; a
+    megabyte of lines that repeat one took --check 33 s
+  - figures: the message for a figure svglib cannot read carries svglib's
+    reason, which 7.14.1 took off stderr and dropped
+
+
+7.15.0
+------
+
+  - cli: --compare knows its own machine's summary again where the name
+    holds a version of four numbers; 7.14.1 took it for another machine's
+  - figures: svglib's limit of 10,000 <use> elements is lifted; in 7.14.1 a
+    ry-verify log of 600 sections failed the build over its chart's labels
+  - parsing: the package rows are again those 7.14.0 counted; 7.14.1 left
+    out a row that opens with a slash
+  - ry-verify: the README names 7.265.0 as tested and 7.266.0 as read from
+    its source; 7.14.1 called 7.266.0 tested
+
+
+7.14.1
+------
+
+  - figures: a figure draws at most 6,000 ticks, the journal timeline too;
+    svglib from 2.3.1 drops an SVG's <use> elements past 10,000
+  - figures: an error svglib logs over a figure fails the build, and its
+    warnings go to --verbose; neither prints on stderr unprefixed
+  - parsing: the boot milestones, the inxi rules, and the facts read a line's
+    first 4,096 characters; an inxi line of 16,000 took --check 14 min
+  - parsing: inxi's system and firmware vendor end at the first product: or
+    v: after them; a later one is no longer tried
+  - parsing: a package row is read in one pass; one of 200,000 characters
+    took --check 24 s
+  - privacy: a fact keeps a version of four numbers (firmware 1.20.3.4),
+    which read [IPv4]; a quote masks such a number as before
+  - report: an unread date line stops at 400 characters on the cover and in
+    --json
+  - report: a card shows the ry-verify record its rule cites, as the watch
+    table and Appendix A do; no shipped rule with a card cites one
+  - quotes: the private-use characters U+E000 to U+E002 show as U+FFFD; from
+    a log they read ` * { in running text
+  - cli: a JSON line with an over-long number is named without Python's hint
+    on raising its limit
+  - ry-verify: 7.266.0 logs parse as 7.265.0 logs do
+
+
 7.14.0
 ------
 
