@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.15.1"
+__version__ = "7.16.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
