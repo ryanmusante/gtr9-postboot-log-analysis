@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.16.0** · [Changelog](CHANGELOG.md)
+**Version 7.16.1** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` builds a PDF report from a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log — the findings with their evidence and the commands they call for, system health, the boot, dmesg, the journal, and the ry-verify results. Every finding, quote, count, and figure comes from the two inputs on each run; the script holds analysis rules, never results.
 

@@ -14,10 +14,9 @@ ignore = [
     "PLR2004",  # small counts, seconds per hour and minute, clock limits, and a width tolerance read best as literals
     "PLC0415",  # matplotlib and svglib load after the preflight; attach_inputs() and library_versions() import on use
     "RUF001",   # the report text uses en dashes in number and time ranges
-    "ISC001",   # single-line implicit concatenation is the formatter's call
 ]
 # Left out of `select` on purpose: on the executable script (0755), `ruff check --select ALL --ignore
-# D203,D213,PLR2004,PLC0415,RUF001,ISC001` adds only COM812 (trailing commas are the formatter's call),
+# D203,D213,PLR2004,PLC0415,RUF001` adds only COM812 (trailing commas are the formatter's call),
 # T201 (print is the command-line output), SLF001 (ReportLab internals: the frame position, table cells,
 # grouped flowables, and the canvas's document), and DTZ001, DTZ007, and DTZ901 (journal and capture times
 # are naive wall-clock, as the logs print them).

@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.16.0"
+__version__ = "7.16.1"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -84,16 +84,11 @@ def user_font_dir() -> Path:
 
 FONT_DIRS = (Path("/usr/share/fonts/TTF"), Path("/usr/share/fonts/truetype/ibm-plex"), user_font_dir())
 FONT_FILES = {
-    "Plex": "IBMPlexSans-Regular",
-    "Plex-It": "IBMPlexSans-Italic",
-    "Plex-Md": "IBMPlexSans-Medium",
-    "Plex-SB": "IBMPlexSans-SemiBold",
-    "Plex-SBIt": "IBMPlexSans-SemiBoldItalic",
-    "PlexC": "IBMPlexSansCondensed-Regular",
-    "PlexC-SB": "IBMPlexSansCondensed-SemiBold",
-    "PlexM": "IBMPlexMono-Regular",
-    "PlexM-SB": "IBMPlexMono-SemiBold",
-}
+    "Plex": "IBMPlexSans-Regular", "Plex-It": "IBMPlexSans-Italic", "Plex-Md": "IBMPlexSans-Medium",
+    "Plex-SB": "IBMPlexSans-SemiBold", "Plex-SBIt": "IBMPlexSans-SemiBoldItalic",
+    "PlexC": "IBMPlexSansCondensed-Regular", "PlexC-SB": "IBMPlexSansCondensed-SemiBold",
+    "PlexM": "IBMPlexMono-Regular", "PlexM-SB": "IBMPlexMono-SemiBold",
+}  # fmt: skip
 # The pacman package of each module beyond reportlab: an import error names it, and the preflight checks all three.
 MODULES = {"matplotlib": "python-matplotlib", "svglib": "python-svglib", "PIL": "python-pillow"}
 MAX_PASSES = 6  # layout passes allowed before the page references must have settled
@@ -226,8 +221,7 @@ def preflight(fonts: Path | None, inputs: Sequence[Path]) -> Path:
         raise PreflightError(msg)
     need = [f"{stem}.ttf" for stem in FONT_FILES.values()]
     dirs = (fonts,) if fonts else FONT_DIRS
-    font_dir = next((d for d in dirs if all(readable(d / f) for f in need)), None)
-    if font_dir is None:
+    if (font_dir := next((d for d in dirs if all(readable(d / f) for f in need)), None)) is None:
         best = max(dirs, key=lambda d: sum(readable(d / f) for f in need))  # the first that holds the most of them
         lacking = [f"{best / f} ({why})" for f in need if (why := unreadable(best / f))]
         more = f" and {len(lacking) - 1} more" if len(lacking) > 1 else ""
@@ -244,8 +238,7 @@ def preflight(fonts: Path | None, inputs: Sequence[Path]) -> Path:
         except (TTFError, struct.error, ValueError, LookupError) as exc:
             msg = f"not a TrueType font: {path} ({exc})"
             raise PreflightError(msg) from exc
-    blocked = [f"{p} ({why})" for p in inputs if (why := unreadable(p))]
-    if blocked:
+    if blocked := [f"{p} ({why})" for p in inputs if (why := unreadable(p))]:
         msg = "cannot read input: " + ", ".join(blocked)
         raise PreflightError(msg)
     return font_dir
@@ -290,14 +283,10 @@ STATE = BuildState()
 SEPARATOR = re.compile(r"^(?:_{44}|-{44})[ \t]*$")  # the 44-character rules cachyos-bugreport.sh writes, padded or not
 # Matched ignoring case: cachyos-settings 1.4.2 and later lowercase the two "Getting" titles.
 SECTION_TITLES = {
-    "Start of CachyOS bug report log file": "header",
-    "Getting Hardware Information": "inxi",
-    "Getting Scheduler information": "sched",
-    "dmesg": "dmesg",
-    "journalctl of current boot": "journal-current",
-    "journalctl of previous boot": "journal-previous",
-    "Installed packages": "packages",
-}
+    "Start of CachyOS bug report log file": "header", "Getting Hardware Information": "inxi",
+    "Getting Scheduler information": "sched", "dmesg": "dmesg", "journalctl of current boot": "journal-current",
+    "journalctl of previous boot": "journal-previous", "Installed packages": "packages",
+}  # fmt: skip
 SECTION_LABELS = {  # the names Appendices B.1 and B.2 give the sections
     "header": "header", "inxi": "inxi", "sched": "scheduler", "dmesg": "dmesg",
     "journal-current": "current-boot journal", "journal-previous": "previous-boot journal", "packages": "package list",
@@ -459,8 +448,7 @@ class VerifyLog:
         """
         if not self.footer:
             return "unknown", "no footer"
-        code = self.footer.get("exit_code")
-        if code is None:
+        if (code := self.footer.get("exit_code")) is None:
             return "unknown", "no exit code"
         if self.interrupted:
             return "interrupted", f"exit {code}"
@@ -579,8 +567,7 @@ def parse_sections(lines: Sequence[str]) -> dict[str, tuple[int, int]]:
     blocks.append((start, len(lines)))
     sections = {}
     for first, last in blocks:
-        title_no = next((n for n in range(first, last + 1) if lines[n - 1].strip()), None)
-        if title_no is None:
+        if (title_no := next((n for n in range(first, last + 1) if lines[n - 1].strip()), None)) is None:
             continue
         title = lines[title_no - 1].strip().casefold()
         name = next((v for k, v in SECTION_TITLES.items() if title.startswith(k.casefold())), None)
@@ -758,8 +745,7 @@ def parse_bugreport(path: Path, fallback: dt.datetime | None = None) -> BugRepor
     dmesg: list[DmesgEntry] = []
     more: dict[int, list[str]] = {}  # continuation lines per entry index, joined once
     for n, line in section_slice(lines, sections, "dmesg"):
-        m = DMESG_LINE.match(line)
-        if m:
+        if m := DMESG_LINE.match(line):
             dmesg.append(DmesgEntry(n, float(m.group("t")), m.group("msg")))
         elif dmesg and line.strip():
             more.setdefault(len(dmesg) - 1, []).append(line.strip())
@@ -772,21 +758,10 @@ def parse_bugreport(path: Path, fallback: dt.datetime | None = None) -> BugRepor
     unparsed += unparsed_prev
     packages = [n for n, line in section_slice(lines, sections, "packages") if PACKAGE_LINE.match(line)]
     inxi, inxi_parts = inxi_logical_lines(section_slice(lines, sections, "inxi"))
+    date = clip(sanitize(head.get("Date", "")), QUOTE_LIMIT)  # the cover prints a line no layout fits
+    uname, cmdline = head.get("uname", ""), head.get("cmdline", "")
     return BugReport(
-        path,
-        raw,
-        lines,
-        sections,
-        clip(sanitize(head.get("Date", "")), QUOTE_LIMIT),  # the cover prints a line no layout fits
-        captured,
-        head.get("uname", ""),
-        head.get("cmdline", ""),
-        inxi,
-        inxi_parts,
-        dmesg,
-        journal,
-        unparsed,
-        packages,
+        path, raw, lines, sections, date, captured, uname, cmdline, inxi, inxi_parts, dmesg, journal, unparsed, packages
     )
 
 
@@ -932,13 +907,8 @@ def parse_verify(path: Path) -> VerifyLog:
             scope = SCOPE.search(data)  # older logs name no scope: the record follows the phase it closes
             phase_results[scope[1] if scope else at.last_phase] = {k: int(v) for k, v in COUNTS.findall(data)}
         elif m := RESULT_LINE.match(data):
-            if (
-                at.phase
-                and at.section != "VERIFICATION SUMMARY"
-                and not PHASE_BANNER.match(data)
-                and not SIGNAL_NOTICE.match(data)
-                and not UNCOUNTED_ERR.match(data)
-            ):
+            no_result = PHASE_BANNER.match(data) or SIGNAL_NOTICE.match(data) or UNCOUNTED_ERR.match(data)
+            if at.phase and at.section != "VERIFICATION SUMMARY" and not no_result:
                 items.append(VerifyItem(n, at.phase, at.section, m.group(1), m.group(2).strip(), at.heading))
         elif (e := EVENT.match(data)) and e[1] != "ECHO":
             events.setdefault(e[1], (n, e[2]))
@@ -1521,11 +1491,8 @@ def no_journal(m: Model) -> str:
     Callers ask for the second form only when the journal holds no entries.
     """
     unread = len(m.br.journal_unparsed)
-    return (
-        f"{unread:,}{NBSP}journal {'line' if unread == 1 else 'lines'} could not be read"
-        if unread
-        else "no journal entries"
-    )
+    lines = "line" if unread == 1 else "lines"
+    return f"{unread:,}{NBSP}journal {lines} could not be read" if unread else "no journal entries"
 
 
 def unread_lines(m: Model, boot: str) -> int:
@@ -1638,8 +1605,7 @@ def attribute(br: BugReport, rules: Sequence[Rule]) -> dict[str, Finding]:
         kernel += e.ident == "kernel"
     for n, line in br.inxi:
         head = line[:SCAN_LIMIT]
-        rule = match_rule(rules, "inxi", head)
-        if rule:
+        if rule := match_rule(rules, "inxi", head):
             at, text = inxi_line_at(br, n, head, rule)
             add(rule, Match("inxi", at, quote(text)))
     return found
@@ -1677,8 +1643,7 @@ def apply_mitigations(found: dict[str, Finding], vj: VerifyLog) -> None:
         devices = evidence_devices(f) if rule.covers else []
         if devices is None:
             continue
-        ok = [i for i in related if i.status == "OK" and names_devices(f"{i.heading} {i.text}", devices)]
-        if ok:
+        if ok := [i for i in related if i.status == "OK" and names_devices(f"{i.heading} {i.text}", devices)]:
             hit = ok[-1]
             under = f" under {clip(quote(hit.heading), 60)}" if not names_devices(hit.text, devices) else ""
             f.severity = "INFO"
@@ -1706,8 +1671,7 @@ def evidence_devices(f: Finding) -> list[str] | None:
     """
     out = []
     for mt in f.matches:
-        ids = USB_ID.search(mt.text)
-        if ids is None:
+        if (ids := USB_ID.search(mt.text)) is None:
             return None
         out.append(f"0x{ids.group(1)}/0x{ids.group(2)}".lower())
     return out
@@ -1766,8 +1730,7 @@ def other_machine(vj: VerifyLog, cpu: str) -> tuple[int, str, str] | None:
 
     A vendor other than the one in the bug report's inxi block shows that the two logs come from different machines.
     """
-    found = detected_cpu(vj)
-    if found is None:
+    if (found := detected_cpu(vj)) is None:
         return None
     theirs, ours = cpu_vendor(found[1]), cpu_vendor(cpu)
     return (found[0], theirs, ours) if theirs and ours and theirs != ours else None
@@ -1809,14 +1772,8 @@ def verify_script(vj: VerifyLog) -> str:
     home = re.fullmatch(r"/home/[^/]+/(.+)", path)
     shown = home.group(1) if home else path
     word = f"~/{fish_quote(shown)}" if home else fish_quote(shown)
-    if (
-        not path.startswith("/")
-        or sanitize(shown) != shown
-        or re.search(r"[^\S ]", shown)
-        or len(f"{word} --verify") > COMMAND_WIDTH
-    ):
-        return VERIFY_SCRIPT
-    return word
+    unfit = not path.startswith("/") or sanitize(shown) != shown or re.search(r"[^\S ]", shown)
+    return VERIFY_SCRIPT if unfit or len(f"{word} --verify") > COMMAND_WIDTH else word
 
 
 def section_title(section: str) -> str:
@@ -1998,11 +1955,8 @@ def duration_text(seconds: float) -> str:
 def register_order(f: Finding) -> tuple[int, int, int, str]:
     """Return a finding's place in the register: severity, then the first line its First line column shows."""
     br, vj = f.line_numbers()
-    return (
-        (SEVERITY_RANK[f.severity], 0, min(br), f.key)
-        if br
-        else (SEVERITY_RANK[f.severity], 1, min(vj, default=0), f.key)
-    )
+    rank = SEVERITY_RANK[f.severity]
+    return (rank, 0, min(br), f.key) if br else (rank, 1, min(vj, default=0), f.key)
 
 
 MILESTONES = (
@@ -2206,8 +2160,7 @@ def inxi_facts(br: BugReport) -> dict[str, str]:
     blocks = inxi_blocks(br)
     facts = {}
     for key, block, pattern, template in INXI_FACTS:
-        m = re.search(pattern, blocks.get(block, ""), re.MULTILINE)
-        if m:
+        if m := re.search(pattern, blocks.get(block, ""), re.MULTILINE):
             groups = [g or "?" for g in m.groups()]
             text = mask(template.format(*groups), fact=True).replace(", ? available", "")
             if key == "firmware":
@@ -2246,11 +2199,8 @@ def vulnerability_counts(cpu_block: str) -> str:
         else:
             counts["unknown"] += 1
     named = {"partly vulnerable": f" ({'; '.join(partly)})"} if partly else {}
-    return ", ".join(
-        f"{n}{NBSP}{k}{named.get(k, '')}"
-        for k, n in counts.items()
-        if n or k in ("not affected", "mitigated", "vulnerable")
-    )
+    listed = ("not affected", "mitigated", "vulnerable")  # shown even at zero
+    return ", ".join(f"{n}{NBSP}{k}{named.get(k, '')}" for k, n in counts.items() if n or k in listed)
 
 
 def dmesg_facts(br: BugReport) -> dict[str, str]:
@@ -2266,8 +2216,7 @@ def dmesg_facts(br: BugReport) -> dict[str, str]:
         ("secure-boot", SECURE_BOOT),
     )
     for key, pattern in probes:
-        m = re.search(pattern, text)
-        if m:
+        if m := re.search(pattern, text):
             out[key] = " / ".join(m.groups())
     out["smu"] = "initialized" if "SMU is initialized" in text else ""
     return {k: v for k, v in out.items() if v}
@@ -2314,17 +2263,13 @@ def verify_summary(vj: VerifyLog) -> str:
         split = f" ({by_phase[0]:,}{NBSP}static, {by_phase[1]:,}{NBSP}runtime)"
     gen = f", {totals['gen_fail']:,}{NBSP}GEN_FAIL" if totals["gen_fail"] else ""
     info = sum(1 for i in vj.items if i.status == "INFO")
-    outside = vj.outside_totals()
+    counts = f"{totals['ok']:,}{NBSP}OK{split}; {totals['fail']:,}{NBSP}FAIL, {totals['warn']:,}{NBSP}WARN{gen}"
+    outside = f"; {', '.join(left)} in the preamble, outside the totals" if (left := vj.outside_totals()) else ""
     stops = "".join(
         f"; the {i.phase} phase stopped before its checks (VJ {i.no}: {clip(quote(i.text), QUOTE_CLIP)})"
         for i in vj.phase_stops
     )
-    return (
-        f"{totals['ok']:,}{NBSP}OK{split}; {totals['fail']:,}{NBSP}FAIL, {totals['warn']:,}{NBSP}WARN{gen}; "
-        f"{info:,}{NBSP}INFO"
-        + (f"; {', '.join(outside)} in the preamble, outside the totals" if outside else "")
-        + stops
-    )
+    return f"{counts}; {info:,}{NBSP}INFO{outside}{stops}"
 
 
 def verify_health(m: Model) -> list[tuple[str, str, str, str]]:
@@ -2357,8 +2302,7 @@ def gpu_health(m: Model) -> list[tuple[str, str, str, str]]:
         gtt = f"GTT {int(d['gtt']):,} MiB" if "gtt" in d else "GTT not logged"
         rows.append(("GPU memory", f"VRAM {int(d['vram']):,} MiB", gtt, "dmesg"))
     labels = (("smu", "SMU {}"), ("dmub", "DMUB {}"), ("vcn", "VCN ENC/DEC {}"))
-    fw = [label.format(d[key]) for key, label in labels if key in d]
-    if fw:
+    if fw := [label.format(d[key]) for key, label in labels if key in d]:
         rows.append(("amdgpu firmware", fw[0], ", ".join(fw[1:]), "dmesg"))
     return rows
 
@@ -2372,17 +2316,12 @@ def sensor_temps(text: str) -> list[str]:
 def hardware_health(m: Model) -> list[tuple[str, str, str, str]]:
     """Return the firmware, CPU, scheduler, memory, sensor, and drive health rows."""
     f, rows = m.facts, []
-    for key, label in (
-        ("firmware", "Firmware"),
-        ("secure-boot", "Secure Boot"),
-        ("microcode", "CPU microcode"),
-        ("vulnerabilities", "CPU vulnerabilities"),
-        ("scheduler", "CPU scheduler"),
-        ("memory", "Memory"),
-        ("swap", "Swap"),
-        ("temperatures", "Temperatures"),
-        ("fans", "Fan speeds"),
-    ):
+    labels = (
+        ("firmware", "Firmware"), ("secure-boot", "Secure Boot"), ("microcode", "CPU microcode"),
+        ("vulnerabilities", "CPU vulnerabilities"), ("scheduler", "CPU scheduler"), ("memory", "Memory"),
+        ("swap", "Swap"), ("temperatures", "Temperatures"), ("fans", "Fan speeds"),
+    )  # fmt: skip
+    for key, label in labels:
         if key == "scheduler":
             rows += scheduler_health(f, label)
         elif key in f and f[key] != "N/A":  # inxi's N/A states nothing to check
@@ -2416,10 +2355,8 @@ def note_lines(found: Iterable[Finding]) -> set[int]:
 
 def keyword_entries(br: BugReport, boilerplate: set[int]) -> dict[str, int]:
     """Count each boot's journal entries holding a failure keyword, NOTE lines aside; a continuation is its entry's."""
-    return {
-        boot: sum(1 for e in br.journal if e.boot == boot and e.no not in boilerplate and KEYWORD_RE.search(e.text))
-        for boot in ("current", "previous")
-    }
+    hits = Counter(e.boot for e in br.journal if e.no not in boilerplate and KEYWORD_RE.search(e.text))
+    return {boot: hits[boot] for boot in ("current", "previous")}
 
 
 # dmesg subsystems: the first whose pattern matches a message's whole prefix, lowercased, claims it; else Other.
@@ -2537,9 +2474,7 @@ FISH_SAFE = re.compile(r"[\w@+=:,./-]+")  # characters fish reads literally in a
 
 def fish_quote(text: str) -> str:
     """Return text as one fish word: bare when safe, else single-quoted with backslashes and quotes escaped."""
-    if FISH_SAFE.fullmatch(text):
-        return text
-    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return text if FISH_SAFE.fullmatch(text) else "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 # The unit a systemd entry names, in "<unit>: Failed with result '…'" or "Failed to start <unit> - <description>".
@@ -2643,8 +2578,7 @@ def verify_action(m: Model) -> Action | None:
 
 def pairing_action(m: Model) -> Action | None:
     """Return the action for a foreign ry-verify log: a run in the captured boot, which a new report then reads."""
-    found = [f for f in m.findings if f.key == PAIRING]
-    if not found:
+    if not (found := [f for f in m.findings if f.key == PAIRING]):
         return None
     why = f"{found[0].fid}, its log comes from {m.foreign[0].words}"
     note = "after a reboot, capture the bug report again first (sudo cachyos-bugreport.sh); then build the report anew"
@@ -2659,8 +2593,8 @@ def failure_actions(m: Model) -> list[Action]:
     Those are kernel errors, an abnormal reset, core dumps, and failed units.
     """
     acts = [a for a in (pairing_action(m), verify_action(m)) if a]
-    kernel = [f for f in m.findings if f.key in KERNEL_ERRORS]
-    if kernel:
+    cause = "The cause is identified"
+    if kernel := [f for f in m.findings if f.key in KERNEL_ERRORS]:
         boots = {mt.boot for f in kernel for mt in f.matches}  # "" for dmesg lines, which are the current boot
         cmds = [
             f"journalctl -k {which} -p warning -o short-monotonic"
@@ -2668,28 +2602,20 @@ def failure_actions(m: Model) -> list[Action]:
             if wanted
         ]
         why = f"{', '.join(f.fid for f in kernel)} in {section_ref('sub-2.1')}"
-        done = "The cause is identified"
-        acts.append(Action("", "Investigate the kernel errors", why, cmds, done, fids(kernel)))
-    reset = [f for f in m.findings if f.key == "reset-abnormal"]
-    if reset:
+        acts.append(Action("", "Investigate the kernel errors", why, cmds, cause, fids(kernel)))
+    if reset := [f for f in m.findings if f.key == "reset-abnormal"]:
         why = f"{reset[0].fid} in {section_ref('sub-2.1')}"
-        acts.append(
-            Action("", "Find why the previous boot ended", why, ["journalctl -b -1 -e"], "The cause is identified",
-                   fids(reset))
-        )  # fmt: skip
-    dumps = sorted(
-        {int(pid) for f in m.findings if f.key == "core-dump" for mt in f.matches for pid in CORE_PID.findall(mt.text)}
-    )
-    if dumps:
+        acts.append(Action("", "Find why the previous boot ended", why, ["journalctl -b -1 -e"], cause, fids(reset)))
+    cores = [f for f in m.findings if f.key == "core-dump"]
+    if dumps := sorted({int(pid) for f in cores for mt in f.matches for pid in CORE_PID.findall(mt.text)}):
         cmds = ["coredumpctl list", *[f"coredumpctl info {pid}" for pid in dumps[:MAX_LISTED]]]
         if len(dumps) > MAX_LISTED:
             cmds.append(f"# {len(dumps) - MAX_LISTED} more: coredumpctl list names them all")
         why = f"{plural(len(dumps), 'process', 'processes')} dumped core"
         done = "The crashing program is identified" if len(dumps) == 1 else "The crashing programs are identified"
         title = "Inspect the core dump" if len(dumps) == 1 else "Inspect the core dumps"
-        acts.append(Action("", title, why, cmds, done, fids(f for f in m.findings if f.key == "core-dump")))
-    units = failed_units(m)
-    if units:
+        acts.append(Action("", title, why, cmds, done, fids(cores)))
+    if units := failed_units(m):
         names, boots = list(dict.fromkeys(u[0] for u in units)), {u[1] for u in units}
         where = "both boots" if len(boots) > 1 else f"the {boots.pop()} boot"
         failed = f"`{lit(names[0])}` failed" if len(names) == 1 else f"{plural(len(names), 'unit')} failed"
@@ -2825,25 +2751,11 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
         level = f.severity[0]
         counters[level] = counters.get(level, 0) + 1
         f.fid = f"{level}-{counters[level]}"
-    others = sorted(
-        (f for f in found.values() if f.severity not in FINDING_LEVELS), key=lambda f: SEVERITY_RANK[f.severity]
-    )
+    rest = [f for f in found.values() if f.severity not in FINDING_LEVELS]
+    others = sorted(rest, key=lambda f: SEVERITY_RANK[f.severity])
     marks, quiet = timeline(br)
-    m = Model(
-        br,
-        vj,
-        findings,
-        others,
-        marks,
-        quiet,
-        start,
-        verify_sections(vj),
-        facts,
-        [],
-        keyword_entries(br, note_lines(others)),
-        [],
-        foreign,
-    )
+    keywords = keyword_entries(br, note_lines(others))
+    m = Model(br, vj, findings, others, marks, quiet, start, verify_sections(vj), facts, [], keywords, [], foreign)
     m.health = health_rows(m)
     m.actions = plan_actions(m)
     return m
@@ -3164,8 +3076,7 @@ def boot_axis(m: Model) -> tuple[float, dict[str, float]] | None:
     The range covers the boot's burst of dmesg lines and the captures up to twice its length; later captures
     appear in the timeline table only. A ry-verify run that starts on the chart keeps its end, drawn at the edge.
     """
-    burst = boot_burst(m)
-    if burst is None:
+    if (burst := boot_burst(m)) is None:
         return None
     points = capture_points(m)
     captures = {k: v for k, v in points.items() if v <= min(2 * burst, BOOT_SPAN)}
@@ -3231,8 +3142,7 @@ def draw_boot(m: Model) -> tuple[Figure, Callable[[], None] | None] | None:
 
     It returns the figure and the phase band's striping step, which runs once the layout is final, or None.
     """
-    axis = boot_axis(m)
-    if axis is None:
+    if (axis := boot_axis(m)) is None:
         return None  # the ring buffer no longer holds the boot; there is no chart to draw
     plt = _mpl()
     xmax, captures = axis
@@ -3349,8 +3259,7 @@ def boot_bars(ax1: Axes, m: Model, xmax: float, counts: Sequence[int], width: fl
 
 def fig_verify(m: Model) -> str | None:
     """Draw ry-verify results per section, one panel per phase on a shared scale, stacked by status."""
-    phases = [p for p in ("static", "runtime") if any(s[0] == p for s in m.verify_sections)]
-    if not phases:
+    if not (phases := [p for p in ("static", "runtime") if any(s[0] == p for s in m.verify_sections)]):
         return None
     plt = _mpl()
     from matplotlib.patches import Patch
@@ -3545,8 +3454,7 @@ def uptime_labels(events: dict[str, float], span: tuple[float, float], per: floa
             {j for j, other in enumerate(labels) if j != i and a - pad < other[0] < b + pad}
             for i, (_, _, a, b) in enumerate(labels)
         ]
-        cycle = sorted(tick_cycle(covers))
-        if not cycle:
+        if not (cycle := sorted(tick_cycle(covers))):
             return labels, stack_labels(labels, covers, pad)
         for k in reversed(cycle[1:]):  # into the earliest, whose tick the merged label keeps
             groups[cycle[0]][1].extend(groups.pop(k)[1])
@@ -3650,8 +3558,7 @@ def tick_times(marks: Sequence[dt.datetime], limit: int) -> list[dt.datetime]:
 
 def draw_subsystems(m: Model) -> Figure | None:
     """Draw dmesg activity per subsystem over the boot: one tick per line on a span from the first line to the last."""
-    axis = boot_axis(m)
-    if axis is None:
+    if (axis := boot_axis(m)) is None:
         return None
     xmax = axis[0]
     rows = [(name, [e.t for e in lines if e.t < xmax]) for name, lines in subsystem_lines(m.br).items()]
@@ -3690,9 +3597,7 @@ def time_unit(span: float) -> tuple[float, str]:
 def after_span(m: Model) -> tuple[float, float] | None:
     """Return the after-boot chart's span, from the burst's end to the last line, or None when it has no line."""
     lines, burst = after_lines(m), boot_burst(m)
-    if not lines or burst is None:
-        return None
-    return burst, max(e.t for e in lines)
+    return (burst, max(e.t for e in lines)) if lines and burst is not None else None
 
 
 def after_suspends(m: Model) -> list[float]:
@@ -3705,8 +3610,7 @@ def fig_after(m: Model) -> str | None:
 
     A dashed line marks each suspend, as dmesg time stops while the system sleeps.
     """
-    span = after_span(m)
-    if span is None:
+    if (span := after_span(m)) is None:
         return None
     plt = _mpl()
     div, unit = time_unit(span[1] - span[0])
@@ -3873,8 +3777,7 @@ def fig_journal(m: Model) -> str | None:
     A row's tick marks each second with a matched entry. The current boot is timed from the kernel start when it
     is estimated, else by the wall clock; the previous boot by the wall clock.
     """
-    boots = journal_boots(m)
-    if not boots:
+    if not (boots := journal_boots(m)):
         return None
     plt = _mpl()
     rows = journal_timeline_rows(m)
@@ -4047,9 +3950,7 @@ def link(key: str, text: str) -> str:
 
 def pref(key: str) -> str:
     """Return a linked "p. N" reference to an anchor; a brief names the full report for one it leaves out."""
-    if not in_report(key):
-        return f"full{NBSP}report"
-    return link(key, f"p.{NBSP}{page_of(key)}")
+    return link(key, f"p.{NBSP}{page_of(key)}") if in_report(key) else f"full{NBSP}report"
 
 
 REF_KEYS = re.compile(r"\{p:((?:sec|sub|card|fig|tab|ryv|act)-[\w.-]+)\}")  # the anchors the report defines
@@ -4567,17 +4468,14 @@ def chip(text: str) -> Table:
     fill, ink, border = CHIP_COLORS[text]
     box = Table([[Paragraph(f'<font color="{ink.hexval()}">{text}</font>', sty_chip)]], colWidths=[chip_width(text)],
                 rowHeights=[11])  # fmt: skip
-    box.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), fill),
-                ("BOX", (0, 0), (-1, -1), 0.7, border),
-                *ZERO_PAD[:2],
-                ("TOPPADDING", (0, 0), (-1, -1), 1.4),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]
-        )
-    )
+    commands = [
+        ("BACKGROUND", (0, 0), (-1, -1), fill),
+        ("BOX", (0, 0), (-1, -1), 0.7, border),
+        *ZERO_PAD[:2],
+        ("TOPPADDING", (0, 0), (-1, -1), 1.4),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]
+    box.setStyle(TableStyle(commands))
     return box
 
 
@@ -4600,17 +4498,14 @@ def card(f: Finding) -> KeepTogether:
     shown = [Paragraph(mono_markup(q, FW - 72, TD_MONO), sty_td_mono) for q in quotes[:EVIDENCE_LINES]]
     if len(quotes) > EVIDENCE_LINES:
         shown.append(Paragraph(f"… and {len(quotes) - EVIDENCE_LINES:,} more (Lines row)", sty_label))
-    counts = ", ".join(
-        plural(n, *noun)
-        for n, noun in (
-            (f.count("journal", "current"), ("current-boot journal entry", "current-boot journal entries")),
-            (f.count("journal", "previous"), ("previous-boot journal entry", "previous-boot journal entries")),
-            (f.count("dmesg"), ("dmesg line",)),
-            (f.count("inxi"), ("inxi line",)),
-            (f.count("verify"), ("ry-verify record",)),
-        )
-        if n
+    kinds = (
+        (f.count("journal", "current"), ("current-boot journal entry", "current-boot journal entries")),
+        (f.count("journal", "previous"), ("previous-boot journal entry", "previous-boot journal entries")),
+        (f.count("dmesg"), ("dmesg line",)),
+        (f.count("inxi"), ("inxi line",)),
+        (f.count("verify"), ("ry-verify record",)),
     )
+    counts = ", ".join(plural(n, *noun) for n, noun in kinds if n)
     lines = escape(f.lines()) + (f' <font color="{PALETTE["mute"]}">({counts})</font>' if counts else "")
     data: list[list[object]] = [[header, ""], [Paragraph(meta, sty_card_meta), ""]]
     if shown:
@@ -4693,24 +4588,17 @@ def svg_drawing(name: str) -> Drawing:
 
 def cover_strip(m: Model) -> list[Flowable]:
     """Return the cover's uptime strip with a caption naming what it draws; nothing when no phase or finding shows."""
-    name = STATE.charts.get("uptime")
-    if name is None:
+    if (name := STATE.charts.get("uptime")) is None:
         return []
     marks = uptime_captures(m)
-    drawn = [
-        what
-        for what, shown in (
-            ("the boot phases", boot_phases(m)),
-            (
-                "where each bug-report finding that calls for action first shows"
-                + (" (findings close together share a label)" if STATE.uptime_shared else ""),
-                uptime_events(m),
-            ),
-            ("the ry-verify run (diamond)", "ry-verify" in marks),
-            ("the bug report (square)", "bug report" in marks),
-        )
-        if shown
-    ]
+    shared = " (findings close together share a label)" if STATE.uptime_shared else ""
+    parts = (
+        ("the boot phases", boot_phases(m)),
+        (f"where each bug-report finding that calls for action first shows{shared}", uptime_events(m)),
+        ("the ry-verify run (diamond)", "ry-verify" in marks),
+        ("the bug report (square)", "bug report" in marks),
+    )
+    drawn = [what for what, shown in parts if shown]
     caption = f"Uptime: {series(drawn)}; seconds since kernel start on a log scale."
     return [Spacer(1, 10), svg_drawing(name), Paragraph(fmt(prose(caption), sty_caption), sty_cover_caption)]
 
@@ -4736,27 +4624,22 @@ def code_block(label: str, lines: Sequence[str]) -> list[Flowable]:
     longest = max((stringWidth(line, "PlexM", CODE_SIZE) for line in lines), default=0)
     size = CODE_SIZE if longest <= CODE_ROOM - 1 else max(CODE_MIN_SIZE, CODE_SIZE * (CODE_ROOM - 1) / longest)
     code = style("code-fit", parent=sty_code, fontSize=size, leading=size * 1.45)
-    rows = [
-        [Paragraph(escape(label), sty_code_label)],
-        *[[Paragraph(mono_markup(line, CODE_ROOM, size), code)] for line in lines],
-    ]
+    head = [Paragraph(escape(label), sty_code_label)]
+    rows = [head, *[[Paragraph(mono_markup(line, CODE_ROOM, size), code)] for line in lines]]
     block = Table(rows, colWidths=[FW], spaceAfter=4)
-    block.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), DARK),
-                ("BACKGROUND", (0, 1), (-1, -1), ZEBRA),
-                ("BOX", (0, 0), (-1, -1), 0.6, INK),
-                ("LEFTPADDING", (0, 0), (-1, -1), 7),
-                ("TOPPADDING", (0, 0), (-1, 0), 2.5),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 2.5),
-                ("TOPPADDING", (0, 1), (-1, -1), 1.6),
-                ("BOTTOMPADDING", (0, 1), (-1, -1), 1.6),
-                ("BOTTOMPADDING", (0, -1), (-1, -1), 5),
-                ("TOPPADDING", (0, 1), (-1, 1), 5),
-            ]
-        )
-    )
+    commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), DARK),
+        ("BACKGROUND", (0, 1), (-1, -1), ZEBRA),
+        ("BOX", (0, 0), (-1, -1), 0.6, INK),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, 0), 2.5),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 2.5),
+        ("TOPPADDING", (0, 1), (-1, -1), 1.6),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 1.6),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 5),
+        ("TOPPADDING", (0, 1), (-1, 1), 5),
+    ]
+    block.setStyle(TableStyle(commands))
     return [block]
 
 
@@ -4841,17 +4724,14 @@ def verdict_panel(m: Model) -> Table:
         Paragraph(fmt(text, sty_verdict), sty_verdict),
     ]
     panel = Table([["", body]], colWidths=[6, FW - 6])
-    panel.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (0, 0), INK),
-                ("BACKGROUND", (1, 0), (1, 0), ZEBRA),
-                ("LEFTPADDING", (1, 0), (1, 0), 10),
-                ("TOPPADDING", (0, 0), (-1, -1), 7),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
+    commands = [
+        ("BACKGROUND", (0, 0), (0, 0), INK),
+        ("BACKGROUND", (1, 0), (1, 0), ZEBRA),
+        ("LEFTPADDING", (1, 0), (1, 0), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]
+    panel.setStyle(TableStyle(commands))
     return panel
 
 
@@ -4884,12 +4764,8 @@ def kpi_strip(m: Model) -> Table:
     for name, g in groups:
         row0 += [Paragraph(name, sty_kpi_group), *[""] * (len(g) - 1)]
     value = kpi_style(values, width)
-    labels = [
-        MarkLabel(k, (LABEL_FONT, LABEL_SIZE, LABEL_LEADING), MUTE, centered=True)
-        if k in MARKED
-        else Paragraph(k, sty_kpi_label)
-        for k, _ in items
-    ]
+    face = (LABEL_FONT, LABEL_SIZE, LABEL_LEADING)
+    labels = [MarkLabel(k, face, MUTE, centered=True) if k in MARKED else Paragraph(k, sty_kpi_label) for k, _ in items]
     data = [row0, [Paragraph(v, value) for v in values], labels]
     strip = Table(data, colWidths=[width] * len(items), rowHeights=[13, 22, 12])
     commands: list[tuple[object, ...]] = [
@@ -4919,18 +4795,12 @@ def tile_rows(m: Model) -> list[tuple[str, str, str]]:
     checked = f"{len(ERROR_RULES)} classes checked" if m.br.journal else f"{in_dmesg} classes, dmesg only"
     if m.br.journal and unread:
         checked = f"{len(ERROR_RULES)} classes; {plural(unread, 'journal line')} unread"
-    tiles = [
-        (
-            "error classes",
-            plural(len(errors), "finding") if errors else "None seen",
-            ", ".join(f.fid for f in errors) if errors else checked,
-        )
-    ]
+    seen = (plural(len(errors), "finding"), ", ".join(f.fid for f in errors)) if errors else ("None seen", checked)
+    tiles = [("error classes", *seen)]
     if "Root mounted" in m.milestones:
         quiet = f"longest silence {secs(gap_seconds(*m.quiet_gap))}" if m.quiet_gap else "dmesg"
         tiles.append(("boot to root mount", secs(m.milestones["Root mounted"]), quiet))
-    failed = unit_failures(m)
-    if failed is None:
+    if (failed := unit_failures(m)) is None:
         tiles.append(("unit failures", "—", no_journal(m)))
     elif "current" in unread_boots(m):
         tiles.append(("unit failures", "—", "current boot not read"))
@@ -4939,11 +4809,9 @@ def tile_rows(m: Model) -> list[tuple[str, str, str]]:
         owners = ", ".join(sorted(dict.fromkeys(fid for fid in current if fid), key=id_order))
         tiles.append(("unit failures", f"{len(current):,}", f"current boot · {owners}" if owners else "current boot"))
     if "vram" in d:
-        tiles.append(
-            ("GPU memory", f"{int(d['vram']):,} MiB", f"VRAM · GTT {int(d['gtt']):,} MiB" if "gtt" in d else "VRAM")
-        )
-    temps = sensor_temps(d.get("temperatures", ""))
-    if temps:
+        gtt = f"VRAM · GTT {int(d['gtt']):,} MiB" if "gtt" in d else "VRAM"
+        tiles.append(("GPU memory", f"{int(d['vram']):,} MiB", gtt))
+    if temps := sensor_temps(d.get("temperatures", "")):
         tiles.append(("temperatures", temps[0], " · ".join(temps[1:3])))
     return tiles
 
@@ -4959,18 +4827,15 @@ def health_tiles(m: Model) -> Table:
         for c, r, e in tile_rows(m)
     ]
     tiles = Table([cells], colWidths=[FW / len(cells)] * len(cells))
-    tiles.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (0, 0), (-1, 0), 2.0, INK),
-                ("LINEBEFORE", (1, 0), (-1, -1), HAIR, RULE),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ]
-        )
-    )
+    commands = [
+        ("LINEABOVE", (0, 0), (-1, 0), 2.0, INK),
+        ("LINEBEFORE", (1, 0), (-1, -1), HAIR, RULE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]
+    tiles.setStyle(TableStyle(commands))
     return tiles
 
 
@@ -5041,21 +4906,16 @@ def toc_side() -> list[Flowable]:
         side += [Paragraph("Figures", sty_side_head), fig_list, Spacer(1, 14)]
     side.append(Paragraph("How to read this report", sty_side_head))
     side += [Paragraph(fmt(g, sty_guide), sty_guide) for g in READING_GUIDE]
-    scale = Table(
+    levels = [
         [
-            [
-                MarkLabel(k, LEVEL_FACE, INK) if k in MARKED else Paragraph(k, sty_level),
-                Paragraph(fmt(v, sty_level_meaning), sty_level_meaning),
-            ]
-            for k, v in SEVERITY_SCALE
-        ],
-        colWidths=[44, width - 44],
-    )
-    scale.setStyle(
-        TableStyle(
-            [*ZERO_PAD[:2], *padding, ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEBELOW", (0, 0), (-1, -2), HAIR, RULE)]
-        )
-    )
+            MarkLabel(k, LEVEL_FACE, INK) if k in MARKED else Paragraph(k, sty_level),
+            Paragraph(fmt(v, sty_level_meaning), sty_level_meaning),
+        ]
+        for k, v in SEVERITY_SCALE
+    ]
+    scale = Table(levels, colWidths=[44, width - 44])
+    grid = [*ZERO_PAD[:2], *padding, ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEBELOW", (0, 0), (-1, -2), HAIR, RULE)]
+    scale.setStyle(TableStyle(grid))
     return [*side, Spacer(1, 10), Paragraph("Severity levels", sty_side_head), scale]
 
 
@@ -5066,17 +4926,14 @@ def toc(m: Model) -> Table:
         rest = "The full report adds system health, the boot, dmesg, the journal, ry-verify, and the appendices."
         sections += [Spacer(1, 8), Paragraph(rest, sty_guide)]
     outer = Table([[sections, toc_side()]], colWidths=[TOC_W, FW - TOC_W])
-    outer.setStyle(
-        TableStyle(
-            [
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                *ZERO_PAD,
-                ("RIGHTPADDING", (0, 0), (0, 0), TOC_GAP),
-                ("LEFTPADDING", (1, 0), (1, 0), TOC_GAP),
-                ("LINEBEFORE", (1, 0), (1, 0), HAIR, RULE),
-            ]
-        )
-    )
+    commands = [
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        *ZERO_PAD,
+        ("RIGHTPADDING", (0, 0), (0, 0), TOC_GAP),
+        ("LEFTPADDING", (1, 0), (1, 0), TOC_GAP),
+        ("LINEBEFORE", (1, 0), (1, 0), HAIR, RULE),
+    ]
+    outer.setStyle(TableStyle(commands))
     return outer
 
 
@@ -5181,8 +5038,7 @@ def verify_fact(m: Model) -> str:
         f"ry-verify {lit(vj.meta('version'))}: profile {lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; {result}"
     )
     ryv += "".join(f"; {reason.fact}" for reason in m.foreign)
-    preamble = [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]
-    if preamble:
+    if preamble := [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]:
         logged = Counter(i.status for i in preamble)
         counts = ", ".join(f"{logged[s]} {s}" for s in ("FAIL", "ERR", "WARN") if logged[s])
         refs = f"VJ {ranges([i.no for i in preamble], LINE_RUNS)}"
@@ -5273,8 +5129,7 @@ def compare_day(m: Model) -> str:
 def _story_summary(m: Model) -> list[Flowable]:
     """Return Section 1: key facts and the register of findings that call for action; the checklist is on the cover."""
     out: list[Flowable] = [HPara("sec-1"), HPara("sub-1.1"), *bullet_paragraphs(key_facts(m)), HPara("sub-1.2")]
-    acting = [f for f in m.findings if f.severity != "INFO"]
-    if acting:
+    if acting := [f for f in m.findings if f.severity != "INFO"]:
         journal = any(f.count("journal") for f in acting)  # without journal evidence, Cur. and Prev. are left out
         face, change = (TD_FONT, TD_SIZE, TD_LEADING), changes(m)
         rows = [
@@ -5292,8 +5147,7 @@ def _story_summary(m: Model) -> list[Flowable]:
         out.append(para("No finding calls for action."))
     if STATE.compare is not None:
         out.append(para(compare_text(m)))
-    info = sum(1 for f in m.findings if f.severity == "INFO")
-    if info:
+    if info := sum(1 for f in m.findings if f.severity == "INFO"):
         out.append(para(f"{{s:sec-A}} explains {plural(info, 'INFO finding')}."))
     return out
 
@@ -5320,34 +5174,19 @@ def inputs_table(m: Model) -> list[Flowable]:
     vj = m.vj
     br_secs = ", ".join(SECTION_LABELS[n] for n in SECTION_TITLES.values() if n in m.br.sections)
     phases = ", ".join(p for p in ("static", "runtime") if any(i.phase == p for i in vj.items))
+    br_text = f"Sections found: {br_secs}; {plural(len(m.br.packages), 'package')} listed"
+    vj_text = (
+        f"{plural(len(vj.records), 'record')}; ry-verify {lit(vj.meta('version'))}, profile "
+        f"{lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; phases: {phases or 'none'}"
+    )
     rows: list[list[object]] = [
-        [
-            f"`{lit(file_name(m.br.path))}`",
-            f"{len(m.br.raw):,}",
-            f"{len(m.br.lines):,}",
-            f"Sections found: {br_secs}; {plural(len(m.br.packages), 'package')} listed",
-        ],
+        [f"`{lit(file_name(m.br.path))}`", f"{len(m.br.raw):,}", f"{len(m.br.lines):,}", br_text],
         [Paragraph("SHA256", sty_label), Paragraph(hashlib.sha256(m.br.raw).hexdigest(), sty_td_mono), "", ""],
-        [
-            f"`{lit(file_name(vj.path))}`",
-            f"{len(vj.raw):,}",
-            f"{len(text_lines(vj.raw)):,}",
-            (
-                f"{plural(len(vj.records), 'record')}; ry-verify {lit(vj.meta('version'))}, profile "
-                f"{lit(vj.meta('profile'))}, mode {lit(vj.meta('mode'))}; phases: {phases or 'none'}"
-            ),
-        ],
+        [f"`{lit(file_name(vj.path))}`", f"{len(vj.raw):,}", f"{len(text_lines(vj.raw)):,}", vj_text],
         [Paragraph("SHA256", sty_label), Paragraph(hashlib.sha256(vj.raw).hexdigest(), sty_td_mono), "", ""],
     ]
-    spans = [((1, 2), (3, 2)), ((1, 4), (3, 4))]
-    return table(
-        ["File", "Bytes", "Lines", "Content"],
-        rows,
-        [172, 46, 38, 256],
-        title="Input files, sizes, and SHA256",
-        right=(1, 2),
-        spans=spans,
-    )
+    head, spans = ["File", "Bytes", "Lines", "Content"], [((1, 2), (3, 2)), ((1, 4), (3, 4))]
+    return table(head, rows, [172, 46, 38, 256], title="Input files, sizes, and SHA256", right=(1, 2), spans=spans)
 
 
 # Appendix B.3: how the report reads its inputs; the last note is on the failure keywords, which the README lists.
@@ -5427,8 +5266,7 @@ def timeline_rows(m: Model) -> list[list[str]]:
             since = (when - dt.datetime(1970, 1, 1)).total_seconds() if when else 0.0
         return (group, since)
 
-    prev = [e for e in m.br.journal if e.boot == "previous"]
-    if prev:
+    if prev := [e for e in m.br.journal if e.boot == "previous"]:
         first = min(e.when for e in prev)
         events.append((order(0, first), ["Previous boot, journal", journal_span(prev), "—"]))
     if m.kernel_start:
@@ -5531,8 +5369,7 @@ def subsystem_table(m: Model) -> tuple[list[str], list[list[object]], list[float
 
 def pause_rows(m: Model) -> list[list[object]]:
     """Return the longest pauses in dmesg during the boot's burst, in time order, with the lines around each."""
-    burst = boot_burst(m)
-    if burst is None:
+    if (burst := boot_burst(m)) is None:
         return []
     lines = [e for e in m.br.dmesg if e.t <= burst]
     gaps = [(b.t - a.t, a, b) for a, b in itertools.pairwise(lines) if b.t - a.t >= PAUSE_MIN]
@@ -5556,8 +5393,7 @@ def subsystems_caption(m: Model) -> str:
         "One tick per dmesg line; a bar spans each subsystem's first to last line, the lines drawn beside its name; "
         f"rows follow the first line{', Other last' if OTHER in drawn else ''}."
     )
-    outside = sum(1 for e in m.br.dmesg if axis and e.t >= axis[0])
-    if outside:
+    if outside := sum(1 for e in m.br.dmesg if axis and e.t >= axis[0]):
         verb = "falls" if outside == 1 else "fall"
         text += f" {plural(outside, 'later line')} {verb} outside the chart; {section_ref('sub-6.1')} counts all."
     return text
@@ -5565,8 +5401,7 @@ def subsystems_caption(m: Model) -> str:
 
 def boot_caption(m: Model) -> str:
     """Return the boot chart's caption, naming what the chart shows and what it leaves to the timeline table."""
-    axis = boot_axis(m)
-    if axis is None:
+    if (axis := boot_axis(m)) is None:
         return ""
     xmax, drawn = axis
     parts = ["the boot phases"] if any(a < xmax for _, a, _ in boot_phases(m)) else []
@@ -5577,8 +5412,7 @@ def boot_caption(m: Model) -> str:
     if drawn and m.kernel_start:
         text += f" Capture points use the kernel-start estimate (±{secs(m.kernel_start[1])})."
     text += captures_left(m, drawn)
-    outside = sum(1 for e in m.br.dmesg if e.t >= xmax)
-    if outside:
+    if outside := sum(1 for e in m.br.dmesg if e.t >= xmax):
         text += f" {plural(outside, 'later dmesg line')} {'falls' if outside == 1 else 'fall'} outside the chart."
     return text
 
@@ -5710,23 +5544,13 @@ def _story_boot(m: Model) -> list[Flowable]:
     out.append(HPara("sub-5.2"))
     if boot_axis(m) is not None and not boot_phases(m):
         out.append(para("dmesg holds no milestone that bounds a boot phase."))
-    out += table(
-        ["Event", "Wall clock (local)", "Since kernel start", "Step"],
-        timeline_rows(m),
-        [160, 196, 82, 74],
-        title="Boot and capture timeline",
-        right=(2, 3),
-    )
+    head = ["Event", "Wall clock (local)", "Since kernel start", "Step"]
+    out += table(head, timeline_rows(m), [160, 196, 82, 74], title="Boot and capture timeline", right=(2, 3))
     out.append(HPara("sub-5.3"))
     if pauses := pause_rows(m):
-        out += table(
-            ["Pause", "From – to", "Last line before", "First line after"],
-            pauses,
-            [46, 76, 195, 195],
-            title="Longest dmesg pauses during boot, in time order",
-            mono=(2, 3),
-            right=(0,),
-        )
+        head = ["Pause", "From – to", "Last line before", "First line after"]
+        title = "Longest dmesg pauses during boot, in time order"
+        out += table(head, pauses, [46, 76, 195, 195], title=title, mono=(2, 3), right=(0,))
     elif boot_axis(m):
         out.append(para(f"No pause in dmesg during the boot reaches {PAUSE_MIN:.2f} s."))
     else:
@@ -5749,8 +5573,7 @@ def _story_findings(m: Model) -> list[Flowable]:
     else:
         out.append(para(f"No bug-report finding calls for action{where}."))
     out.append(HPara("sub-2.2"))
-    shown = [f for f in m.others if f.severity in ("WATCH", "SETTING")]
-    if not shown:
+    if not (shown := [f for f in m.others if f.severity in ("WATCH", "SETTING")]):
         return [*out, para("No watch item or setting appears in the logs.")]
     rows = [
         [
@@ -5778,9 +5601,8 @@ def _story_explained(m: Model) -> list[Flowable]:
 def failure_rows(m: Model) -> tuple[list[list[object]], dict[int, str]]:
     """Return the records counted as FAIL, GEN_FAIL, or WARN, under a heading row per phase and section, in log order.
 
-    A section lists its first VERIFY_RECORDS rows, where a template row holds several records, and a row that counts
-    the records past them. The second value maps each heading row to its markup; each heading anchors its section's
-    finding.
+    A section lists its first VERIFY_RECORDS rows, where a template row holds several records, and a row that counts the
+    records past them. The second value maps each heading row to its markup; each heading anchors its section's finding.
     """
     groups: dict[tuple[str, str], list[VerifyItem]] = {}
     for i in m.vj.items:
@@ -5839,8 +5661,7 @@ def record_rows(items: Sequence[VerifyItem]) -> list[tuple[list[VerifyItem], str
 
 def verify_caption(m: Model) -> str:
     """Return the ry-verify chart's caption, naming the phases drawn and the preamble records left out."""
-    phases = [p for p in ("static", "runtime") if any(s[0] == p for s in m.verify_sections)]
-    if not phases:
+    if not (phases := [p for p in ("static", "runtime") if any(s[0] == p for s in m.verify_sections)]):
         return ""  # no figure to caption
     where = "static phase above, runtime below, on one scale" if len(phases) > 1 else f"{phases[0]} phase only"
     before = Counter(i.counted for i in m.vj.items if i.phase == "preamble")
@@ -5878,19 +5699,12 @@ def _story_verify(m: Model) -> list[Flowable]:
         if any(row[0] == "…" for row in rows):  # a section cut after VERIFY_RECORDS rows
             lead = f"A section lists its first {VERIFY_RECORDS} rows; a last row counts the records past them by line."
             out.append(para(lead, sty_lead))
-        out += table(
-            ["Record", "Status", "Text"],
-            rows,
-            [50, 44, 418],
-            title="ry-verify failures and warnings, by section",
-            mono=(2,),
-            groups=heads,
-        )
+        title = "ry-verify failures and warnings, by section"
+        out += table(["Record", "Status", "Text"], rows, [50, 44, 418], title=title, mono=(2,), groups=heads)
     else:
         out.append(para("No ry-verify check reported FAIL or WARN."))
     out.append(HPara("sub-8.3"))
-    infos = [i for i in m.vj.items if i.status == "INFO"]
-    if not infos:
+    if not (infos := [i for i in m.vj.items if i.status == "INFO"]):
         return [*out, para("ry-verify logged no INFO record.")]
     notes: list[list[object]] = [
         [f"VJ {i.no}", lit(section_title(i.section)), quote(i.text)] for i in infos[:NOTE_ROWS]
@@ -5899,19 +5713,14 @@ def _story_verify(m: Model) -> list[Flowable]:
         notes.append(
             ["…", "", f"{plural(len(rest), 'more INFO record')}: VJ {ranges([i.no for i in rest], LINE_RUNS)}"]
         )
-        out.append(
-            para(
-                f"ry-verify logged {plural(len(infos), 'INFO record')}; the table lists the first {NOTE_ROWS}.",
-                sty_lead,
-            )
-        )
+        lead = f"ry-verify logged {plural(len(infos), 'INFO record')}; the table lists the first {NOTE_ROWS}."
+        out.append(para(lead, sty_lead))
     return out + table(["Record", "Section", "Text"], notes, [50, 110, 352], title="ry-verify notes", mono=(2,))
 
 
 def journal_caption(m: Model) -> str:
     """Return the journal timeline's caption: each panel's bar width and clock, and the tick rows a rule matches."""
-    boots = journal_boots(m)
-    if not boots:
+    if not (boots := journal_boots(m)):
         return ""  # no figure to caption
     panels = {boot: journal_bars(*journal_times(m, boot)) for boot in boots}
     unit = journal_unit(m, "current")
@@ -5921,11 +5730,8 @@ def journal_caption(m: Model) -> str:
     text = f"Journal entries per {widths}{', log scale' if peak >= JOURNAL_LOG else ''}"
     if not journal_timeline_rows(m):
         return text + "."
-    kinds = [
-        k
-        for k, found in (("finding", m.findings), ("message class", m.others))
-        if any(f.count("journal") for f in found)
-    ]
+    groups = (("finding", m.findings), ("message class", m.others))
+    kinds = [k for k, found in groups if any(f.count("journal") for f in found)]
     return text + f"; below, a tick per second with a rule-matched entry, one row per {' or '.join(kinds)}."
 
 
@@ -6362,8 +6168,7 @@ def process_rows(m: Model) -> list[list[object]]:
     rows: list[list[object]] = []
     for name, cur, prev in procs[:PROCESS_ROWS]:
         rows.append([quote(name), f"{cur:,}", f"{prev:,}", f"{keyword[name]:,}", id_list(by_process.get(name, []))])
-    rest = procs[PROCESS_ROWS:]
-    if rest:
+    if rest := procs[PROCESS_ROWS:]:
         cur, prev = sum(r[1] for r in rest), sum(r[2] for r in rest)
         label = Paragraph(escape(plural(len(rest), "more process", "more processes")), sty_td)
         hits = sum(keyword[name] for name, _, _ in rest)
@@ -6415,8 +6220,7 @@ def cross_checks(m: Model) -> list[list[str]]:
     """
     out = []
     for phase in ("static", "runtime"):
-        res = m.vj.phase_results.get(phase)
-        if res is None:
+        if (res := m.vj.phase_results.get(phase)) is None:
             continue
         sections = [s[2] for s in m.verify_sections if s[0] == phase]
         found = {k: sum(s[k] for s in sections) for k in ("OK", "FAIL", "WARN", "GEN_FAIL")}
@@ -6766,12 +6570,7 @@ def page_sections(total: int) -> dict[int, str]:
 def render_figures(m: Model) -> int:
     """Render every figure the model supports; return how many were drawn."""
     STATE.charts = boot_figures(m)
-    for key, draw in (
-        ("uptime", fig_uptime),
-        ("after", fig_after),
-        ("journal", fig_journal),
-        ("verify", fig_verify),
-    ):
+    for key, draw in (("uptime", fig_uptime), ("after", fig_after), ("journal", fig_journal), ("verify", fig_verify)):
         STATE.charts[key] = draw(m)
     return sum(1 for v in STATE.charts.values() if v)
 
@@ -6791,22 +6590,11 @@ def layout(m: Model, log: Callable[[str], None]) -> bytes:
         doc.build(story(m))
         total = doc.page
         sections = page_sections(total)
-        stable = (
-            STATE.anchors == STATE.ref
-            and total == STATE.total
-            and sections == STATE.page_section
-            and STATE.figures == STATE.fig_ref
-        )
-        STATE.ref, STATE.total, STATE.page_section, STATE.fig_ref = (
-            dict(STATE.anchors),
-            total,
-            sections,
-            list(STATE.figures),
-        )
-        log(
-            f"layout pass {n}: {plural(total, 'page')}, {plural(len(STATE.anchors), 'anchor')}, "
-            f"{'settled' if stable else 'not settled'}"
-        )
+        now = (dict(STATE.anchors), total, sections, list(STATE.figures))
+        stable = now == (STATE.ref, STATE.total, STATE.page_section, STATE.fig_ref)
+        STATE.ref, STATE.total, STATE.page_section, STATE.fig_ref = now
+        settled = "settled" if stable else "not settled"
+        log(f"layout pass {n}: {plural(total, 'page')}, {plural(len(STATE.anchors), 'anchor')}, {settled}")
         if stable and n > 1:
             break
     else:
@@ -6825,8 +6613,7 @@ def stated_zone(date_text: str) -> dt.tzinfo | None:
 
     An offset of a day or more, or of 60 minutes or more past the hour, is no zone's and counts as none.
     """
-    offset = re.search(r"(?:(?<=:\d\d)|(?<=\s)|^)([+-])(\d\d)(?::?(\d\d))?(?=\s|$)", date_text)
-    if offset:
+    if offset := re.search(r"(?:(?<=:\d\d)|(?<=\s)|^)([+-])(\d\d)(?::?(\d\d))?(?=\s|$)", date_text):
         hours, minutes = int(offset.group(2)), int(offset.group(3) or 0)
         if hours > 23 or minutes > 59:
             return None
@@ -6841,8 +6628,7 @@ def source_epoch(m: Model) -> int:
     no offset, so the ry-verify log's offset stands in when both fall on the same day, and UTC otherwise.
     """
     if m.br.captured:
-        zone = stated_zone(m.br.date_text)
-        if zone is None:
+        if (zone := stated_zone(m.br.date_text)) is None:
             same_day = m.vj.started and m.vj.started.date() == m.br.captured.date()
             zone = m.vj.started.tzinfo if same_day and m.vj.started else dt.UTC
         when = m.br.captured.replace(tzinfo=zone)
@@ -7287,8 +7073,7 @@ def run(args: argparse.Namespace) -> int:
 
 def print_path(path: Path) -> None:
     """Print a path on stdout as its bytes, so a name that is not UTF-8 prints as written; a closed stdout loses it."""
-    stream = sys.stdout
-    if stream is None:
+    if (stream := sys.stdout) is None:
         return
     try:
         if (raw := getattr(stream, "buffer", None)) is None:  # a text stream without bytes below it

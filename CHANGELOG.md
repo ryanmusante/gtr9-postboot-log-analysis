@@ -3,6 +3,18 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.16.1
+------
+
+  - build: build_report.py is 215 lines shorter (7,095): tests bind their
+    value in place, long calls name their parts first, and three tables pack
+    their pairs
+  - build: the PDF, the JSON summary, the messages, and the exit codes are
+    unchanged
+  - lint: ruff.toml drops the ISC001 ignore, which ruff 0.17.5 raises nowhere
+    in the script
+
+
 7.16.0
 ------
 
