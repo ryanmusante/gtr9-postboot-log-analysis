@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.18.0"
+__version__ = "7.19.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -343,6 +343,7 @@ class BugReport:
     inxi: list[tuple[int, str]]  # logical lines: (first line number, wrapped parts joined)
     inxi_parts: dict[int, list[tuple[int, str]]]  # per logical line, by its first line: (line number, part as joined)
     dmesg: list[DmesgEntry]
+    dmesg_unparsed: list[int]  # dmesg-section lines before the first time stamp, which continue no message
     journal: list[JournalEntry]
     journal_unparsed: list[int]  # journal-section lines that are neither entries, continuations, nor markers
     packages: list[int]  # lines of the package list that name a repository/package and a version
@@ -713,6 +714,27 @@ def inxi_logical_lines(
     return [(n, " ".join(part for _, part in joined)) for n, joined in parts.items()], parts
 
 
+def parse_dmesg(lines: Iterable[tuple[int, str]]) -> tuple[list[DmesgEntry], list[int]]:
+    """Return the dmesg messages and the lines that parsed as nothing.
+
+    A line without a time stamp continues the message above it, each message's at once. One that comes before the
+    first stamp has no message to continue: a ring buffer printed without stamps is unread, never empty.
+    """
+    entries: list[DmesgEntry] = []
+    unparsed: list[int] = []
+    more: dict[int, list[str]] = {}  # continuation lines per entry index, joined once
+    for n, line in lines:
+        if m := DMESG_LINE.match(line):
+            entries.append(DmesgEntry(n, float(m.group("t")), m.group("msg")))
+        elif entries and line.strip():
+            more.setdefault(len(entries) - 1, []).append(line.strip())
+        elif line.strip():
+            unparsed.append(n)
+    for i, parts in more.items():
+        entries[i].text = " ".join([entries[i].text, *parts])
+    return entries, unparsed
+
+
 PACKAGE_LINE = re.compile(r"\S[^\s/]*/\S+ \S")  # a package row; splitting the name at one slash reads it in one pass
 
 
@@ -742,15 +764,7 @@ def parse_bugreport(path: Path, fallback: dt.datetime | None = None) -> BugRepor
     first, last = sections["header"]
     head = dict(ln.split(": ", 1) for ln in lines[first - 1 : last] if ": " in ln)
     captured = parse_capture_date(head.get("Date", ""))
-    dmesg: list[DmesgEntry] = []
-    more: dict[int, list[str]] = {}  # continuation lines per entry index, joined once
-    for n, line in section_slice(lines, sections, "dmesg"):
-        if m := DMESG_LINE.match(line):
-            dmesg.append(DmesgEntry(n, float(m.group("t")), m.group("msg")))
-        elif dmesg and line.strip():
-            more.setdefault(len(dmesg) - 1, []).append(line.strip())
-    for i, parts in more.items():
-        dmesg[i].text = " ".join([dmesg[i].text, *parts])
+    dmesg, unstamped = parse_dmesg(section_slice(lines, sections, "dmesg"))
     reference = captured or fallback or dt.datetime(1972, 12, 31)  # a leap year that holds every journal date
     journal, unparsed = parse_journal(section_slice(lines, sections, "journal-current"), "current", reference)
     previous, unparsed_prev = parse_journal(section_slice(lines, sections, "journal-previous"), "previous", reference)
@@ -760,9 +774,8 @@ def parse_bugreport(path: Path, fallback: dt.datetime | None = None) -> BugRepor
     inxi, inxi_parts = inxi_logical_lines(section_slice(lines, sections, "inxi"))
     date = clip(sanitize(head.get("Date", "")), QUOTE_LIMIT)  # the cover prints a line no layout fits
     uname, cmdline = head.get("uname", ""), head.get("cmdline", "")
-    return BugReport(
-        path, raw, lines, sections, date, captured, uname, cmdline, inxi, inxi_parts, dmesg, journal, unparsed, packages
-    )
+    return BugReport(path, raw, lines, sections, date, captured, uname, cmdline, inxi, inxi_parts, dmesg, unstamped,
+                     journal, unparsed, packages)  # fmt: skip
 
 
 # ERR is ry-verify's fatal-check level; it counts as FAIL.
@@ -1173,7 +1186,8 @@ RULES = (
       (r'host bridge windows from ACPI; if necessary, use "pci=(?:nocrs|use_crs)"',),
       "Printed on every x86 boot with ACPI; the closing request to report a bug is part of the standard message."),
     R("mitigations", "CPU vulnerability mitigations", "CPU / security", "NOTE", ("dmesg",),
-      ((r"(?i)\b(?:spectre|meltdown|mmio stale data|retbleed|speculative store bypass)\b.*"
+      ((r"(?i)\b(?:spectre|meltdown|mmio stale data|retbleed|speculative store bypass|register file data sampling"
+       r"|transient scheduler attacks|speculative return stack overflow)\b.*"
        r"(?:mitigation|vulnerable|not affected|disabled)"),
        r"\b(?:MDS|TAA|SRBDS|GDS|SRSO|RFDS|ITS|TSA|VMSCAPE|L1TF|SSB|BHI):", r"(?i)\bmitigations?: "),
       "Posture lines printed on every boot; inxi's Vulnerabilities block summarizes them."),
@@ -1482,14 +1496,17 @@ def secs_span(a: float, b: float) -> str:
     return f"{a:,.2f}–{b:,.2f} s"
 
 
+def not_read(lines: Sequence[int], log: str) -> str:
+    """Return how many lines of a log the parser could not read, as "3 journal lines could not be read"."""
+    return f"{len(lines):,}{NBSP}{log} {'line' if len(lines) == 1 else 'lines'} could not be read"
+
+
 def no_journal(m: Model) -> str:
     """Return how many journal lines the parser could not read, or "no journal entries" when it read every line.
 
     Callers ask for the second form only when the journal holds no entries.
     """
-    unread = len(m.br.journal_unparsed)
-    lines = "line" if unread == 1 else "lines"
-    return f"{unread:,}{NBSP}journal {lines} could not be read" if unread else "no journal entries"
+    return not_read(m.br.journal_unparsed, "journal") if m.br.journal_unparsed else "no journal entries"
 
 
 def unread_lines(m: Model, boot: str) -> int:
@@ -2512,7 +2529,7 @@ def unit_commands(units: Sequence[tuple[str, str, bool]]) -> list[str]:
         head = f"journalctl {'-b -1' if boot == 'previous' else '-b'} {'--user-unit' if user else '-u'} "
         cmds.append(head + unit_glob(name, COMMAND_WIDTH - len(head)))
     if len(units) > MAX_LISTED:
-        cmds.append(f"# {len(units) - MAX_LISTED} more: {section_ref('sub-7.6')}")
+        cmds.append(f"# {len(units) - MAX_LISTED:,} more: {section_ref('sub-7.6')}")
     return cmds
 
 
@@ -2607,16 +2624,20 @@ def failure_actions(m: Model) -> list[Action]:
     if dumps := sorted({int(pid) for f in cores for mt in f.matches for pid in CORE_PID.findall(mt.text)}):
         cmds = ["coredumpctl list", *[f"coredumpctl info {pid}" for pid in dumps[:MAX_LISTED]]]
         if len(dumps) > MAX_LISTED:
-            cmds.append(f"# {len(dumps) - MAX_LISTED} more: coredumpctl list names them all")
+            cmds.append(f"# {len(dumps) - MAX_LISTED:,} more: coredumpctl list names them all")
         why = f"{plural(len(dumps), 'process', 'processes')} dumped core"
         done = "The crashing program is identified" if len(dumps) == 1 else "The crashing programs are identified"
         title = "Inspect the core dump" if len(dumps) == 1 else "Inspect the core dumps"
         acts.append(Action("", title, why, cmds, done, fids(cores)))
     if units := failed_units(m):
         names, boots = list(dict.fromkeys(u[0] for u in units)), {u[1] for u in units}
-        where = "both boots" if len(boots) > 1 else f"the {boots.pop()} boot"
+        both = len(boots) > 1
+        where = "both boots" if both else f"the {boots.pop()} boot"
         failed = f"`{lit(names[0])}` failed" if len(names) == 1 else f"{plural(len(names), 'unit')} failed"
         why = f"{failed} in {where}"
+        if both and len(names) > 1:  # each boot's units: "in both boots" would say that every unit failed in both
+            cur, prev = (len({u[0] for u in units if u[1] == boot}) for boot in ("current", "previous"))
+            why = f"{plural(cur, 'unit')} failed in the current boot and {prev:,} in the previous"
         title = "Inspect the failed unit" if len(names) == 1 else "Inspect the failed units"
         owners = fids(f for f in m.findings if f.key == "unit-failed")
         acts.append(Action("", title, why, unit_commands(units), "No unit stays failed", owners))
@@ -3389,7 +3410,7 @@ def fig_uptime(m: Model) -> str | None:
     end to the last capture, the ry-verify run marked by a white diamond, the bug report by a white square; the IDs
     of the findings stand above their tick (uptime_labels()), stacked where two labels would meet.
     """
-    phases, events, marks = boot_phases(m), uptime_events(m), uptime_captures(m)
+    phases, events, marks = strip_phases(boot_phases(m)), uptime_events(m), uptime_captures(m)
     if not phases and not events:
         return None
     plt = _mpl()
@@ -3409,11 +3430,11 @@ def fig_uptime(m: Model) -> str | None:
     span = (math.log10(UPTIME_MIN), math.log10(xmax))
     labels, levels = uptime_labels(events, span, per)
     rows = max(levels, default=-1) + 1
-    shown, caps = strip_phases(phases), capture_labels(marks, span, per)
-    drop = captures_drop(caps, shown, per)  # rows the capture labels stand below the phase names: 0 or 1
+    caps = capture_labels(marks, span, per)
+    drop = captures_drop(caps, phases, per)  # rows the capture labels stand below the phase names: 0 or 1
     fig.set_size_inches(CW, 0.7 + 0.14 * (rows + drop))
     ax.set_ylim(-1.3 - 0.55 * drop, 0.75 + 0.55 * rows)
-    uptime_phases(fig, ax, shown)
+    uptime_phases(fig, ax, phases)
     if marks:
         ax.plot([phases[-1][2] if phases else UPTIME_MIN, max(marks.values())], [0, 0], color=C_MID, lw=0.9, zorder=1)
         look = {"mfc": "white", "mew": 0.8, "color": C_INK, "ls": "none", "clip_on": False, "zorder": 3}
@@ -4589,7 +4610,7 @@ def cover_strip(m: Model) -> list[Flowable]:
     marks = uptime_captures(m)
     shared = " (findings close together share a label)" if STATE.uptime_shared else ""
     parts = (
-        ("the boot phases", boot_phases(m)),
+        ("the boot phases", strip_phases(boot_phases(m))),
         (f"where each bug-report finding that calls for action first shows{shared}", uptime_events(m)),
         ("the ry-verify run (diamond)", "ry-verify" in marks),
         ("the bug report (square)", "bug report" in marks),
@@ -4787,10 +4808,12 @@ def tile_rows(m: Model) -> list[tuple[str, str, str]]:
     """Return the cover's system tiles (label, value, detail), each short enough for its box."""
     d, errors = m.facts, error_findings(m)
     in_dmesg = sum(1 for r in RULES if r.key in ERROR_RULES and "dmesg" in r.streams)
-    unread = len(m.br.journal_unparsed)
-    checked = f"{len(ERROR_RULES)} classes checked" if m.br.journal else f"{in_dmesg} classes, dmesg only"
-    if m.br.journal and unread:
-        checked = f"{len(ERROR_RULES)} classes; {plural(unread, 'journal line')} unread"
+    known = len(ERROR_RULES) if m.br.journal else in_dmesg
+    unread = {"dmesg": len(m.br.dmesg_unparsed), "journal": len(m.br.journal_unparsed) if m.br.journal else 0}
+    checked = f"{known} classes checked" if m.br.journal else f"{known} classes, dmesg only"
+    if logs := [log for log, n in unread.items() if n]:  # one log's unread lines by its name, both logs' as log lines
+        noun = f"{logs[0] if len(logs) == 1 else 'log'} line"
+        checked = f"{known} classes; {plural(sum(unread.values()), noun)} unread"
     seen = (plural(len(errors), "finding"), ", ".join(f.fid for f in errors)) if errors else ("None seen", checked)
     tiles = [("error classes", *seen)]
     if "Root mounted" in m.milestones:
@@ -5003,7 +5026,8 @@ def key_facts(m: Model) -> list[str]:
         journal += span + (f"; {no_journal(m)}" if m.br.journal_unparsed else "")
     else:
         journal = no_journal(m)
-    out.append(f"Logs: {plural(len(m.br.dmesg), 'dmesg line')}; {journal}.")
+    lost = f", {not_read(m.br.dmesg_unparsed, 'dmesg')}" if m.br.dmesg_unparsed else ""
+    out.append(f"Logs: {plural(len(m.br.dmesg), 'dmesg line')}{lost}; {journal}.")
     early = [(name.lower(), a, b) for name, a, b in boot_phases(m) if name != "Userspace"]
     phases = ", ".join(f"{name} {secs(gap_seconds(a, b))}" for name, a, b in early)
     boot = [phases] if phases else []
@@ -5036,7 +5060,7 @@ def verify_fact(m: Model) -> str:
     ryv += "".join(f"; {reason.fact}" for reason in m.foreign)
     if preamble := [i for i in vj.items if i.phase == "preamble" and i.counted in ("FAIL", "WARN")]:
         logged = Counter(i.status for i in preamble)
-        counts = ", ".join(f"{logged[s]} {s}" for s in ("FAIL", "ERR", "WARN") if logged[s])
+        counts = ", ".join(f"{logged[s]:,} {s}" for s in ("FAIL", "ERR", "WARN") if logged[s])
         refs = f"VJ {ranges([i.no for i in preamble], LINE_RUNS)}"
         ryv += f"; preamble: {counts} ({refs}, {{s:sub-8.2}})"
     return f"{ryv}."
@@ -5468,7 +5492,8 @@ def captures_left(m: Model, drawn: dict[str, float]) -> str:
 def _story_health(m: Model) -> list[Flowable]:
     """Return Section 4: the system health checks, then the lines each error class matched in each log."""
     rows = [[lit(check_), lit(result), lit(detail), lit(source)] for check_, result, detail, source in m.health]
-    unread = f"; {no_journal(m)}, so a journal count can fall short" if m.br.journal_unparsed else ""
+    logs = (("dmesg", m.br.dmesg_unparsed), ("journal", m.br.journal_unparsed))
+    unread = "".join(f"; {not_read(lines, log)}, so a {log} count can fall short" for log, lines in logs if lines)
     lead = f"Lines per error class and log; 0 means checked and clean, and a dash means not read or empty{unread}."
     return [
         CondPageBreak(SECTION_ROOM),
@@ -5485,8 +5510,8 @@ def _story_health(m: Model) -> list[Flowable]:
 def error_class_rows(m: Model) -> list[list[object]]:
     """Return one row per error class: the lines it matched in dmesg and in each journal boot, and its finding.
 
-    A dash marks a log the class does not read (core dumps are journal-only), an empty dmesg, or a journal boot without
-    entries.
+    A dash marks a log the class does not read (core dumps are journal-only), a dmesg of which no line was read, or a
+    journal boot without entries.
     """
     found, boots = {f.key: f for f in m.findings}, journal_boots(m)
     rows: list[list[object]] = []
@@ -5520,9 +5545,10 @@ def info_rows(m: Model) -> list[list[object]]:
 
 
 def no_boot(m: Model) -> str:
-    """Return why the report shows no boot: no dmesg line at all, or a ring buffer that has lost the boot."""
+    """Return why the report shows no boot: no dmesg line, none the parser read, or a ring buffer that lost the boot."""
     if not m.br.dmesg:
-        return "The bug report holds no dmesg line"
+        unread = m.br.dmesg_unparsed
+        return not_read(unread, "dmesg") if unread else "The bug report holds no dmesg line"
     return f"dmesg no longer holds the boot: its first line comes {secs(m.br.dmesg[0].t)} after the kernel start"
 
 
@@ -5642,7 +5668,7 @@ def record_rows(items: Sequence[VerifyItem]) -> list[tuple[list[VerifyItem], str
         for (_, shared), group in groups.items():
             if len(group) >= TEMPLATE_MIN:
                 varied = clip(", ".join(g[3 - side] for g in group), TEMPLATE_CLIP)  # the subjects, or the states
-                rows[group[0][0].no] = ([g[0] for g in group], f"{shared} ({len(group)}): {varied}")
+                rows[group[0][0].no] = ([g[0] for g in group], f"{shared} ({len(group):,}): {varied}")
                 taken |= {g[0].no for g in group}
     for p in parts:
         if p[0].no not in taken:
@@ -5752,7 +5778,7 @@ def after_absent(m: Model) -> str:
 def _story_dmesg(m: Model) -> list[Flowable]:
     """Return Section 6: the lines by subsystem and after the boot, the sources with failure keywords, and repeats."""
     if not m.br.dmesg:
-        return [CondPageBreak(SECTION_ROOM), HPara("sec-6"), para(f"{no_boot(m)}.")]  # the bug report holds no dmesg
+        return [CondPageBreak(SECTION_ROOM), HPara("sec-6"), para(f"{no_boot(m)}.")]  # no dmesg line was read
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-6"), HPara("sub-6.1"), para(dmesg_lead(m), sty_lead)]
     head, rows, widths = subsystem_table(m)
     out += table(head, rows, widths, title="dmesg lines by subsystem", right=tuple(range(1, len(head) - 1)))
@@ -5871,7 +5897,8 @@ def dmesg_lead(m: Model) -> str:
     if notes := sum(f.count("dmesg") for f in m.others if f.severity == "NOTE"):  # no table totals NOTE lines
         share = ("both" if matched == 2 else "all") if notes == matched else f"{notes:,}"
         rules += ", a NOTE rule" if matched == 1 else f", {share} of them a NOTE rule"
-    return f"{plural(len(d), 'dmesg line')}, {span} since the kernel start; {rules}."
+    lost = f"; {not_read(m.br.dmesg_unparsed, 'dmesg')}" if m.br.dmesg_unparsed else ""
+    return f"{plural(len(d), 'dmesg line')}, {span} since the kernel start; {rules}{lost}."
 
 
 def journal_overview_rows(m: Model) -> list[list[object]]:
@@ -6202,8 +6229,14 @@ def exit_check(vj: VerifyLog) -> list[list[str]]:
     return [["ry-verify's exit code fits its counts (1 with a FAIL or GEN_FAIL, else 0)", result]]
 
 
+def read_check(name: str, unparsed: Sequence[int]) -> list[str]:
+    """Return the check that the parser read every line of a log section: match, or its unread lines by number."""
+    read = f"differs: {len(unparsed):,}{NBSP}unread (BR {clip(ranges(unparsed), RANGES_CLIP)})" if unparsed else "match"
+    return [name, read]
+
+
 def cross_checks(m: Model) -> list[list[str]]:
-    """Return checks of the parse against the inputs: their totals, the logs' pairing, journal lines, kernel times.
+    """Return checks of the parse against the inputs: their totals, the logs' pairing, log lines read, kernel times.
 
     The last check counts the bug report's sections against those cachyos-bugreport.sh writes.
     """
@@ -6231,9 +6264,8 @@ def cross_checks(m: Model) -> list[list[str]]:
         result = "match" if all(found[k] == stated[k] for k in stated) else f"differs: records give {gave}"
         out.append([f"ry-verify records match its footer ({said})", result])
     out += exit_check(m.vj) + pairing_checks(m)
-    unparsed = m.br.journal_unparsed
-    read = f"differs: {len(unparsed):,}{NBSP}unread (BR {clip(ranges(unparsed), RANGES_CLIP)})" if unparsed else "match"
-    out.append(["Journal lines read as entries, continuations, or markers", read])
+    out.append(read_check("dmesg lines read as messages or continuations", m.br.dmesg_unparsed))
+    out.append(read_check("Journal lines read as entries, continuations, or markers", m.br.journal_unparsed))
     if pairs := kernel_pairs(m.br):
         lo, hi = kernel_bounds(pairs)
         if lo is None or hi is None:
@@ -6649,9 +6681,10 @@ def load_model(args: argparse.Namespace, log: Callable[[str], None]) -> Model:
     STATE.reset()
     STATE.brief, STATE.attach = args.brief, not args.no_attach
     br, vj = parse_inputs(args)
+    unread = f"{plural(len(br.dmesg_unparsed), 'dmesg line')} and {plural(len(br.journal_unparsed), 'journal line')}"
     log(
         f"bug report: {plural(len(br.lines), 'line')}, {len(br.dmesg):,} dmesg, {len(br.journal):,} journal, "
-        f"{plural(len(br.journal_unparsed), 'journal line')} unread; ry-verify: {plural(len(vj.records), 'record')}"
+        f"{unread} unread; ry-verify: {plural(len(vj.records), 'record')}"
     )
     m = analyze(br, vj)
     STATE.model = m
@@ -7016,13 +7049,14 @@ def check(args: argparse.Namespace) -> int:
     br, vj = parse_inputs(args)
     checks = [row for row in cross_checks(analyze(br, vj)) if row[1] == "match" or row[1].startswith("differs")]
     differing = [row for row in checks if row[1] != "match"]
-    unread = f", {plural(len(br.journal_unparsed), 'journal line')} unread" if br.journal_unparsed else ""
-    counts = (
-        f"{len(br.sections)} bug-report sections, {plural(len(br.dmesg), 'dmesg line')}, "
-        f"{plural(len(br.journal), 'journal entry', 'journal entries')}{unread}"
+    logs = (
+        (plural(len(br.dmesg), "dmesg line"), br.dmesg_unparsed, "dmesg line"),
+        (plural(len(br.journal), "journal entry", "journal entries"), br.journal_unparsed, "journal line"),
     )
+    read = ", ".join(f"{count}, {plural(len(lost), noun)} unread" if lost else count for count, lost, noun in logs)
     say(
-        f"inputs ok ({counts}; ry-verify {vj.meta('version')} with {plural(len(vj.items), 'result')}; "
+        f"inputs ok ({len(br.sections)} bug-report sections, {read}; "
+        f"ry-verify {vj.meta('version')} with {plural(len(vj.items), 'result')}; "
         f"cross-checks: {len(checks) - len(differing)} of {len(checks)} match)"
     )
     for name, result in differing:

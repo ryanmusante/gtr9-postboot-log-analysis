@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.18.0** · [Changelog](CHANGELOG.md)
+**Version 7.19.0** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` builds a PDF report from a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log — the findings with their evidence and the commands they call for, system health, the boot, dmesg, the journal, and the ry-verify results. Every finding, quote, count, and figure comes from the two inputs on each run; the script holds analysis rules, never results.
 
@@ -29,7 +29,7 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 | Python | 3.12 or newer; 3.12, 3.13, and 3.14 as tested, which build the same PDF, byte for byte where they link the same zlib (zlib-ng compresses it to other bytes) |
 | Libraries | ReportLab 5.1.0, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested; the script metadata requires at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12, which on Python 3.12 build the same PDF |
 | Fonts | the 9 IBM Plex TTF files named at the top of the script — `ttf-ibm-plex` on Arch, `fonts-ibm-plex` on Debian |
-| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions of 1.4.2 to 1.4.4 and of the CachyOS-Settings tree after them, as the script writes them; ry-verify 7.265.0 as tested, and the records of 7.266.0, as its source writes them |
+| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions of 1.4.2 to 1.4.4 and of the CachyOS-Settings tree after them, as the script writes them; ry-verify 7.265.0 as tested, and the records of 7.266.0 to 7.268.0, as its source writes them |
 | Section 3 commands | fish, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
 | Lint | ruff 0.17.5 and ty 0.0.101 to 0.0.104 as tested |
 
@@ -45,7 +45,7 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 - `--compare PATH` — an earlier run's JSON summary: the register marks each finding new, worse, better, or same, and a line under it names those resolved since — see [JSON Summary](#json-summary)
 - `--no-attach` — leave the two inputs out of the PDF, which otherwise carries them as file attachments (`pdfdetach -list`)
 - `--fonts DIR` — directory with the 9 IBM Plex TTF files; default search `/usr/share/fonts/TTF`, `/usr/share/fonts/truetype/ibm-plex`, `$XDG_DATA_HOME/fonts`
-- `--check` — run the preflight, parse both inputs, and run the parser cross-checks, then stop; its report counts journal lines the parser could not read and names any cross-check that differs
+- `--check` — run the preflight, parse both inputs, and run the parser cross-checks, then stop; its report counts the dmesg and journal lines the parser could not read and names any cross-check that differs
 - `--verbose` — report the setup (the font directory and the Python and library versions), then the parse, the analysis, the charts and their matplotlib or svglib warnings, each layout pass, and each file written
 - `--version`, `--help` — version and usage; both work before the Python dependencies are loaded
 
@@ -99,7 +99,7 @@ A cover, a contents page, 8 sections, and 2 appendices; `--brief` stops after Se
 
 ## How It Works
 
-**Bug report** — split at the separator lines `cachyos-bugreport.sh` writes, each section known by its title in any case; lines are numbered at newline characters only, as `rg -n` numbers them. The capture time comes from the `date` line in the C locale or any English locale glibc ships; in another language it is left unstated. Journal entries carry no year: each takes the latest year that puts it at most a day after the capture time (the ry-verify start when that is unstated). Journal lines the parser cannot read (another locale's month names, say) are counted in the cross-checks and named wherever journal entries are counted.
+**Bug report** — split at the separator lines `cachyos-bugreport.sh` writes, each section known by its title in any case; lines are numbered at newline characters only, as `rg -n` numbers them. The capture time comes from the `date` line in the C locale or any English locale glibc ships; in another language it is left unstated. Journal entries carry no year: each takes the latest year that puts it at most a day after the capture time (the ry-verify start when that is unstated). Journal lines the parser cannot read (another locale's month names, say) are counted in the cross-checks and named wherever journal entries are counted. A dmesg line without a time stamp continues the message above it; one before the first stamp continues none (every line, when dmesg prints no stamps) and is counted in the cross-checks, in the key facts, and in Sections 4.2 and 6.
 
 **ry-verify log** — the header, footer, phases, sections, and every `OK`, `INFO`, `WARN`, `FAIL`, and `ERR` record. As ry-verify counts them, `ERR` is a `FAIL`, and a generator failure, logged as `FAIL`, is a `GEN_FAIL`; phase banners, the notice a signal logs, and the `ERR` lines ry-verify does not count are no results, and the hardware-mismatch warning is no finding. The totals come from a footer that counts every record — a finished run's, or an interrupted one's from ry-verify 7.257.0 — else from the combined record, else from the phase records plus the records of a phase without one. The result reads in the words of ry-install's verdict: `PREFLIGHT` for exit `3`; `FAIL` for a counted `FAIL` or `GEN_FAIL`, and for a failing exit the counts do not explain; else `PASS-WITH-WARNINGS` or `PASS`. An interrupted run reads interrupted, and a log without a footer or an exit code unknown.
 
@@ -117,7 +117,7 @@ A cover, a contents page, 8 sections, and 2 appendices; `--brief` stops after Se
 
 **Kernel start** — each kernel message logged once in both dmesg and the current journal bounds the start to the second the journal stamps, and the estimate is the middle of the window they share. A message printed while no journald ran bounds it from above only, and messages after the first suspend are left out, as dmesg time stops while the system sleeps.
 
-**Cross-checks** — in Appendix B.2 and under `--check`: ry-verify's per-phase counts against its result records, its combined totals against its footer, its records against a footer that counts them all, and a finished run's exit code against its counts; every journal line as an entry, a continuation, a marker, or an unread line; the kernel messages paired between dmesg and the journal, which must agree on the kernel start; and the 7 sections `cachyos-bugreport.sh` writes. The pairing checks apply where both logs state the fact: the CPU vendor ry-verify detected (the mismatch warning, else `HARDWARE_MATCH`, logged from 7.251.0) against inxi's, its root file system against the bug report's, its kernel release (`KERNEL_RELEASE`, logged from 7.265.0) against the bug report's, the kernel command line tokens it checked against the bug report's `cmdline:` line, and its start against the kernel start, as a run from before the captured boot describes an earlier one.
+**Cross-checks** — in Appendix B.2 and under `--check`: ry-verify's per-phase counts against its result records, its combined totals against its footer, its records against a footer that counts them all, and a finished run's exit code against its counts; every dmesg line as a message, a continuation, or an unread line, and every journal line as an entry, a continuation, a marker, or an unread line; the kernel messages paired between dmesg and the journal, which must agree on the kernel start; and the 7 sections `cachyos-bugreport.sh` writes. The pairing checks apply where both logs state the fact: the CPU vendor ry-verify detected (the mismatch warning, else `HARDWARE_MATCH`, logged from 7.251.0) against inxi's, its root file system against the bug report's, its kernel release (`KERNEL_RELEASE`, logged from 7.265.0) against the bug report's, the kernel command line tokens it checked against the bug report's `cmdline:` line, and its start against the kernel start, as a run from before the captured boot describes an earlier one.
 
 **Quotes** — quotes keep their line numbers: BR, a line of the bug report; VJ, a line of the ry-verify log, blank lines counted. A quote from wrapped inxi output shows the line its number names. A message logged once is quoted as logged, repeats as their template.
 
@@ -125,7 +125,7 @@ A cover, a contents page, 8 sections, and 2 appendices; `--brief` stops after Se
 
 **Figures** — 5, in grayscale: the boot chart (dmesg lines per bar, with the longest silence before the root mount, a band of the boot phases, the milestones, and the captures); boot activity by subsystem (one tick per line, aligned under the boot chart); dmesg after the boot (one tick per line, one row per subsystem, with a dashed line at each suspend); the journal timeline (entries per bar for each boot, on a log scale once a bar holds 20, above one row of ticks per finding or message class); and ry-verify results by section (the static phase above the runtime phase, on one scale). The boot chart covers the burst and the captures up to twice its length, within 600 s of the kernel start; a capture later than the chart or before the kernel start appears in the timeline table only.
 
-**Missing data** — a log section without content is one sentence, and a journal whose lines could not be read adds its overview table; a journal boot of which no line could be read counts as not read, never as zero. A figure without data is left out and its section says so.
+**Missing data** — a log section without content is one sentence, which counts the dmesg lines that could not be read when there are any, and a journal whose lines could not be read adds its overview table; a journal boot of which no line could be read counts as not read, never as zero. A figure without data is left out and its section says so.
 
 ## Privacy and Reliability
 

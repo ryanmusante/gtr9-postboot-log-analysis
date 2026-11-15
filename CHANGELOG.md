@@ -3,6 +3,29 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.19.0
+------
+
+  - parsing: a dmesg line before the first time stamp is counted as unread;
+    it was dropped, and a ring buffer printed without stamps read as empty:
+    the report said the bug report holds no dmesg line
+  - checks: a cross-check reads every dmesg line as a message, a
+    continuation, or an unread line; --check, --verbose, the key facts, the
+    error-class tile, and Sections 4.2, 5, and 6 count the unread lines
+  - rules: the mitigations rule knows the kernel's long prefixes, Register
+    File Data Sampling, Transient Scheduler Attacks, and Speculative Return
+    Stack Overflow; a Vulnerable line under one of them matched no rule
+  - actions: units that failed in different boots are counted per boot; 3
+    in the current boot and 1 in the previous read 4 units failed in both
+    boots
+  - figures: the uptime strip's caption names the boot phases only when the
+    strip draws one; a phase that ends within 0.1 s is not drawn
+  - report: a count of 1,000 or more takes its separator in the units and
+    core dumps an action leaves out, in a template row of the failures
+    table, and in the preamble's records
+  - docs: the README names the records of ry-verify 7.266.0 to 7.268.0
+
+
 7.18.0
 ------
 
