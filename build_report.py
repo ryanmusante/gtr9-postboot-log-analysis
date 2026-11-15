@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.16.1"
+__version__ = "7.18.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -680,7 +680,7 @@ def normalize_inxi(text: str, key: str) -> str:
     """
     if key:
         opens = rf"\x03{key}(?:,\d{{1,2}})?(?=[A-Za-z])"
-        keyed = re.compile(rf"{opens}([^\x03]*?)(\s*)\x03")
+        keyed = re.compile(rf"{opens}([^\x03]*?)(?<!\s)(\s*)\x03")  # the key ends before its spaces, read once
         text = keyed.sub(lambda m: m[1] + ("" if m[1].endswith(":") else ":") + m[2], text)
         text = re.sub(rf"\x03{key}(\d{{1,2}})( ?)\x03", r"\1:\2", text)
         text = re.sub(rf"{opens}|\x03", "", text)
@@ -794,7 +794,7 @@ SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify
 # — inbound ping blocked until sudo systemctl restart …, (re-login or systemctl --user daemon-reload)
 FIX_VERB = r"(?:systemctl|chown|chmod|iw|mount)"  # as a bare word after other words, only systemctl names a command
 FIX_COMMAND = re.compile(
-    rf"(?:—|\(|;)\s*(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
+    rf"(?:—|\(|;)\s*+(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
 )
 RUN_HINT = re.compile(r"\b(?:Run|Install missing): (?=\S)")  # an INFO record that names its fix: Run: sudo …
 
@@ -897,9 +897,7 @@ def parse_verify(path: Path) -> VerifyLog:
     at = VerifyCursor()
     for n, rec in numbered:
         data = str(rec.get("data", "")) if rec.get("event") == "log" else ""
-        if not data:
-            continue
-        if at.advance(data):
+        if not data or at.advance(data):  # no log text, or a marker, section, or sub-heading record
             continue
         if data.startswith("VERIFY_RESULT_COMBINED:"):
             combined = {k: int(v) for k, v in COUNTS.findall(data)}
@@ -1017,7 +1015,7 @@ RULES = (
       "System memory, or a memory cgroup's limit (MemoryMax=), ran out and the kernel killed a process to recover.",
       "Find the killed process in the evidence and the memory consumer that caused it."),
     R("reset-abnormal", "Previous boot ended in an abnormal reset", "Boot / platform", "MED", ("dmesg",),
-      (RESET_REASON + r"(?!" + ROUTINE_RESET + ")",),
+      (rf"{RESET_REASON}(?!{ROUTINE_RESET})",),
       "The previous boot ended in neither a software reboot nor an ACPI power-off: a thermal trip, a held power "
       "button, a reset pin, a watchdog, or a hardware error ended it.",
       "Read the end of the previous boot with `journalctl -b -1 -e`; check cooling after a thermal trip and look for "
@@ -1090,7 +1088,7 @@ RULES = (
       "The kernel warns once per boot when a program queries Wi-Fi through the legacy wireless-extensions ioctls, "
       "which Wi-Fi 7 multi-link devices refuse; connectivity is unaffected."),
     R("nm-p2p", "NetworkManager warns on the Wi-Fi P2P device", "Network / NetworkManager", "LOW", ("journal",),
-      (r"p2p-dev-\w+.*(?:forwarding|No such file or directory)",),
+      (r"p2p-dev-\w.*(?:forwarding|No such file or directory)",),  # .* takes the rest of the name
       "NetworkManager configures a P2P device that has no kernel network device and logs the failure.",
       "Unmanage `type:wifi-p2p` devices in a NetworkManager conf.d drop-in.", mitigated_by=r"(?i)p2p",
       task="Unmanage the Wi-Fi P2P device", done="NetworkManager reads the device unmanaged and logs no warning"),
@@ -1197,7 +1195,7 @@ RULES = (
       (r"\baudit[:(](?!.*(?:DENIED|denied|res=failed))",),  # a denial or a failed result is no boilerplate
       "Boilerplate printed on every boot."),
     R("reset-reason", "Previous reset reason: a reboot or power-off", "Boot / platform", "NOTE", ("dmesg",),
-      (RESET_REASON + r"(?:" + ROUTINE_RESET + ")",),
+      (rf"{RESET_REASON}(?:{ROUTINE_RESET})",),
       "How the previous boot ended, as the platform recorded it: a reset the system asked for."),
     R("secure-boot", "Secure Boot state", "Boot / Secure Boot", "NOTE", ("dmesg",),
       (SECURE_BOOT,), "The firmware's Secure Boot state."),
@@ -1247,8 +1245,7 @@ IDENTIFIERS = (
     (re.compile(rf"{HEX_BEFORE}(?:[0-9A-Fa-f]{{2}}:){{5}}[0-9A-Fa-f]{{2}}{HEX_AFTER}"), "[MAC]"),  # colon form
     (re.compile(r"/home/(?!<)[A-Za-z0-9._-]+"), "/home/<user>"),
     (re.compile(rf"(?<![\w:.])(?:{IPV6})(?:%[\w.-]+)?(?![\w:]|\.\d)"), "[IPv6]"),  # with a zone, as fe80::1%wlan0
-    (re.compile(r"(?<!v: )(?<![\w.:/-])(?:25[0-5]|2[0-4]\d|1?\d?\d)"
-                r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?!\w|\.\d)"), IPV4_PLACEHOLDER),
+    (re.compile(rf"(?<!v: )(?<![\w.:/-]){V4}(?!\w|\.\d)"), IPV4_PLACEHOLDER),
     (re.compile(r"(?<![\w.%+-])[\w.%+-]+@(?:[\w-]+\.)+"
                 r"(?!(?:service|socket|timer|target|mount|slice|scope)\b)[A-Za-z]{2,}\b"), "[email]"),
 )  # fmt: skip
@@ -2106,29 +2103,31 @@ def verify_sections(vj: VerifyLog) -> list[tuple[str, str, dict[str, int]]]:
 
 
 CELSIUS = "\u00a0°C"  # an inxi temperature's unit, bound to its number by a no-break space
-# The atomic groups try a key only where a line first names it, so a line that repeats keys is read in one pass.
+# The atomic groups try a key only where a line first names it, so a line that repeats keys is read in one pass; a
+# value opens after the key's spaces (\s*+) and ends before the next key's ((?<!\s)), so a run of spaces is too.
 INXI_FACTS = (  # (key, inxi block, pattern, template); patterns run on the block's logical lines joined by newlines
-    ("machine", "Machine", r"^(?>.*?System:)\s*(?>(.+?)\s+product:)\s*(.+?)\s+(?:v:|serial:)", "{0} {1}"),
+    ("machine", "Machine",
+     r"^(?>.*?System:)\s*+(?>(.+?)(?<!\s)\s+product:)\s*+(.+?)(?<!\s)\s+(?:v:|serial:)", "{0} {1}"),
     (  # inxi 3.3 prints "Firmware: UEFI vendor: … v: … date: …", older releases "UEFI: … v: … date: …"
         "firmware",
         "Machine",
         (r"^(?>.*?\b(UEFI-\[Legacy\]|UEFI|BIOS)(?:\s+vendor)?:)"
-         r"\s*(?>(.+?)\s+v:)\s*(.+?)(?:\s+rev:\s*\S+)?\s+date:\s*(\S+)"),
+         r"\s*+(?>(.+?)(?<!\s)\s+v:)\s*+(.+?)(?<!\s)(?:\s+rev:\s*\S+)?\s+date:\s*(\S+)"),
         "{0}: {1} {2} ({3})",
     ),
-    ("cpu", "CPU", r"^(?>.*?\bmodel:)\s*(.+?)\s+bits:", "{0}"),
+    ("cpu", "CPU", r"^(?>.*?\bmodel:)\s*+(.+?)(?<!\s)\s+bits:", "{0}"),
     ("kernel", "System", KERNEL_FIELD, "{0}"),
-    ("distro", "System", r"Distro:\s*(.+?)(?:\s+base:.*)?$", "{0}"),
-    ("desktop", "System", r"^(?>.*?Desktop:)\s*(.+?)\s+v:\s*(\S+)", "{0} {1}"),
-    ("gpu", "Graphics", r"^(?>.*?Device-1:)\s*(.+?)\s+(?:vendor|driver):", "{0}"),  # -x adds the board vendor first
+    ("distro", "System", r"Distro:\s*+(.+?)(?<!\s)(?:\s+base:.*)?\s*$", "{0}"),
+    ("desktop", "System", r"^(?>.*?Desktop:)\s*+(.+?)(?<!\s)\s+v:\s*(\S+)", "{0} {1}"),
+    ("gpu", "Graphics", r"^(?>.*?Device-1:)\s*+(.+?)(?<!\s)\s+(?:vendor|driver):", "{0}"),  # -x adds the vendor first
     ("mesa", "Graphics", r"\bmesa v:\s*(\S+)", "{0}"),
     ("pipewire", "Audio", r"PipeWire v:\s*(\S+)", "{0}"),
     ("memory", "Info", r"Memory:\s*total:\s*([\d.]+ \w+)(?:.*?available:\s*([\d.]+ \w+))?", "{0} total, {1} available"),
     ("swap", "Swap", r"type:\s*zram\s+size:\s*([\d.]+ \w+)", "zram {0}"),
     ("temperatures", "Sensors", r"System Temperatures:\s*(.+)$", "{0}"),
     ("fans", "Sensors", r"Fan Speeds \(rpm\):\s*(.+)$", "{0}"),
-    ("drive", "Drive-1", r"ID-1:\s*/dev/(\w+)\s.*?model:\s*(.+?)(?=\s+(?:drive vendor|drive model|family|size):|$)",
-     "{0} {1}"),
+    ("drive", "Drive-1",
+     r"ID-1:\s*/dev/(\w+)\s.*?model:\s*+(.+?)(?<!\s)(?=\s+(?:drive vendor|drive model|family|size):|\s*$)", "{0} {1}"),
     ("smart", "Drive-1", r"health:\s*(\w+)", "{0}"),
     ("drive-temp", "Drive-1", r"\btemp:\s*([\d.]+) C\b", "{0}" + CELSIUS),
     ("written", "Drive-1", r"written(?:-units)?:\s*(?:[\d,]+\s+\[)?([\d.]+ \w+)", "{0} written"),  # NVMe: units [size]
@@ -2178,15 +2177,15 @@ def vulnerability_counts(cpu_block: str) -> str:
     that does not open with "Mitigation:" a status, so a KVM: prefix is read past. A mitigation that leaves a part
     vulnerable (spectre_v2 with BHI: Vulnerable, say) counts as partly vulnerable and is named.
     """
-    rows = re.findall(r"Type:\s*(\S+)\s+(status|mitigation):\s*(.+?)(?=\s+Type:\s|$)", cpu_block, re.MULTILINE)
-    if not rows:
+    row = r"Type:\s*(\S+)\s+(status|mitigation):\s*+(.+?)(?<!\s)(?=\s+Type:\s|\s*$)"  # a run of spaces is read once
+    if not (rows := re.findall(row, cpu_block, re.MULTILINE)):
         return ""
     counts = {"not affected": 0, "mitigated": 0, "partly vulnerable": 0, "vulnerable": 0, "unknown": 0}
     partly = []
     for name, kind, value in rows:
         text = value.removeprefix("KVM: ")
         if kind == "mitigation" or text.startswith("Mitigation"):
-            weak = re.findall(r"([\w-]+):? [Vv]ulnerable\b", text)  # BHI: Vulnerable, SMT vulnerable
+            weak = re.findall(r"(?<![\w-])([\w-]+):? [Vv]ulnerable\b", text)  # BHI: Vulnerable, SMT vulnerable
             if re.search(r"(?i)\bvulnerable\b", text):  # a weak spot, or the whole mitigation, reads vulnerable
                 counts["partly vulnerable"] += 1
                 partly.append(f"{name}: {', '.join(weak)}" if weak else name)
@@ -2380,20 +2379,18 @@ SUBSYSTEMS = (
                            "efivars", r"tpm\w*", "ccp", "rtc_cmos", r"i2c_designware\w*", "piix4_smbus", "pinctrl",
                            "pm")),
     ("Audio", (r"snd\w*", r"acp(?!i)\w*", r"soundwire\w*", r"sof-audio\w*")),
-    ("PCI and IOMMU", (r"pci\w*", "pci-dma", "pcieport", "acpiphp", "amd-vi", "amd_iommu", "iommu", "dmar",
-                       "virtio-pci")),
+    ("PCI and IOMMU", (r"pci\w*", "pci-dma", "acpiphp", "amd-vi", "amd_iommu", "iommu", "dmar", "virtio-pci")),
     ("CPU and memory", ("x86", r"cpu\d*", "smpboot", "smp", "microcode", r"spectre v\d", "speculative", "mitigations",
                         "mds", "taa", "mmio", "srbds", "gds", "its", "rfds", "bhi", "ssb", "l1tf", "tsa", "transient",
                         "vmscape", "retbleed", "rcu", "clocksource", "tsc", "apic", "ioapic", "x2apic", "e820",
                         "bios-e820", "bios-provided", "memory", "numa", "percpu", "pcpu-alloc", "setup_percpu",
                         "hugetlb", r"kvm[\w-]*", "hypervisor", "amd[-_]pstate", "intel_pstate", "acpi_cpufreq",
-                        "cpufreq", "cpuidle", "zswap",
-                        "mce", r"edac\w*", "perf", "performance", "rapl", "virt", "pv", "calibrating", "mtrr", "nx",
-                        "using", "last", "zone", "dma", "dma32", "normal", "device", "on", "node", "node_data",
-                        "initmem", "early", "movable", "fallback", "built", "policy", "mem", "slub", "last_pfn",
-                        "ramdisk", "faking", "dentry", "inode-cache", "mount-cache", "mountpoint-cache", "workingset",
-                        "free", "demotion", "kfence", "lvt", "process", r"hpet\d*", "resctrl", "ras", "amd_atl",
-                        r"intel_rapl\w*", "adding")),
+                        "cpufreq", "cpuidle", "zswap", "mce", r"edac\w*", "perf", "performance", "rapl", "virt", "pv",
+                        "calibrating", "mtrr", "nx", "using", "last", "zone", "dma", "dma32", "normal", "device", "on",
+                        "node", "node_data", "initmem", "early", "movable", "fallback", "built", "policy", "mem",
+                        "slub", "last_pfn", "ramdisk", "faking", "dentry", "inode-cache", "mount-cache",
+                        "mountpoint-cache", "workingset", "free", "demotion", "kfence", "lvt", "process", r"hpet\d*",
+                        "resctrl", "ras", "amd_atl", r"intel_rapl\w*", "adding")),
     ("systemd and audit", (r"systemd(?:-[\w-]+)?", "audit", r"kauditd\w*")),
     ("Kernel core", ("linux", "command", "kernel", "booting", "console", "printk", "random", "ftrace", "lsm",
                      "landlock", "selinux", "apparmor", "yama", "bpf", "key", "vfs", "devtmpfs", "pid_max",
@@ -2412,18 +2409,18 @@ SPLAT_LINE = re.compile(
 )  # a kernel splat's lines, matched from their start: banner, task, registers, trace
 
 
-# Messages whose first word names no subsystem, known by their wording: error classes, kernel splats, set-up lines.
+# Messages whose first word names no subsystem, known by their wording: error classes, kernel splats, setup lines.
 DMESG_WORDING = (
     (re.compile(r"\[drm:"), "GPU"),  # [drm:amdgpu_job_timedout [amdgpu]] *ERROR* …
     (re.compile(r"(?:Buffer )?I/O error\b|[\w ]+ error, dev \S+, sector "), "Storage"),  # the block layer's errors
     (re.compile(r"Out of memory|oom-kill:|oom_reaper:|Memory cgroup out of memory|\S+ invoked oom-killer:"
                 r"|(?:\{\d+\})?\[Hardware Error\]"), "CPU and memory"),  # and machine-check reports
     (re.compile(r"No NUMA configuration found|\.\.\.\. node +#\d+, CPUs:|software IO TLB|IPI shorthand broadcast"
-                r"|page_reporting|\S+ \(\d+\): drop_caches: "), "CPU and memory"),  # memory set-up and cache drops
+                r"|page_reporting|\S+ \(\d+\): drop_caches: "), "CPU and memory"),  # memory setup and cache drops
     (re.compile(r"Initiali[sz]e system trusted keyrings|Asymmetric key parser|Loading compiled-in X\.509"
                 r"|registered taskstats|Serial: 8250|\S+: ttyS\d+ at "), "Kernel core"),  # keys, accounting, serial
     (re.compile(r"Mirror/redirect action on|u32 classifier|Actions configured|Initializing XFRM netlink socket"
-                r"|warning: `\S+' uses wireless extensions"), "Network"),  # traffic control, IPsec set-up, and wext
+                r"|warning: `\S+' uses wireless extensions"), "Network"),  # traffic control, IPsec setup, and wext
     (SPLAT_LINE, "Kernel core"),  # a splat and its lines: banner, task, registers
 )  # fmt: skip
 DMESG_PREFIXES = (
@@ -3563,8 +3560,6 @@ def draw_subsystems(m: Model) -> Figure | None:
     xmax = axis[0]
     rows = [(name, [e.t for e in lines if e.t < xmax]) for name, lines in subsystem_lines(m.br).items()]
     rows = [(name, times) for name, times in rows if times][::-1]  # the first subsystem on top
-    if not rows:
-        return None
     plt = _mpl()
     fig, ax = plt.subplots(figsize=(CW, fig_height(0.7, 0.2, len(rows))), layout="constrained")
     limit = tick_limit([len(times) for _, times in rows])
@@ -4560,10 +4555,10 @@ class ConverterLog(logging.Handler):
 def svg_drawing(name: str) -> Drawing:
     """Return a rendered SVG as a drawing scaled to the frame width.
 
-    Raise RuntimeError, with svglib's reason, when svglib cannot read the figure or logs an error over it: a figure
-    is drawn whole or not at all. Its warnings go to the verbose log. svglib's limits on <use> elements (2.3.1), past
-    which it drops the rest, guard against hostile SVGs; they are lifted, as matplotlib wrote these, a <use> per tick
-    and glyph.
+    Raise RuntimeError, with svglib's reason, when svglib cannot read the figure, reads one of no size (a file cut
+    short), or logs an error over it: a figure is drawn whole or not at all. Its warnings go to the verbose log.
+    svglib's limits on <use> elements (2.3.1), past which it drops the rest, guard against hostile SVGs; they are
+    lifted, as matplotlib wrote these, a <use> per tick and glyph.
     """
     from svglib import svglib
 
@@ -4576,9 +4571,10 @@ def svg_drawing(name: str) -> Drawing:
         logger.removeHandler(heard)
     errors = [r.getMessage() for r in heard.records if r.levelno >= logging.ERROR]
     STATE.figure_notes.update(f"{name}.svg: {r.getMessage()}" for r in heard.records if r.levelno < logging.ERROR)
-    if drawing is None or errors:
+    unread = drawing is None or min(drawing.width, drawing.height) <= 0
+    if unread or errors:
         why = f" (svglib: {clip(errors[0], 120)})" if errors else ""
-        msg = f"{'unreadable' if drawing is None else 'incomplete'} figure {name}.svg{why}"
+        msg = f"{'unreadable' if unread else 'incomplete'} figure {name}.svg{why}"
         raise RuntimeError(msg)
     scale = FW / drawing.width
     drawing.width, drawing.height = drawing.width * scale, drawing.height * scale
@@ -5241,11 +5237,6 @@ METHOD = (
 )
 
 
-def method_bullets() -> list[Flowable]:
-    """Return the method notes as bullets."""
-    return [*bullet_paragraphs(METHOD, keep=True)]
-
-
 def timeline_rows(m: Model) -> list[list[str]]:
     """Return the boot and capture timeline rows in time order; times are local, as each source logs them.
 
@@ -5668,9 +5659,7 @@ def verify_caption(m: Model) -> str:
     listed = {"FAIL": "sub-8.2", "GEN_FAIL": "sub-8.2", "WARN": "sub-8.2", "INFO": "sub-8.3"}  # OK records: no list
     refs = {s: f" ({section_ref(listed[s])})" if s in listed else "" for s in before}
     parts = [f"{before[s]:,} {s}{refs[s]}" for s in STATUS_ORDER if before[s]]
-    left_out = ""
-    if parts:
-        left_out = f" Not drawn: {series(parts)} from the preamble."
+    left_out = f" Not drawn: {series(parts)} from the preamble." if parts else ""
     return f"Records per section and status, {where}.{left_out}"
 
 
@@ -5835,7 +5824,7 @@ def _story_journal(m: Model) -> list[Flowable]:
         out += table(head, rows, [318, 50, 50, 94], title="Repeated journal warnings", mono=(0,), right=(1, 2))
     else:
         out.append(para(f"No journal entry repeats {where}."))
-    out += [HPara("sub-7.5"), *_journal_comparison(m), HPara("sub-7.6")]
+    out += [HPara("sub-7.5"), *journal_comparison(m), HPara("sub-7.6")]
     if not (rows := unit_failure_rows(m)):
         return [*out, para(f"systemd logged no unit failure {where}.")]
     if (total := len(unit_failures(m) or [])) > UNIT_ROWS:
@@ -5846,7 +5835,7 @@ def _story_journal(m: Model) -> list[Flowable]:
     return out + table(head, rows, [196, 52, 54, 86, 58, 66], title="Unit failures systemd logged", mono=(0,))
 
 
-def _journal_comparison(m: Model) -> list[Flowable]:
+def journal_comparison(m: Model) -> list[Flowable]:
     """Return the boot comparison: the messages new in the current boot, or why there is nothing to compare.
 
     A finding's entries in each boot are the Cur. and Prev. columns of the register and of Appendix A.
@@ -6243,9 +6232,7 @@ def cross_checks(m: Model) -> list[list[str]]:
         out.append([f"ry-verify records match its footer ({said})", result])
     out += exit_check(m.vj) + pairing_checks(m)
     unparsed = m.br.journal_unparsed
-    read = "match"
-    if unparsed:
-        read = f"differs: {len(unparsed):,}{NBSP}unread (BR {clip(ranges(unparsed), RANGES_CLIP)})"
+    read = f"differs: {len(unparsed):,}{NBSP}unread (BR {clip(ranges(unparsed), RANGES_CLIP)})" if unparsed else "match"
     out.append(["Journal lines read as entries, continuations, or markers", read])
     if pairs := kernel_pairs(m.br):
         lo, hi = kernel_bounds(pairs)
@@ -6280,9 +6267,7 @@ def pairing_checks(m: Model) -> list[list[str]]:
     out += kernel_check(m.br, m.vj)
     checked, differing = cmdline_rows(m.br, m.vj)
     if checked:
-        result = "match"
-        if differing:
-            result = f"differs: VJ {clip(ranges([i.no for i in differing]), RANGES_CLIP)}"
+        result = f"differs: VJ {clip(ranges([i.no for i in differing]), RANGES_CLIP)}" if differing else "match"
         out.append([f"ry-verify's kernel command line is the bug report's ({plural(checked, 'token')})", result])
     if m.kernel_start and m.vj.started and not clock_set_back(m.kernel_start, m.br.captured):
         early = ran_before_boot(m.kernel_start, m.vj, m.br.captured)
@@ -6322,11 +6307,9 @@ def _story_actions(m: Model) -> list[Flowable]:
 def _story_appendix(m: Model) -> list[Flowable]:
     """Return Appendix B: the inputs, the parser cross-checks, and the method."""
     out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-B"), HPara("sub-B.1"), *inputs_table(m)]
-    checks = table(
-        ["Cross-check", "Result"], cross_checks(m), [372, 140], title="Parse results checked against the inputs"
-    )
-    out += [HPara("sub-B.2"), *checks]
-    return [*out, HPara("sub-B.3"), *method_bullets()]
+    title = "Parse results checked against the inputs"
+    checks = table(["Cross-check", "Result"], cross_checks(m), [372, 140], title=title)
+    return [*out, HPara("sub-B.2"), *checks, HPara("sub-B.3"), *bullet_paragraphs(METHOD, keep=True)]
 
 
 def story(m: Model) -> list[Flowable]:
@@ -6580,7 +6563,6 @@ def layout(m: Model, log: Callable[[str], None]) -> bytes:
 
     Raise on drift or unresolved references.
     """
-    pdf = io.BytesIO()
     for n in range(1, MAX_PASSES + 1):
         STATE.anchors.clear()
         STATE.h1pos.clear()

@@ -3,6 +3,53 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.18.0
+------
+
+  - build: build_report.py is 14 lines shorter (7,077): a default that an if
+    overwrote is one conditional expression in three places, the vulnerability
+    rows bind in their test, the ry-verify parser skips a record in one test,
+    Appendix B returns one list, and the IPv4 mask takes the pattern the IPv6
+    mask embeds
+  - build: the dmesg subsystem table drops pcieport, which its pci pattern
+    matches, and its CPU and memory names fill their lines again; the
+    reset-reason rules compose their patterns as the other rules do, and three
+    comments spell setup as the rest do
+  - build: the PDF, the JSON summary, the messages, and the exit codes are
+    unchanged
+
+
+7.17.1
+------
+
+  - actions: a suggested fix is found in one pass over its record; 100,000
+    spaces after a parenthesis took --check 72 s
+  - figures: a figure file without a size, as one cut short, fails the build
+    as an unreadable figure; it raised ZeroDivisionError
+  - rules: the Wi-Fi P2P rule reads a device name once; a megabyte of journal
+    lines with names of 4,000 letters took --check 15 s
+  - parsing: an inxi fact reads a run of spaces once; 4,000 after a key took
+    --check 18 s, after the GPU's key 84 s
+  - parsing: an inxi value neither opens nor ends with spaces; of two or more
+    spaces after a key without a value, one had been read as its value
+  - parsing: inxi in IRC form reads the spaces after a key once; 100,000 took
+    --check 31 s
+  - parsing: inxi's vulnerability rows are read in one pass; a megabyte of
+    values of 4,000 letters took --check 29 s
+
+
+7.17.0
+------
+
+  - build: build_report.py is 8 lines shorter (7,087): gone are the method
+    notes' one-line helper with the list copy it made, the buffer the layout
+    made before its first pass, and the subsystem chart's check for a chart
+    without rows, which the boot's first line rules out; the boot comparison's
+    builder loses its leading underscore
+  - build: the PDF, the JSON summary, the messages, and the exit codes are
+    unchanged
+
+
 7.16.1
 ------
 
