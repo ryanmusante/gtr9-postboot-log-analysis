@@ -3,43 +3,63 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.21.0
+------
+
+  - rules: the requires field, a limit to hardware the bug report names, is
+    gone; no rule set it
+  - build: build_report.py is 12 lines shorter (6,973); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
+  - docs: the README states each fact once and cuts reasons and finer detail
+  - changelog: every entry fits two lines again; the blocks before this one
+    keep 328 of their 343 entries
+
+
+7.20.1
+------
+
+  - build: build_report.py is 2 lines shorter (6,985); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
+
+
+7.20.0
+------
+
+  - build: build_report.py is 125 lines shorter (6,987); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
+
+
+7.19.1
+------
+
+  - report: the key facts state unread dmesg lines as they state the
+    journal's; they read 0 dmesg lines, 79 dmesg lines could not be read
+
+
 7.19.0
 ------
 
-  - parsing: a dmesg line before the first time stamp is counted as unread;
-    it was dropped, and a ring buffer printed without stamps read as empty:
-    the report said the bug report holds no dmesg line
-  - checks: a cross-check reads every dmesg line as a message, a
-    continuation, or an unread line; --check, --verbose, the key facts, the
-    error-class tile, and Sections 4.2, 5, and 6 count the unread lines
-  - rules: the mitigations rule knows the kernel's long prefixes, Register
-    File Data Sampling, Transient Scheduler Attacks, and Speculative Return
-    Stack Overflow; a Vulnerable line under one of them matched no rule
-  - actions: units that failed in different boots are counted per boot; 3
-    in the current boot and 1 in the previous read 4 units failed in both
-    boots
+  - report: a count of 1,000 or more takes its separator in the units and core
+    dumps an action leaves out, a template row, and the preamble's records
+  - actions: units that failed in different boots are counted per boot; 3 in
+    the current boot and 1 in the previous read 4 units failed in both boots
   - figures: the uptime strip's caption names the boot phases only when the
     strip draws one; a phase that ends within 0.1 s is not drawn
-  - report: a count of 1,000 or more takes its separator in the units and
-    core dumps an action leaves out, in a template row of the failures
-    table, and in the preamble's records
-  - docs: the README names the records of ry-verify 7.266.0 to 7.268.0
+  - rules: the mitigations rule knows Register File Data Sampling, Transient
+    Scheduler Attacks, and Speculative Return Stack Overflow
+  - checks: a cross-check reads every dmesg line as a message, a continuation,
+    or an unread line; --check, --verbose, and the report count unread lines
+  - ry-verify: the README names the records of 7.266.0 to 7.268.0 as read from
+    its source
+  - parsing: a dmesg line before the first timestamp is counted as unread; it
+    was dropped, and a ring buffer without timestamps read as empty
 
 
 7.18.0
 ------
 
-  - build: build_report.py is 14 lines shorter (7,077): a default that an if
-    overwrote is one conditional expression in three places, the vulnerability
-    rows bind in their test, the ry-verify parser skips a record in one test,
-    Appendix B returns one list, and the IPv4 mask takes the pattern the IPv6
-    mask embeds
-  - build: the dmesg subsystem table drops pcieport, which its pci pattern
-    matches, and its CPU and memory names fill their lines again; the
-    reset-reason rules compose their patterns as the other rules do, and three
-    comments spell setup as the rest do
-  - build: the PDF, the JSON summary, the messages, and the exit codes are
-    unchanged
+  - build: build_report.py is 14 lines shorter (7,077); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
 
 
 7.17.1
@@ -64,23 +84,15 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.17.0
 ------
 
-  - build: build_report.py is 8 lines shorter (7,087): gone are the method
-    notes' one-line helper with the list copy it made, the buffer the layout
-    made before its first pass, and the subsystem chart's check for a chart
-    without rows, which the boot's first line rules out; the boot comparison's
-    builder loses its leading underscore
-  - build: the PDF, the JSON summary, the messages, and the exit codes are
-    unchanged
+  - build: build_report.py is 8 lines shorter (7,087); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
 
 
 7.16.1
 ------
 
-  - build: build_report.py is 215 lines shorter (7,095): tests bind their
-    value in place, long calls name their parts first, and three tables pack
-    their pairs
-  - build: the PDF, the JSON summary, the messages, and the exit codes are
-    unchanged
+  - build: build_report.py is 215 lines shorter (7,095); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
   - lint: ruff.toml drops the ISC001 ignore, which ruff 0.17.5 raises nowhere
     in the script
 
@@ -90,8 +102,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 
   - docs: README takes ry-install's and ry-verify's shape: a warning alert,
     tables for requirements, exit codes, and the report; shorter paragraphs
-  - changelog: one tag order and one wrap width in every block; 7.0.0 to 7.4.0
-    keep 138 of their 185 entries
 
 
 7.15.1
@@ -571,8 +581,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     pause or quiet gap is the difference of its printed ends
   - report: counts are of messages, a continuation with its entry and a
     wrapped inxi line once; Method says so and covers indented lines
-  - actions: past 6 failed units, the overflow comment points to Section 5.6,
-    which lists every unit
+  - actions: past 6 failed units, the overflow comment points to Section 5.6
   - dmesg: errors without a prefix take their subsystem from the wording: DRM
     errors, I/O errors, OOM kills, and kernel splats
   - dmesg: acpiphp, acpi_cpufreq, zswap, CPU mitigations, sp5100-tco,
@@ -731,9 +740,8 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     verdict and the count strip
   - report: inxi facts, the date line, and ry-verify header fields are
     sanitized like quotes, so no escape sequence reaches the PDF or stderr
-  - actions: file and unit names are quoted for fish, not POSIX sh
-  - actions: a failed unit is looked up in its boot and manager, with -b -1 or
-    --user-unit
+  - actions: file and unit names are quoted for fish, not POSIX sh; a failed
+    unit is looked up in its boot and manager, with -b -1 or --user-unit
   - actions: core dumps get coredumpctl commands; an OOM kill joins the kernel
     errors to investigate
   - figures: the boot timeline ends at the first 30 s pause after the last
