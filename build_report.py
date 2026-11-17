@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.21.0"
+__version__ = "7.22.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -792,7 +792,7 @@ FOOTER_LIMIT = 10**9  # footer counts lie from 0 up to this, as the VERIFY_RESUL
 FOOTER_COUNTS_ALL = (7, 257, 0)  # from this ry-verify on, an interrupted run's footer counts every section's rows
 VERIFY_PREFLIGHT = 3  # ry-verify's exit when a gate stops the run: missing sudo, a dependency, or a validator
 SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify skipped as its sudo cache lapsed
-# A fix a FAIL or WARN record names in its last clause, after a dash, a parenthesis, or a semicolon: — sudo chown …
+# A fix a FAIL or WARN record names in its last clause, after a dash (— sudo chown …), a parenthesis, or a semicolon.
 FIX_VERB = r"(?:systemctl|chown|chmod|iw|mount)"  # as a bare word after other words, only systemctl names a command
 FIX_COMMAND = re.compile(
     rf"(?:—|\(|;)\s*+(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
@@ -2978,17 +2978,15 @@ def boot_bin(xmax: float) -> float:
     return next((w for w in BAR_WIDTHS if xmax / w <= BOOT_BARS), BAR_WIDTHS[-1])
 
 
-def quiet_span(m: Model, xmax: float) -> tuple[float, float] | None:
+def quiet_span(gap: tuple[float, float], xmax: float) -> tuple[float, float] | None:
     """Return the stretch of the boot chart shaded for the quiet gap: the bars wholly inside it, up to xmax.
 
     The lines that bound the gap fall into the bars at either end, which stay unshaded, so no drawn bar lies on the
     shading; a gap within one or two bars shades nothing. Bars are counted in whole microseconds, as draw_boot does.
     """
-    if not m.quiet_gap:
-        return None
     step = round(boot_bin(xmax) * 1e6)
-    a = (round(m.quiet_gap[0] * 1e6) // step + 1) * step / 1e6
-    b = min(round(m.quiet_gap[1] * 1e6) // step * step / 1e6, xmax)
+    a = (round(gap[0] * 1e6) // step + 1) * step / 1e6
+    b = min(round(gap[1] * 1e6) // step * step / 1e6, xmax)
     return (a, b) if b > a else None
 
 
@@ -3218,7 +3216,7 @@ def boot_bars(ax1: Axes, m: Model, xmax: float, counts: Sequence[int], width: fl
     ax1.bar([(i + 0.5) * width for i in range(len(counts))], counts, width=width * BAR_FILL, color=C_DARK)
     top = log_counts(ax1, max([*counts, 1]))
     ax1.set_ylabel(f"dmesg lines\nper {width:g} s")
-    if m.quiet_gap and (span := quiet_span(m, xmax)):
+    if m.quiet_gap and (span := quiet_span(m.quiet_gap, xmax)):
         a, b = span
         ax1.axvspan(a, b, color=C_LIGHT, zorder=0)
         if b - a >= 0.1 * xmax:  # a narrower stretch is named in the caption only
@@ -5332,7 +5330,7 @@ def burst_text(m: Model, xmax: float) -> str:
         a, b = m.quiet_gap
         limit = "the root mount" if "Root mounted" in m.milestones else "the root switch"
         gap = f"{secs(gap_seconds(a, b))} ({secs_span(a, b)})"
-        if quiet_span(m, xmax):
+        if quiet_span(m.quiet_gap, xmax):
             text += f" Shading: the longest silence before {limit}, {gap}."
         else:
             text += f" The longest silence before {limit} lasts {gap}."

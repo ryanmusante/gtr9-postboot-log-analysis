@@ -3,6 +3,14 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.22.0
+------
+
+  - build: build_report.py is 2 lines shorter (6,971); the PDF, the JSON
+    summary, the messages, and the exit codes are unchanged
+  - docs: the README trims repeats, examples, and finer detail
+
+
 7.21.0
 ------
 
@@ -10,9 +18,6 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     gone; no rule set it
   - build: build_report.py is 12 lines shorter (6,973); the PDF, the JSON
     summary, the messages, and the exit codes are unchanged
-  - docs: the README states each fact once and cuts reasons and finer detail
-  - changelog: every entry fits two lines again; the blocks before this one
-    keep 328 of their 343 entries
 
 
 7.20.1
@@ -131,8 +136,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 
   - report: an unread date line stops at 400 characters on the cover and in
     --json
-  - report: a card shows the ry-verify record its rule cites, as the watch
-    table and Appendix A do; no shipped rule with a card cites one
+  - report: a card shows the ry-verify record its rule cites
   - figures: a figure draws at most 6,000 ticks, the journal timeline too;
     svglib from 2.3.1 drops an SVG's <use> elements past 10,000
   - figures: an error svglib logs over a figure fails the build, and its
@@ -746,8 +750,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     errors to investigate
   - figures: the boot timeline ends at the first 30 s pause after the last
     milestone, so later lines cannot squeeze the boot; the caption counts them
-  - figures: row-scaled charts stop growing at 8 in, so a long rule roster
-    cannot push a figure past its page
+  - figures: row-scaled charts stop growing at 8 in
   - layout: a heading or lead paragraph stays with the figure, card, or
     command block below it; section headings get room above their rule
   - layout: a table split twice keeps two rows on each side (ReportLab 5
