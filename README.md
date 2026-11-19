@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.22.0** · [Changelog](CHANGELOG.md)
+**Version 7.23.0** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` builds a PDF report from a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log — the findings with their evidence and the commands they call for, system health, the boot, dmesg, the journal, and the ry-verify results. The script holds analysis rules, never results.
 
@@ -29,9 +29,9 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 | Python | 3.12 or newer; 3.12, 3.13, and 3.14 as tested, which build the same PDF, byte for byte where they link the same zlib |
 | Libraries | ReportLab 5.1.0, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested; the script requires at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12 |
 | Fonts | the 9 IBM Plex TTF files named at the top of the script — `ttf-ibm-plex` on Arch, `fonts-ibm-plex` on Debian |
-| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions of 1.4.2 to 1.4.4 and of the CachyOS-Settings tree after them, as the script writes them; ry-verify 7.265.0 as tested, and the records of 7.266.0 to 7.268.0, as its source writes them |
-| Section 3 commands | fish, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
-| Lint | ruff 0.17.5 and ty 0.0.101 to 0.0.104 as tested |
+| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions of 1.4.2 to 1.4.4 and of the CachyOS-Settings tree after them, as the script writes them; ry-verify 7.265.0 to 7.271.0 as tested |
+| Section 3 commands | fish, `sudo`, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
+| Lint | ruff 0.17.5 and ty 0.0.101 to 0.0.107 as tested |
 
 ## Usage
 
@@ -121,7 +121,7 @@ A cover, a contents page, 8 sections, and 2 appendices.
 
 **Quotes** — quotes keep their line numbers: BR, a line of the bug report; VJ, a line of the ry-verify log, blank lines counted. A message logged once is quoted as logged, repeats as their template.
 
-**Actions** — every `HIGH`, `MED`, and `LOW` finding is answered by an action. A failed unit is looked up in its own boot and manager (`journalctl -b -1`, `--user-unit`) by its name as logged, a masked identifier as `*`; kernel errors are looked up in the warning-level kernel journal. The ry-verify rerun calls the script by the absolute path its log's header records, else `~/ry-verify/ry-verify.fish`, after `sudo -v` when sudo stopped the run or its cache lapsed. Above a paired log's rerun stand up to 6 of ry-verify's own suggestions and the checks a lapsed sudo cache skipped. A finding no failure action answers gets its rule's task — for a unit that failed under a redacted name, the Wi-Fi P2P device, a HID joystick, or jack2 — and an action without commands points at its finding's card.
+**Actions** — every `HIGH`, `MED`, and `LOW` finding is answered by an action. A failed unit is looked up in its own boot and manager (`journalctl -b -1`, `--user-unit`) by its name as logged, a masked identifier as `*`; kernel errors are looked up in the warning-level kernel journal. The ry-verify rerun calls the script by the absolute path its log's header records, else `~/ry-verify/ry-verify.fish`, after `sudo -v` when sudo stopped the run or its cache lapsed, or `sudo true` when the stop says `sudo -v` cached nothing. Above a paired log's rerun stand up to 6 of ry-verify's own suggestions and the checks a lapsed sudo cache skipped. A finding no failure action answers gets its rule's task — for a unit that failed under a redacted name, the Wi-Fi P2P device, a HID joystick, or jack2 — and an action without commands points at its finding's card.
 
 **Figures** — 5, in grayscale: the boot chart, boot activity by subsystem, dmesg after the boot, the journal timeline (on a log scale once a bar holds 20), and ry-verify results by section. The boot chart covers the burst and the captures up to twice its length, within 600 s of the kernel start; a capture later than the chart or before the kernel start appears in the timeline table only.
 

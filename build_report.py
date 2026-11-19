@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.22.0"
+__version__ = "7.23.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -123,7 +123,7 @@ OPTIONS: tuple[tuple[str, dict[str, Any]], ...] = (  # in the README's order
                  "help": "directory with the IBM Plex TTF files (default: system and user font directories)"}),
     ("--check", {"action": "store_true", "help": "parse the inputs and run the cross-checks; build nothing"}),
     ("--verbose", {"action": "store_true",
-                   "help": "report the setup, parsing, analysis, layout passes, and files written"}),
+                   "help": "report the setup, parsing, analysis, charts, layout passes, and files written"}),
     ("--version", {"action": "version", "version": f"%(prog)s {__version__}", "help": "print the version and exit"}),
 )  # fmt: skip
 
@@ -792,6 +792,7 @@ FOOTER_LIMIT = 10**9  # footer counts lie from 0 up to this, as the VERIFY_RESUL
 FOOTER_COUNTS_ALL = (7, 257, 0)  # from this ry-verify on, an interrupted run's footer counts every section's rows
 VERIFY_PREFLIGHT = 3  # ry-verify's exit when a gate stops the run: missing sudo, a dependency, or a validator
 SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify skipped as its sudo cache lapsed
+SUDO_UNCACHED = re.compile(r"\bsudo -v left sudo -n unusable\b")  # a gate's reason when sudo -v caches nothing
 # A fix a FAIL or WARN record names in its last clause, after a dash (— sudo chown …), a parenthesis, or a semicolon.
 FIX_VERB = r"(?:systemctl|chown|chmod|iw|mount)"  # as a bare word after other words, only systemctl names a command
 FIX_COMMAND = re.compile(
@@ -1502,11 +1503,6 @@ def unread_lines(m: Model, boot: str) -> int:
 def unread_boots(m: Model) -> list[str]:
     """Return the journal boots of which the parser read no entry and could not read some line: counts say not read."""
     return [b for b in ("current", "previous") if unread_lines(m, b) and not any(e.boot == b for e in m.br.journal)]
-
-
-def error_findings(m: Model) -> list[Finding]:
-    """Return the findings of the error classes in ERROR_RULES, in register order."""
-    return [f for f in m.findings if f.key in ERROR_RULES]
 
 
 def match_rule(stream: str, text: str, ident: str = "", *, shutdown: bool = False) -> Rule | None:
@@ -2322,11 +2318,6 @@ def scheduler_health(facts: Mapping[str, str], label: str) -> list[tuple[str, st
     return [(label, ext, "", "scheduler")] if ext else []
 
 
-def health_rows(m: Model) -> list[tuple[str, str, str, str]]:
-    """Return (check, result, detail, source) rows for the system-health table, from facts the inputs state."""
-    return [*verify_health(m), *gpu_health(m), *hardware_health(m)]
-
-
 def note_lines(found: Iterable[Finding]) -> set[int]:
     """Return the lines that NOTE rules claim: boilerplate, which the failure-keyword counts leave out."""
     return {mt.no for f in found if f.severity == "NOTE" for mt in f.matches}
@@ -2515,7 +2506,9 @@ def unit_glob(name: str, room: int) -> str:
 def verify_action(m: Model) -> Action | None:
     """Return the action for ry-verify's failures and warnings: its own suggested fixes as comments, then a rerun.
 
-    The rerun caches sudo first when a gate stopped ry-verify for want of sudo or its sudo cache lapsed mid-run.
+    The rerun caches sudo first when a gate stopped ry-verify for want of sudo or its sudo cache lapsed mid-run:
+    with sudo -v, or with sudo true where the gate found that sudo -v caches nothing (verifypw), as ry-verify 7.269.0
+    does on a terminal.
     """
     if m.foreign:  # another boot's or machine's failures: pairing_action() has the run that shows this boot's
         return None
@@ -2538,7 +2531,11 @@ def verify_action(m: Model) -> Action | None:
         lines = ranges([i.no for i in lapses], COMMENT_RUNS)
         cmds += comment(f"{plural(len(lapses), 'check')} skipped as ry-verify's sudo cache lapsed: VJ {lines}")
     gates = [s for s in (stop, *m.vj.phase_stops) if s and re.search(r"\bsudo\b", s.text)]
-    if gates or lapses:
+    if any(SUDO_UNCACHED.search(s.text) for s in gates):
+        note = "sudo -v caches nothing under verifypw, but a command authenticates; "
+        note += "nothing caches under timestamp_timeout=0"
+        cmds += [*comment(note), "sudo true"]
+    elif gates or lapses:
         cmds.append("sudo -v")
     cmds.append(f"{verify_script(m.vj)} --verify")
     kinds = "FAIL, GEN_FAIL, or WARN" if shown else "FAIL or WARN"
@@ -2733,7 +2730,7 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
     marks, quiet = timeline(br)
     keywords = keyword_entries(br, note_lines(others))
     m = Model(br, vj, findings, others, marks, quiet, start, verify_sections(vj), facts, [], keywords, [], foreign)
-    m.health = health_rows(m)
+    m.health = [*verify_health(m), *gpu_health(m), *hardware_health(m)]  # check, result, detail, source
     m.actions = plan_actions(m)
     return m
 
@@ -4715,7 +4712,7 @@ def kpi_strip(m: Model) -> Table:
 
 def tile_rows(m: Model) -> list[tuple[str, str, str]]:
     """Return the cover's system tiles (label, value, detail), each short enough for its box."""
-    d, errors = m.facts, error_findings(m)
+    d, errors = m.facts, [f for f in m.findings if f.key in ERROR_RULES]
     in_dmesg = sum(1 for r in RULES if r.key in ERROR_RULES and "dmesg" in r.streams)
     known = len(ERROR_RULES) if m.br.journal else in_dmesg
     unread = {"dmesg": len(m.br.dmesg_unparsed), "journal": len(m.br.journal_unparsed) if m.br.journal else 0}

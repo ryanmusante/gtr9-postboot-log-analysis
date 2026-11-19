@@ -3,6 +3,20 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.23.0
+------
+
+  - actions: a ry-verify stop that says sudo -v cached nothing (verifypw)
+    reruns after sudo true, as ry-verify 7.269.0 does; sudo -v left it stopped
+  - ry-verify: the README names 7.265.0 to 7.271.0 as tested; it named the
+    records of 7.266.0 to 7.268.0 as read from its source
+  - cli: --help lists the charts among what --verbose reports
+  - build: build_report.py is 3 lines shorter (6,968); the PDF, the JSON
+    summary, the messages, and the exit codes change only as above
+  - docs: the README names sudo among the Section 3 commands
+  - lint: ty 0.0.105 to 0.0.107 as tested
+
+
 7.22.0
 ------
 
