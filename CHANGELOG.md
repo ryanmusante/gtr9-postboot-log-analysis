@@ -3,6 +3,50 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.25.0
+------
+
+  - report: no numeral opens a sentence; the cover verdict, Sections 6 and 7,
+    Appendix B, two captions, and the missing-data lines are recast
+  - report: temperatures read CPU, board, and GPU in place of inxi's cpu,
+    mobo, and gpu
+  - report: the PDF names gtr9-postboot-log-analysis as its author, not
+    build_report.py
+  - actions: a ry-verify hint that names no fix, such as a sudo-lapse note,
+    reads as a note in Section 3, not as a suggestion
+  - layout: five named stroke weights replace ten
+  - layout: the cover's band names the edition, full report or brief
+    report, in place of the capture date
+  - figures: log-scale count axes read 1, 10, and 100 in place of 10^0,
+    10^1, and 10^2
+  - ry-verify: the iw-regdomain FAIL of 7.274.0 no longer reads as a fix;
+    iw counts as a command only in iw reg
+  - cli: a failed import also names the other missing modules, so one pacman
+    line installs them all
+  - build: build_report.py is 16 lines longer (6,984); the JSON summary and
+    the exit codes are unchanged
+  - docs: the README reads in shorter paragraphs, How It Works in
+    subsections, and The Report before the JSON Summary
+  - docs: the README names the dmesg lines whose wording sets their source:
+    splats, OOM kills, machine checks, and block, file-system, and DRM lines
+  - docs: the README names CachyOS beside Arch Linux as running Quick Start
+    and Verify as written
+  - lint: ruff.toml gives each ignored and excluded rule its reason on a
+    line of its own
+
+
+7.23.1
+------
+
+  - report: B.3's kernel-start note states the suspend cut the estimate
+    applies, as the code does
+  - ry-verify: the README names the records of 7.272.0 to 7.274.0 as its
+    source writes them
+  - consistency: the module docstring carries the version and date; a comment
+    dates the two INFO notes it skips by the release that made each
+  - lint: ruff 0.17.6 as tested
+
+
 7.23.0
 ------
 
@@ -135,7 +179,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.15.0
 ------
 
-  - figures: svglib's limit of 10,000 <use> elements is lifted; in 7.14.1 a
+  - figures: svglib's limit of 10,000 `<use>` elements is lifted; in 7.14.1 a
     ry-verify log of 600 sections failed the build over its chart's labels
   - ry-verify: the README names 7.265.0 as tested and 7.266.0 as read from its
     source; 7.14.1 called 7.266.0 tested
@@ -152,7 +196,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     --json
   - report: a card shows the ry-verify record its rule cites
   - figures: a figure draws at most 6,000 ticks, the journal timeline too;
-    svglib from 2.3.1 drops an SVG's <use> elements past 10,000
+    svglib from 2.3.1 drops an SVG's `<use>` elements past 10,000
   - figures: an error svglib logs over a figure fails the build, and its
     warnings go to --verbose; neither prints on stderr unprefixed
   - ry-verify: 7.266.0 logs parse as 7.265.0 logs do
@@ -243,7 +287,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     mixer; --compare against a 7.10.3 summary names it resolved
   - rules: Linux 7.3's hung-task line ("blocked in I/O wait") is a kernel
     splat; KWin 6.8's "Atomic commit failed: EACCESS" a refused commit
-  - rules: "Failed to start dbus-:<email-address-redacted>" belongs to the
+  - rules: `Failed to start dbus-:<email-address-redacted>` belongs to the
     redacted D-Bus unit, so it raises no unit-failure action
   - rules: a GPU hang claims the "device wedged" line; a FAT volume not
     cleanly unmounted is a watch item, the DRM panic boot line boilerplate
@@ -291,7 +335,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - parsing: an event of the current boot no longer claims the previous boot's
     first journal entries; inxi keys may carry a background color
   - privacy: email masking covers domains of several labels, as in
-    a.b@mail.example.co.uk; a nil UUID in a unit name stays readable
+    `a.b@mail.example.com`; a nil UUID in a unit name stays readable
   - cli: a default output name that names a directory fails before layout; a
     summary that fails after the PDF names it; cleanup survives signals
   - cli: --brief titles the PDF brief; a relative XDG_DATA_HOME is ignored;

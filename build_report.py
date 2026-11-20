@@ -5,7 +5,7 @@
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Ryan Musante
-"""Analyze a cachyos-bugreport.log and a ry-verify JSONL log and build a PDF report.
+"""build_report.py 7.25.0 (2026-11-19): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
 
 Every finding, quote, line reference, and figure comes from the two inputs on each run;
 the script carries analysis rules (message patterns and what they mean), never results.
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.23.0"
+__version__ = "7.25.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -89,7 +89,7 @@ FONT_FILES = {
     "PlexC": "IBMPlexSansCondensed-Regular", "PlexC-SB": "IBMPlexSansCondensed-SemiBold",
     "PlexM": "IBMPlexMono-Regular", "PlexM-SB": "IBMPlexMono-SemiBold",
 }  # fmt: skip
-# The pacman package of each module beyond reportlab: an import error names it, and the preflight checks all three.
+# The pacman package of each module beyond reportlab; a failed import and the preflight name every missing one.
 MODULES = {"matplotlib": "python-matplotlib", "svglib": "python-svglib", "PIL": "python-pillow"}
 MAX_PASSES = 6  # layout passes allowed before the page references must have settled
 SCRATCH_TRIES = 100  # scratch names write_scratch() tries; of 64 random bits each, the first all but always serves
@@ -174,9 +174,13 @@ try:
     from reportlab.platypus.doctemplate import LayoutError
 except ImportError as exc:
     missing = exc.name or "reportlab"
-    package = MODULES.get(missing.partition(".")[0], "python-reportlab")
+    root = missing.partition(".")[0]
+    package = MODULES.get(root, "python-reportlab")
+    others = [n for n in ("reportlab", *MODULES) if n != root and importlib.util.find_spec(n) is None]
+    also = ", ".join(f"{n} (pacman: {MODULES.get(n, 'python-reportlab')})" for n in others)  # one pacman line for all
     if sys.stderr is not None:  # print() would fall back to stdout, which carries only the written path
-        print(f"build_report.py: cannot import {missing} (pacman: {package})", file=sys.stderr)
+        tail = f"; also missing: {also}" if also else ""
+        print(f"build_report.py: cannot import {missing} (pacman: {package}){tail}", file=sys.stderr)
     sys.exit(EXIT_PREFLIGHT)
 
 
@@ -471,7 +475,7 @@ class VerifyLog:
 
     @property
     def hints(self) -> list[VerifyItem]:
-        """Return the INFO records in which ry-verify suggests a fix, in log order.
+        """Return the INFO records in which ry-verify suggests a fix or adds a note to a record, in log order.
 
         A ↳ line logged right after a FAIL, WARN, or ERR record of the same section and sub-heading is that record's
         hint; an INFO record that names its fix (Run: …, Install missing: …) is one too, as older logs word them.
@@ -774,7 +778,7 @@ GENERATOR_FAILED = re.compile(r": generator failed\b")  # a FAIL record that ry-
 PHASE_BANNER = re.compile(r"^INFO: (?:Static|Runtime) verification \(")  # a phase heading logged as INFO, no result
 # ry-verify's signal handler logs this through _log, which counts nothing: no result either.
 SIGNAL_NOTICE = re.compile(r"^WARN: Caught (?:SIG[A-Z]+|exit) — cleaning up")
-# ERR lines ry-verify does not count: continuations of a counted ERR, and two notes it logs as INFO from 7.257.0 on.
+# ERR lines ry-verify does not count: continuations of a counted ERR, and two INFO notes (sudo 7.257.0+, ESP 7.258.0+).
 UNCOUNTED_ERR = re.compile(
     r"^ERR: (?:sudo required for verification$|\s+(?:Checking gfx1151/Strix Halo expectations "
     r"|Override \(at your risk\): |ESP autodetect failed AND /boot is not a directory))"
@@ -794,7 +798,7 @@ VERIFY_PREFLIGHT = 3  # ry-verify's exit when a gate stops the run: missing sudo
 SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify skipped as its sudo cache lapsed
 SUDO_UNCACHED = re.compile(r"\bsudo -v left sudo -n unusable\b")  # a gate's reason when sudo -v caches nothing
 # A fix a FAIL or WARN record names in its last clause, after a dash (— sudo chown …), a parenthesis, or a semicolon.
-FIX_VERB = r"(?:systemctl|chown|chmod|iw|mount)"  # as a bare word after other words, only systemctl names a command
+FIX_VERB = r"(?:systemctl|chown|chmod|iw reg|mount)"  # as a bare word after other words, only systemctl names a command
 FIX_COMMAND = re.compile(
     rf"(?:—|\(|;)\s*+(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
 )
@@ -1481,17 +1485,23 @@ def secs_span(a: float, b: float) -> str:
     return f"{a:,.2f}–{b:,.2f} s"
 
 
-def not_read(lines: Sequence[int], log: str) -> str:
-    """Return how many lines of a log the parser could not read, as "3 journal lines could not be read"."""
-    return f"{len(lines):,}{NBSP}{log} {'line' if len(lines) == 1 else 'lines'} could not be read"
+def not_read(lines: Sequence[int], log: str, *, lead: bool = False) -> str:
+    """Return how many lines of a log the parser could not read, as "3 journal lines could not be read".
+
+    With lead, the count opens a sentence instead: "The parser could not read 3 journal lines".
+    """
+    count = f"{len(lines):,}{NBSP}{log} {'line' if len(lines) == 1 else 'lines'}"
+    return f"The parser could not read {count}" if lead else f"{count} could not be read"
 
 
-def no_journal(m: Model) -> str:
+def no_journal(m: Model, *, lead: bool = False) -> str:
     """Return how many journal lines the parser could not read, or "no journal entries" when it read every line.
 
-    Callers ask for the second form only when the journal holds no entries.
+    With lead, either form opens a sentence. Callers ask for the second form only when the journal holds no entries.
     """
-    return not_read(m.br.journal_unparsed, "journal") if m.br.journal_unparsed else "no journal entries"
+    if m.br.journal_unparsed:
+        return not_read(m.br.journal_unparsed, "journal", lead=lead)
+    return "No journal entries" if lead else "no journal entries"
 
 
 def unread_lines(m: Model, boot: str) -> int:
@@ -2284,10 +2294,13 @@ def gpu_health(m: Model) -> list[tuple[str, str, str, str]]:
     return rows
 
 
+SENSOR_NAMES = {"cpu": "CPU", "mobo": "board", "gpu": "GPU"}  # inxi's sensor labels, as the report names them
+
+
 def sensor_temps(text: str) -> list[str]:
-    """Return inxi's CPU, board, and GPU temperatures as "cpu 49.6 °C", in the order inxi prints them."""
+    """Return inxi's CPU, board, and GPU temperatures as "CPU 49.6 °C", in the order inxi prints them."""
     found = re.findall(r"\b(cpu|mobo|gpu)\S*:(?:\s+\S+\s+temp:)?\s+([\d.]+) C\b", text)
-    return [f"{name} {value}{CELSIUS}" for name, value in found]
+    return [f"{SENSOR_NAMES[name]} {value}{CELSIUS}" for name, value in found]
 
 
 def hardware_health(m: Model) -> list[tuple[str, str, str, str]]:
@@ -2377,14 +2390,16 @@ SPLAT_LINE = re.compile(
     r"|---\[ end trace|INFO: task .+ blocked|-+\[ cut here \]|CPU: \d+ (?:UID: \d+ )?PID: |Tainted: \["
     r"|(?:R[A-D]X|R[SD]I|R[SB]P|R(?:0[89]|1[0-5])|[CDEFGS]S|CR[0-4]|DR[0-7]|PKRU): |task:\S+ +state:|\"echo 0 > "
 )  # a kernel splat's lines, matched from their start: banner, task, registers, trace
+# Shared by DMESG_WORDING and SOURCE_WORDING: the OOM killer's lines and a machine-check report's, from their start.
+OOM_KILL = r"Out of memory|oom-kill:|oom_reaper:|Memory cgroup out of memory|\S+ invoked oom-killer:"
+MACHINE_CHECK = r"(?:\{\d+\})?\[Hardware Error\]"
 
 
 # Messages whose first word names no subsystem, known by their wording: error classes, kernel splats, setup lines.
 DMESG_WORDING = (
     (re.compile(r"\[drm:"), "GPU"),  # [drm:amdgpu_job_timedout [amdgpu]] *ERROR* …
     (re.compile(r"(?:Buffer )?I/O error\b|[\w ]+ error, dev \S+, sector "), "Storage"),  # the block layer's errors
-    (re.compile(r"Out of memory|oom-kill:|oom_reaper:|Memory cgroup out of memory|\S+ invoked oom-killer:"
-                r"|(?:\{\d+\})?\[Hardware Error\]"), "CPU and memory"),  # and machine-check reports
+    (re.compile(f"{OOM_KILL}|{MACHINE_CHECK}"), "CPU and memory"),  # OOM kills and machine-check reports
     (re.compile(r"No NUMA configuration found|\.\.\.\. node +#\d+, CPUs:|software IO TLB|IPI shorthand broadcast"
                 r"|page_reporting|\S+ \(\d+\): drop_caches: "), "CPU and memory"),  # memory setup and cache drops
     (re.compile(r"Initiali[sz]e system trusted keyrings|Asymmetric key parser|Loading compiled-in X\.509"
@@ -2504,7 +2519,7 @@ def unit_glob(name: str, room: int) -> str:
 
 
 def verify_action(m: Model) -> Action | None:
-    """Return the action for ry-verify's failures and warnings: its own suggested fixes as comments, then a rerun.
+    """Return the action for ry-verify's failures and warnings: its own fixes and notes as comments, then a rerun.
 
     The rerun caches sudo first when a gate stopped ry-verify for want of sudo or its sudo cache lapsed mid-run:
     with sudo -v, or with sudo true where the gate found that sudo -v caches nothing (verifypw), as ry-verify 7.269.0
@@ -2523,10 +2538,11 @@ def verify_action(m: Model) -> Action | None:
     for tip in tips[:MAX_LISTED]:  # a record that names its fix keeps its end, where the fix stands
         hint = tip.text.removeprefix("↳").lstrip()  # the arrow ties a hint to its record in ry-verify's own output
         text = clip(quote(hint), QUOTE_CLIP) if tip.status == "INFO" else clip_start(sanitize(tip.text), QUOTE_CLIP)
-        line = f"ry-verify suggests (VJ {tip.no}): {text}"
+        verb = "notes" if tip.status == "INFO" and not RUN_HINT.search(tip.text) else "suggests"
+        line = f"ry-verify {verb} (VJ {tip.no}): {text}"
         cmds += comment(line, fix_start(line))
     if rest := tips[MAX_LISTED:]:
-        cmds += comment(f"{plural(len(rest), 'more suggestion')}: VJ {ranges([h.no for h in rest], COMMENT_RUNS)}")
+        cmds += comment(f"{len(rest):,} more from ry-verify: VJ {ranges([h.no for h in rest], COMMENT_RUNS)}")
     if lapses := m.vj.lapses:
         lines = ranges([i.no for i in lapses], COMMENT_RUNS)
         cmds += comment(f"{plural(len(lapses), 'check')} skipped as ry-verify's sudo cache lapsed: VJ {lines}")
@@ -2868,9 +2884,10 @@ def log_counts(ax: Axes, peak: int) -> float:
 
     The fixed floor keeps a one-count bar visible and a label at the axis middle inside the axes.
     """
-    from matplotlib.ticker import NullFormatter
+    from matplotlib.ticker import FuncFormatter, NullFormatter
 
     ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))  # 1, 10, 100, as the uptime strip reads
     ax.yaxis.set_minor_formatter(NullFormatter())  # a range under a decade would label its minor ticks too
     top = peak * 1.8
     ax.set_ylim(0.8, top)
@@ -3805,7 +3822,7 @@ PALETTE = {  # the report's grays, darkest first: markup takes the hex strings, 
 INK, DARK, SOFT, MUTE, RULE, LIGHT, ZEBRA = (
     HexColor(PALETTE[k]) for k in ("ink", "dark", "soft", "mute", "rule", "light", "zebra")
 )
-HAIR = 0.25  # pt, the weight of every separator rule
+HAIR, FINE, FIRM, BAND, BAR = 0.25, 0.6, 1.0, 2.0, 3.2  # pt: separators, inner rules, frames, bands, bars
 PW, PH = letter
 LM = RM = 50  # pt, left and right page margins
 TOPM, BOTM = 58, 54  # pt, top and bottom page margins (the running header and footer sit inside them)
@@ -4144,7 +4161,7 @@ class HPara(Paragraph):
         super().draw()
         if self.level == 0:
             canvas.setStrokeColor(INK)
-            canvas.setLineWidth(1.1)
+            canvas.setLineWidth(FIRM)
             canvas.line(0, -3.5, FW, -3.5)
 
 
@@ -4174,12 +4191,12 @@ def table_style(head: int) -> list[tuple[object, ...]]:
     """Return the house grid commands: ruled header at row `head` (0, or 1 under a title row), zebra rows below."""
     return [
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LINEABOVE", (0, head), (-1, head), 1.0, INK), ("LINEBELOW", (0, head), (-1, head), 0.6, INK),
+        ("LINEABOVE", (0, head), (-1, head), FIRM, INK), ("LINEBELOW", (0, head), (-1, head), FINE, INK),
         ("LINEBELOW", (0, head + 1), (-1, -1), HAIR, RULE), ("BACKGROUND", (0, head), (-1, head), LIGHT),
         ("ROWBACKGROUNDS", (0, head + 1), (-1, -1), [colors.white, ZEBRA]),
         ("LEFTPADDING", (0, head), (-1, -1), CELL_PAD / 2), ("RIGHTPADDING", (0, head), (-1, -1), CELL_PAD / 2),
         ("TOPPADDING", (0, head), (-1, -1), 2.6), ("BOTTOMPADDING", (0, head), (-1, -1), 2.9),
-        ("LINEBELOW", (0, -1), (-1, -1), 0.8, INK),
+        ("LINEBELOW", (0, -1), (-1, -1), FIRM, INK),
     ]  # fmt: skip
 
 
@@ -4321,7 +4338,7 @@ def group_commands(groups: Mapping[int, str], first: int, rows: int) -> list[tup
         end = (heads[i + 1] if i + 1 < len(heads) else rows) + first  # the group's last row
         commands += [
             ("SPAN", (0, row), (-1, row)), ("BACKGROUND", (0, row), (-1, row), LIGHT),
-            ("LINEABOVE", (0, row), (-1, row), 0.6, INK), ("NOSPLIT", (0, row), (-1, min(row + 1, last))),
+            ("LINEABOVE", (0, row), (-1, row), FINE, INK), ("NOSPLIT", (0, row), (-1, min(row + 1, last))),
         ]  # fmt: skip
         if end - 1 > row:  # so a page never opens with the group's last record alone
             commands.append(("NOSPLIT", (0, end - 1), (-1, end)))
@@ -4369,7 +4386,7 @@ def draw_mark(canvas: Canvas, x: float, y: float, severity: str) -> None:
     canvas.saveState()
     canvas.setStrokeColor(INK)
     canvas.setFillColor(INK)
-    canvas.setLineWidth(0.6)
+    canvas.setLineWidth(FINE)
     if severity == "MED":
         canvas.rect(x, y, MARK_SIZE / 2, MARK_SIZE, stroke=0, fill=1)
     canvas.rect(x, y, MARK_SIZE, MARK_SIZE, stroke=1, fill=int(severity == "HIGH"))
@@ -4413,7 +4430,7 @@ def chip(text: str) -> Table:
     box = Table([[Paragraph(f'<font color="{ink.hexval()}">{text}</font>', sty_chip)]], colWidths=[chip_width(text)],
                 rowHeights=[11])  # fmt: skip
     commands = [
-        ("BACKGROUND", (0, 0), (-1, -1), fill), ("BOX", (0, 0), (-1, -1), 0.7, border), *ZERO_PAD[:2],
+        ("BACKGROUND", (0, 0), (-1, -1), fill), ("BOX", (0, 0), (-1, -1), FINE, border), *ZERO_PAD[:2],
         ("TOPPADDING", (0, 0), (-1, -1), 1.4), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]  # fmt: skip
     box.setStyle(TableStyle(commands))
@@ -4466,9 +4483,9 @@ def card_style(severity: str, *, has_evidence: bool) -> list[tuple[object, ...]]
     """Return a card's table commands: box and left bar weighted by severity, rules, padding, evidence shading."""
     heavy = severity in ("HIGH", "MED")
     commands: list[tuple[object, ...]] = [
-        ("SPAN", (0, 0), (-1, 0)), ("SPAN", (0, 1), (-1, 1)), ("BOX", (0, 0), (-1, -1), 1.0 if heavy else 0.7, INK),
-        ("LINEBEFORE", (0, 0), (0, -1), 3.2 if heavy else 1.6, INK), ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.7, INK), ("LINEBELOW", (0, 1), (-1, -2), HAIR, RULE),
+        ("SPAN", (0, 0), (-1, 0)), ("SPAN", (0, 1), (-1, 1)), ("BOX", (0, 0), (-1, -1), FIRM if heavy else FINE, INK),
+        ("LINEBEFORE", (0, 0), (0, -1), BAR if heavy else BAND, INK), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBELOW", (0, 0), (-1, 0), FINE, INK), ("LINEBELOW", (0, 1), (-1, -2), HAIR, RULE),
         ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
         ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.4),
         ("TOPPADDING", (0, 0), (-1, 0), 4.5), ("BOTTOMPADDING", (0, 0), (-1, 0), 4.5),
@@ -4564,7 +4581,7 @@ def code_block(label: str, lines: Sequence[str]) -> list[Flowable]:
     block = Table(rows, colWidths=[FW], spaceAfter=4)
     commands = [
         ("BACKGROUND", (0, 0), (-1, 0), DARK), ("BACKGROUND", (0, 1), (-1, -1), ZEBRA),
-        ("BOX", (0, 0), (-1, -1), 0.6, INK), ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("BOX", (0, 0), (-1, -1), FINE, INK), ("LEFTPADDING", (0, 0), (-1, -1), 7),
         ("TOPPADDING", (0, 0), (-1, 0), 2.5), ("BOTTOMPADDING", (0, 0), (-1, 0), 2.5),
         ("TOPPADDING", (0, 1), (-1, -1), 1.6), ("BOTTOMPADDING", (0, 1), (-1, -1), 1.6),
         ("BOTTOMPADDING", (0, -1), (-1, -1), 5), ("TOPPADDING", (0, 1), (-1, 1), 5),
@@ -4617,12 +4634,15 @@ def verdict(m: Model) -> tuple[str, str]:
             parts.append(f"ry-verify logged {gen:,} {'more ' if shown else ''}GEN_FAIL")
         head = f"Attention — {'; '.join(parts)}."
         if c["LOW"]:
-            low = f"{plural(c['LOW'], 'LOW finding')} also {'needs' if c['LOW'] == 1 else 'need'} action"
+            many = c["LOW"] > 1
+            low = f"Another {c['LOW']:,} LOW findings need action" if many else "Another LOW finding needs action"
     elif c["LOW"]:
         head = f"Healthy, with {plural(c['LOW'], 'LOW finding')} to act on."
     else:
         head = "Healthy — no HIGH, MED, or LOW findings."
     info = f"{plural(c['INFO'], 'INFO finding')} explained" if c["INFO"] else ""
+    if info and not low:  # a sentence opens with a word, not a count
+        info = f"{{s:sec-A}} explains {plural(c['INFO'], 'INFO finding')}"
     findings = "; ".join(x for x in (low, info) if x)
     since = ""
     if STATE.compare is not None:
@@ -4702,7 +4722,7 @@ def kpi_strip(m: Model) -> Table:
     col = 0
     for name, g in groups:
         end = col + len(g) - 1
-        commands += [("SPAN", (col, 0), (end, 0)), ("BOX", (col, 0), (end, -1), 0.9, INK)]
+        commands += [("SPAN", (col, 0), (end, 0)), ("BOX", (col, 0), (end, -1), FIRM, INK)]
         if name == "WATCH":
             commands.append(("BACKGROUND", (col, 0), (end, -1), LIGHT))
         col = end + 1
@@ -4750,7 +4770,7 @@ def health_tiles(m: Model) -> Table:
     ]  # fmt: skip
     tiles = Table([cells], colWidths=[FW / len(cells)] * len(cells))
     commands = [
-        ("LINEABOVE", (0, 0), (-1, 0), 2.0, INK), ("LINEBEFORE", (1, 0), (-1, -1), HAIR, RULE),
+        ("LINEABOVE", (0, 0), (-1, 0), BAND, INK), ("LINEBEFORE", (1, 0), (-1, -1), HAIR, RULE),
         ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 5),
         ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
     ]  # fmt: skip
@@ -5073,7 +5093,7 @@ def cover_checklist(m: Model) -> list[Flowable]:
 
 def tick_box() -> Table:
     """Return an empty tick box for the actions checklist."""
-    return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), 0.9, INK)])
+    return Table([[""]], colWidths=[9], rowHeights=[9], style=[("BOX", (0, 0), (-1, -1), FIRM, INK)])
 
 
 def inputs_table(m: Model) -> list[Flowable]:
@@ -5098,9 +5118,9 @@ def inputs_table(m: Model) -> list[Flowable]:
 METHOD = (
     "The bug report splits at its separator lines; quotes keep line numbers; counts are of messages.",
     (
-        f"{len(RULES)} rules recognize message classes, reading a message's first {SCAN_LIMIT:,} characters; the first "
-        "matching rule claims a line, and a rule for an event the lines that follow it, such as a GPU timeout's "
-        "process and ring-reset lines."
+        f"The {len(RULES)} rules recognize message classes, reading a message's first {SCAN_LIMIT:,} characters; the "
+        "first matching rule claims a line, and a rule for an event the lines that follow it, such as a GPU "
+        "timeout's process and ring-reset lines."
     ),
     (
         "A dmesg line belongs to the subsystem its prefix or wording names, an indented line to the message above; a "
@@ -5129,9 +5149,9 @@ METHOD = (
         "it leaves out a device the evidence comes from, or the evidence names none."
     ),
     (
-        "Each kernel message logged once in both dmesg and the current journal bounds the kernel start to one second, "
-        "from above only when no journald ran as it printed; the estimate is the middle of the window they share, "
-        "± half its width."
+        "Each kernel message logged once in both dmesg and the current journal before the first suspend bounds the "
+        "kernel start to one second, from above only when no journald ran as it printed; the estimate is the middle "
+        "of the window they share, ± half its width."
     ),
     "Every HIGH, MED, and LOW finding is answered by an action on the checklist.",
     (
@@ -5140,8 +5160,8 @@ METHOD = (
     ),
     "Severity follows the observed impact on this host, not the log level.",
     (
-        f"{len(KEYWORDS)} failure keywords, which the README lists, match case-insensitively as whole words; a line a "
-        "NOTE rule claims is not counted."
+        f"The {len(KEYWORDS)} failure keywords, which the README lists, match case-insensitively as whole words; a "
+        "line a NOTE rule claims is not counted."
     ),
 )
 
@@ -5287,8 +5307,7 @@ def subsystems_caption(m: Model) -> str:
     text = "One tick per dmesg line; a bar spans each subsystem's first to last line, the lines drawn beside its name; "
     text += f"rows follow the first line{', Other last' if OTHER in drawn else ''}."
     if outside := sum(1 for e in m.br.dmesg if axis and e.t >= axis[0]):
-        verb = "falls" if outside == 1 else "fall"
-        text += f" {plural(outside, 'later line')} {verb} outside the chart; {section_ref('sub-6.1')} counts all."
+        text += f" The chart leaves out {plural(outside, 'later line')}; {section_ref('sub-6.1')} counts all."
     return text
 
 
@@ -5306,7 +5325,7 @@ def boot_caption(m: Model) -> str:
         text += f" Capture points use the kernel-start estimate (±{secs(m.kernel_start[1])})."
     text += captures_left(m, drawn)
     if outside := sum(1 for e in m.br.dmesg if e.t >= xmax):
-        text += f" {plural(outside, 'later dmesg line')} {'falls' if outside == 1 else 'fall'} outside the chart."
+        text += f" The chart leaves out {plural(outside, 'later dmesg line')}."
     return text
 
 
@@ -5425,7 +5444,7 @@ def no_boot(m: Model) -> str:
     """Return why the report shows no boot: no dmesg line, none the parser read, or a ring buffer that lost the boot."""
     if not m.br.dmesg:
         unread = m.br.dmesg_unparsed
-        return not_read(unread, "dmesg") if unread else "The bug report holds no dmesg line"
+        return not_read(unread, "dmesg", lead=True) if unread else "The bug report holds no dmesg line"
     return f"dmesg no longer holds the boot: its first line comes {secs(m.br.dmesg[0].t)} after the kernel start"
 
 
@@ -5662,8 +5681,8 @@ def _story_dmesg(m: Model) -> list[Flowable]:
     rows, total = source_rows(m)
     if rows:
         if total > SOURCES:
-            lead = f"{total:,} sources log dmesg lines with failure keywords; the table lists {SOURCES}, those of "
-            out.append(para(f"{lead}findings that call for action first and explained ones last.", sty_lead))
+            lead = f"Failure keywords appear in dmesg lines from {total:,} sources; the table lists {SOURCES}, those "
+            out.append(para(f"{lead}of findings that call for action first and explained ones last.", sty_lead))
         head = ["Source", "Subsystem", "Keyword lines", "Lines", "First", "Last", "Matched by"]
         out += table(head, rows, [138, 88, 60, 36, 58, 58, 74], title="dmesg sources with failure keywords",
                      mono=(0,), right=(2, 3, 4, 5))  # fmt: skip
@@ -5700,8 +5719,7 @@ def _story_journal(m: Model) -> list[Flowable]:
     else:
         overview = []
     if not m.br.journal:
-        why = no_journal(m)
-        return [*out, para(f"{why[0].upper()}{why[1:]}."), *overview]
+        return [*out, para(f"{no_journal(m, lead=True)}."), *overview]
     out += [HPara("sub-7.1"), *overview, HPara("sub-7.2")]
     out += [*svgfig(STATE.charts.get("journal"), "Journal timeline", journal_caption(m)), HPara("sub-7.3")]
     head = ["Process", "Current", "Previous", "Keyword entries", "Matched by"]
@@ -5739,12 +5757,12 @@ def journal_comparison(m: Model) -> list[Flowable]:
     rows, total = new
     if not rows:
         return [
-            para("Every message of the current boot also appears in the previous one, numbers and hex values aside.")
+            para("Numbers and hex values aside, every message of the current boot also appears in the previous one.")
         ]
     most = f"; the table lists the {REPEATS} most frequent" if total > REPEATS else ""
     verb = "does" if total == 1 else "do"
-    lead = f"{plural(total, 'message')} of the current boot {verb} not appear in the previous one, numbers and "
-    lead += f"hex values aside{most}."
+    lead = f"Numbers and hex values aside, {plural(total, 'message')} of the current boot {verb} not appear in the "
+    lead += f"previous one{most}."
     return [
         para(lead, sty_lead),
         *table(["Message", "Entries", "First", "Matched by"], rows, [318, 50, 50, 94],
@@ -5763,7 +5781,7 @@ def dmesg_lead(m: Model) -> str:
         share = ("both" if matched == 2 else "all") if notes == matched else f"{notes:,}"
         rules += ", a NOTE rule" if matched == 1 else f", {share} of them a NOTE rule"
     lost = f"; {not_read(m.br.dmesg_unparsed, 'dmesg')}" if m.br.dmesg_unparsed else ""
-    return f"{plural(len(d), 'dmesg line')}, {span} since the kernel start; {rules}{lost}."
+    return f"The bug report holds {plural(len(d), 'dmesg line')}, {span} since the kernel start; {rules}{lost}."
 
 
 def journal_overview_rows(m: Model) -> list[list[object]]:
@@ -5886,10 +5904,9 @@ def after_groups(m: Model) -> list[list[DmesgEntry]]:
 
 def after_lead(lines: int, total: int) -> str:
     """Return the sentence above the after-boot messages: the lines, their messages, and what the table lists."""
-    verb = "follows" if lines == 1 else "follow"
     held = f": {plural(total, 'message')}, numbers and hex values aside" if total < lines else ""
     most = f"; the table lists the {REPEATS} that come first" if total > REPEATS else ""
-    return f"{plural(lines, 'dmesg line')} {verb} the boot's burst{held}{most}."
+    return f"The boot's burst is followed by {plural(lines, 'dmesg line')}{held}{most}."
 
 
 SOURCE_MAX = 40  # characters of a dmesg prefix that can name its source; a longer one is message text
@@ -5897,9 +5914,8 @@ SOURCES = 10  # sources the source table lists: by tier (source_rows()), then th
 
 
 SOURCE_WORDING = (
-    (re.compile(r"^(?:Out of memory|oom-kill:|oom_reaper:|Memory cgroup out of memory|\S+ invoked oom-killer:)"),
-     "OOM killer"),
-    (re.compile(r"^(?:\{\d+\})?\[Hardware Error\]"), "machine check"),
+    (re.compile(f"^(?:{OOM_KILL})"), "OOM killer"),
+    (re.compile(f"^{MACHINE_CHECK}"), "machine check"),
     (re.compile(rf"(?:I/O|{BLOCK_ERRORS}) error,? (?:on )?dev ([\w-]+)"), "block {}"),  # by the device it names
     (re.compile(r"^([\w-]+) (?:error|warning|info|notice|critical) \(device ([\w-]+)\)"), "{} ({})"),  # BTRFS, ext4
     (re.compile(r"^\[drm:\S+ \[(\w+)\]\]"), "{} [drm]"),  # [drm:amdgpu_job_timedout [amdgpu]]
@@ -5909,9 +5925,9 @@ SOURCE_WORDING = (
 def dmesg_source(text: str) -> str:
     """Return what a dmesg line names as its source.
 
-    Kernel splats, OOM kills, machine checks, block-layer and file-system errors, and DRM function tags have sources
-    of their own; any other line's source is the prefix before its first ": " when that is short (a driver and its
-    device, usb 1-4, an interface, or a subsystem, "(bug)" aside), else its first word.
+    Kernel splats, OOM kills, machine checks, block-layer errors, file-system messages that name their device, and DRM
+    function tags have sources of their own; any other line's source is the prefix before its first ": " when that is
+    short (a driver and its device, usb 1-4, an interface, or a subsystem, "(bug)" aside), else its first word.
     """
     if SPLAT_LINE.match(text):
         return "kernel splat"
@@ -6009,7 +6025,7 @@ def journal_repeats(m: Model) -> tuple[list[list[object]], int]:
 def repeats_lead(total: int, noun: str, nouns: str) -> str:
     """Return the sentence above a repeats table: how many messages repeat, and whether the table lists them all."""
     most = f"; the table lists the {REPEATS} most frequent" if total > REPEATS else ""
-    return f"{plural(total, noun, nouns)} {'repeats' if total == 1 else 'repeat'}, numbers and hex values aside{most}."
+    return f"Numbers and hex values aside, {plural(total, noun, nouns)} {'repeats' if total == 1 else 'repeat'}{most}."
 
 
 def evidence_owners(m: Model, stream: str) -> dict[int, list[str]]:
@@ -6232,7 +6248,7 @@ class Doc(BaseDocTemplate):
         super().__init__(
             output, pagesize=letter, leftMargin=LM, rightMargin=RM, topMargin=TOPM, bottomMargin=BOTM,
             title=f"{report_name()} · {m.facts.get('machine', UNKNOWN_MACHINE)} ({capture_day(m)})",
-            lang="en-US", displayDocTitle=True, author="build_report.py",
+            lang="en-US", displayDocTitle=True, author="gtr9-postboot-log-analysis",
             subject=f"Findings from {file_name(m.br.path)} and {file_name(m.vj.path)}",
             keywords="CachyOS, cachyos-bugreport, ry-verify, dmesg, journal, log analysis",
             creator=f"build_report.py {__version__} (ReportLab)",
@@ -6311,7 +6327,7 @@ def footer(canvas: Canvas, doc: BaseDocTemplate) -> None:
 
 
 def on_cover(canvas: Canvas, doc: BaseDocTemplate) -> None:
-    """Decorate the cover: black band with the report name and capture date, plus the footer."""
+    """Decorate the cover: black band with the report name and edition, plus the footer."""
     canvas.showOutline()  # the bookmarks pane opens with the file
     if STATE.attach:
         attach_inputs(canvas, model())
@@ -6320,8 +6336,8 @@ def on_cover(canvas: Canvas, doc: BaseDocTemplate) -> None:
     canvas.rect(0, PH - 30, PW, 30, stroke=0, fill=1)
     canvas.setFillColor(colors.white)
     canvas.setFont("Plex-SB", 7.8)
-    canvas.drawString(LM, PH - 19, "POST-BOOT LOG ANALYSIS · BRIEF" if STATE.brief else "POST-BOOT LOG ANALYSIS")
-    canvas.drawRightString(PW - RM, PH - 19, capture_label(model()).upper())
+    canvas.drawString(LM, PH - 19, "POST-BOOT LOG ANALYSIS")
+    canvas.drawRightString(PW - RM, PH - 19, "BRIEF REPORT" if STATE.brief else "FULL REPORT")
     footer(canvas, doc)
     canvas.restoreState()
 

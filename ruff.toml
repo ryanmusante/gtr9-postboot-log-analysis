@@ -1,27 +1,34 @@
 # Lint and format settings for build_report.py:
-# `ruff check build_report.py`, `ruff format build_report.py`.
+#   ruff check build_report.py
+#   ruff format build_report.py
 line-length = 120
 target-version = "py312"
 
 [lint]
 select = [
-    "E", "W", "F", "I", "B", "UP", "N", "D", "ANN", "ARG", "C4", "SIM", "RUF", "PTH", "FBT",
-    "EM", "S", "PL", "RET", "PIE", "ISC",
+    "E", "W", "F", "I", "B", "UP", "N", "D", "ANN", "ARG", "C4", "SIM", "RUF", "PTH",
+    "FBT", "EM", "S", "PL", "RET", "PIE", "ISC",
 ]
-ignore = [
-    "D203",     # docstring layout follows D211 (no blank line before a class docstring)
-    "D213",     # and D212 (summary on the first line)
-    "PLR2004",  # small counts, seconds per hour and minute, clock limits, and a width tolerance read best as literals
-    "PLC0415",  # matplotlib and svglib load after the preflight; attach_inputs() and library_versions() import on use
-    "RUF001",   # the report text uses en dashes in number and time ranges
-]
-# Left out of `select` on purpose: on the executable script (0755), `ruff check --select ALL --ignore
-# D203,D213,PLR2004,PLC0415,RUF001` adds only COM812 (trailing commas are the formatter's call),
-# T201 (print is the command-line output), SLF001 (ReportLab internals: the frame position, table cells,
-# grouped flowables, and the canvas's document), and DTZ001, DTZ007, and DTZ901 (journal and capture times
-# are naive wall-clock, as the logs print them).
+# Ignored, with the reason for each:
+#   D203, D213  docstrings follow D211 and D212: no blank line before a class
+#               docstring, and the summary on the first line
+#   PLR2004     small counts, seconds per hour and minute, clock limits, and a
+#               width tolerance read best as literals
+#   PLC0415     matplotlib and svglib load after the preflight;
+#               attach_inputs() and library_versions() import on use
+#   RUF001      the report text uses en dashes in number and time ranges
+ignore = ["D203", "D213", "PLR2004", "PLC0415", "RUF001"]
+# Left out of `select` on purpose. On the executable script (0755),
+# `ruff check --select ALL --ignore D203,D213,PLR2004,PLC0415,RUF001` adds only:
+#   COM812      trailing commas are the formatter's call
+#   T201        print is the command-line output
+#   SLF001      ReportLab internals: the frame position, table cells, grouped
+#               flowables, and the canvas's document
+#   DTZ001, DTZ007, DTZ901
+#               journal and capture times are naive wall-clock, as the logs
+#               print them
 
 [lint.pylint]
-# table() takes one keyword per layout option (8 arguments, 3 positional), and a legend handler's
-# create_artists() the 8 positional ones matplotlib fixes
+# table() takes one keyword per layout option (8 arguments, 3 positional), and
+# a legend handler's create_artists() the 8 positional ones matplotlib fixes
 max-args = 8
