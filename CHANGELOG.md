@@ -3,6 +3,28 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.32.0
+------
+
+  - ry-verify: follows 7.302.0, which changes no record; the README names
+    7.265.0 to 7.302.0 as tested
+  - ry-verify: a paired run that was interrupted, or whose log has no footer
+    or exit code, is a LOW finding (key verify-unfinished) the rerun answers
+  - actions: a record that names journalctl or coredumpctl after a dash, or
+    findmnt after other words, reads as a suggestion, as one with systemctl
+  - actions: a hint is cited with the record ry-verify logged it under, as
+    VJ 100-101, so a suggestion names what it fixes
+  - actions: the note under the record that stopped ry-verify is left out,
+    as the comment on the stop quotes that record
+  - report: Section 8.2 ends a failure's row with its hints; Section 8.3
+    leaves those out and makes one row of 3 or more notes worded alike
+  - rules: a Wi-Fi link that ended and one the regulatory domain downgraded
+    are watch items; the second cites ry-verify's regulatory record
+  - build: build_report.py is 130 lines longer (7,116)
+  - docs: the README names the semicolon among the marks a suggested command
+    follows
+
+
 7.31.0
 ------
 

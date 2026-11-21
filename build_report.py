@@ -5,7 +5,7 @@
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Ryan Musante
-"""build_report.py 7.31.0 (2026-11-21): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
+"""build_report.py 7.32.0 (2026-11-21): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
 
 Every finding, quote, line reference, and figure comes from the two inputs on each run;
 the script carries analysis rules (message patterns and what they mean), never results.
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.31.0"
+__version__ = "7.32.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -382,6 +382,8 @@ class VerifyLog:
     combined: dict[str, int]
     events: dict[str, tuple[int, str]] = field(default_factory=dict)  # first KEY: event of each key, line and text
     header_no: int = 0  # the header record's line
+    footer_no: int = 0  # the footer record's line; 0 without a footer
+    last_no: int = 0  # the last record's line
 
     def meta(self, key: str) -> str:
         """Return a header field for display: sanitized and cut to META_CLIP, or "?" when the log does not state it."""
@@ -474,25 +476,35 @@ class VerifyLog:
         return [s for p in ("static", "runtime") if (s := stop_record([i for i in self.items if i.phase == p]))]
 
     @property
+    def hint_records(self) -> dict[int, VerifyItem]:
+        """Return, by each hint's line, the FAIL, WARN, or ERR record ry-verify logged the hint under.
+
+        A ↳ line logged right after such a record of the same section and sub-heading is that record's hint, and so is
+        each further ↳ line below it; any other record ends the run.
+        """
+        out: dict[int, VerifyItem] = {}
+        record: VerifyItem | None = None
+        for item in self.items:
+            if item.status in ("FAIL", "WARN", "ERR"):
+                record = item
+            elif item.status != "INFO" or not item.text.startswith("↳ "):
+                record = None
+            elif record and (record.phase, record.section, record.heading) == (item.phase, item.section, item.heading):
+                out[item.no] = record
+            else:
+                record = None
+        return out
+
+    @property
     def hints(self) -> list[VerifyItem]:
         """Return the INFO records in which ry-verify suggests a fix or adds a note to a record, in log order.
 
-        A ↳ line logged right after a FAIL, WARN, or ERR record of the same section and sub-heading is that record's
-        hint; so is an INFO record that names its fix: after Install missing:, after Run: in older logs, or as a sudo
-        command after a dash (— sudo sdboot-manage gen), as ry-verify 7.300.0 words its boot-entry hints.
+        A ↳ line logged under a FAIL, WARN, or ERR record is that record's hint (hint_records); so is an INFO record
+        that names its fix: after Install missing:, after Run: in older logs, or as a sudo command after a dash
+        (— sudo sdboot-manage gen), as ry-verify 7.300.0 words its boot-entry hints.
         """
-        out = []
-        for n, item in enumerate(self.items):
-            if item.status != "INFO":
-                continue
-            before = self.items[n - 1] if n else None
-            follows = (
-                before is not None and before.status in ("FAIL", "WARN", "ERR") and item.text.startswith("↳ ")
-                and (before.phase, before.section, before.heading) == (item.phase, item.section, item.heading)
-            )  # fmt: skip
-            if follows or RUN_HINT.search(item.text):
-                out.append(item)
-        return out
+        under = self.hint_records
+        return [i for i in self.items if i.status == "INFO" and (i.no in under or RUN_HINT.search(i.text))]
 
     @property
     def fixes(self) -> list[VerifyItem]:
@@ -799,9 +811,11 @@ VERIFY_PREFLIGHT = 3  # ry-verify's exit when a gate stops the run: missing sudo
 SUDO_LAPSE = re.compile(r"\b(?:cache lapsed|sudo lapse)\b")  # a check ry-verify skipped as its sudo cache lapsed
 SUDO_UNCACHED = re.compile(r"\bsudo -v left sudo -n unusable\b")  # a gate's reason when sudo -v caches nothing
 # A fix a FAIL or WARN record names in its last clause, after a dash (— sudo chown …), a parenthesis, or a semicolon.
-FIX_VERB = r"(?:systemctl|chown|chmod|iw reg|mount)"  # as a bare word after other words, only systemctl names a command
+FIX_VERB = r"(?:systemctl|journalctl|coredumpctl|chown|chmod|iw reg|mount)"  # the command that opens the clause
+# After other words, the commands no sentence uses as a word; findmnt only here, as (findmnt failed) opens a reason.
+FIX_WORD = r"(?:systemctl|journalctl|coredumpctl|findmnt)"
 FIX_COMMAND = re.compile(
-    rf"(?:—|\(|;)\s*+(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
+    rf"(?:—|\(|;)\s*+(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|{FIX_WORD})\s)"
 )
 RUN_HINT = re.compile(r"\b(?:Run|Install missing): (?=\S)|— (?=sudo (?!cache\b)\S)")  # a hint's fix: Run: or — sudo …
 
@@ -917,7 +931,10 @@ def parse_verify(path: Path) -> VerifyLog:
         elif (e := EVENT.match(data)) and e[1] != "ECHO":
             events.setdefault(e[1], (n, e[2]))
     header_no = next(n for n, rec in numbered if rec is header)
-    return VerifyLog(path, raw, records, header, foot, items, phase_results, combined, events, header_no)
+    footer_no = next((n for n, rec in reversed(numbered) if rec is foot), 0)
+    return VerifyLog(
+        path, raw, records, header, foot, items, phase_results, combined, events, header_no, footer_no, numbered[-1][0]
+    )
 
 
 # ── RULES ─────────────────────────────────────────────────────────────
@@ -1146,6 +1163,17 @@ RULES = (
       (r"Limiting TX power to \d+",),
       "The access point advertises a transmit-power limit and the driver applies it.",
       "Watch for a lower cap after router or firmware changes."),
+    R("wifi-drop", "Wi-Fi link ended", "Network / Wi-Fi", "WATCH", ("dmesg",),
+      (r"\bwl\w+: (?:deauthenticat|disassociat)(?:ed|ing) from ", r"\bwl\w+: Connection to AP \S+ lost"),
+      "The link to the access point ended: one side deauthenticated or disassociated, or the access point stopped "
+      "answering; the reason code names the cause, and an access point that restarts ends every link.",
+      "Watch for links that end at other times than the access point's restarts."),
+    R("wifi-regdom", "Wi-Fi link downgraded by the regulatory domain", "Network / Wi-Fi", "WATCH", ("dmesg",),
+      (r"regulatory prevented using AP config, downgraded",),
+      "The regulatory rules in force as the link came up did not allow the channel configuration the access point "
+      "advertises, so the link came up in a lower mode; at boot it can come up before the country code applies.",
+      "Watch for a link that stays downgraded once the country code is set; ry-verify checks the regulatory domain.",
+      cites=r"^Regulatory domain: "),
     R("wifi-mcu-timeout", "Wi-Fi firmware message timeouts", "Network / Wi-Fi", "WATCH", ("dmesg",),
       (r"\bmt79\d\d\w* \S+: Message [0-9a-f]+ \(seq \d+\) timeout",),
       "The Wi-Fi card's firmware did not answer the driver in time; repeated timeouts precede a dropped link or a "
@@ -1328,6 +1356,7 @@ def clip_start(text: str, limit: int) -> str:
 
 
 QUOTE_CLIP = 160  # characters of a ry-verify record quoted in running text or a command comment: two lines at most
+HINT_RECORD = 60  # characters a command comment keeps, at least, of the record a hint is logged under
 COMMENT_WIDTH = 110  # characters per comment line in a command block; longer lines would shrink its type
 
 
@@ -1370,7 +1399,7 @@ class Finding:
     matches: list[Match] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     fid: str = ""
-    anchor: str = ""  # where the register links when the finding has no card: its first ry-verify row
+    anchor: str = ""  # where the register links a finding that has no card: its first ry-verify row, or LOG_ANCHOR
 
     def count(self, stream: str, boot: str = "") -> int:
         """Return how many evidence lines come from one stream (and, for the journal, one boot)."""
@@ -1924,7 +1953,8 @@ def foreign_log(br: BugReport, vj: VerifyLog, cpu: str, start: Estimate | None) 
 
 
 PAIRING = "verify-pairing"  # the key of the finding a foreign ry-verify log makes
-PAIRING_ANCHOR = "sec-8"  # where the register links it: Section 8, which opens with the sentence on the log
+UNFINISHED = "verify-unfinished"  # the key of the finding a ry-verify run that did not finish makes
+LOG_ANCHOR = "sec-8"  # where the register links either: Section 8, which opens with the sentence on the log
 
 
 def pairing_finding(vj: VerifyLog, foreign: Sequence[Foreign]) -> Finding:
@@ -1935,7 +1965,35 @@ def pairing_finding(vj: VerifyLog, foreign: Sequence[Foreign]) -> Finding:
     lines = text_lines(vj.raw)
     f = Finding(PAIRING, f"ry-verify log from {foreign[0].words.partition(' (')[0]}", "ry-verify", "LOW", "", "")
     f.matches = [Match("verify", r.line, quote(lines[r.line - 1])) for r in foreign]
-    f.anchor = PAIRING_ANCHOR
+    f.anchor = LOG_ANCHOR
+    return f
+
+
+def unfinished(vj: VerifyLog) -> str:
+    """Return how a ry-verify run failed to finish, as running text: interrupted, or logged without a footer or exit.
+
+    "" for a run that finished, a gate's stop among them. The checks past such a run's last record never ran, so a log
+    without a FAIL or WARN shows no clean system.
+    """
+    state, why = vj.status
+    if state == "interrupted":
+        return f"the run was interrupted ({why})"
+    return f"the log has {why}" if state == "unknown" else ""
+
+
+def unfinished_finding(vj: VerifyLog) -> Finding | None:
+    """Return the LOW finding of a ry-verify run that did not finish (unfinished()), or None for one that did.
+
+    Its evidence is the footer, else the log's last record, quoted as the log holds it.
+    """
+    if not (how := unfinished(vj)):
+        return None
+    lacks = how.partition(" has ")[2]  # the log has no footer: the title names what it lacks
+    title = f"ry-verify log with {lacks}" if lacks else "ry-verify run interrupted"
+    line = vj.footer_no or vj.last_no
+    f = Finding(UNFINISHED, title, "ry-verify", "LOW", "", "")
+    f.matches = [Match("verify", line, quote(text_lines(vj.raw)[line - 1]))]
+    f.anchor = LOG_ANCHOR
     return f
 
 
@@ -2520,31 +2578,54 @@ def unit_glob(name: str, room: int) -> str:
     return "'*'"
 
 
+def tip_comments(vj: VerifyLog, stop: VerifyItem | None) -> list[str]:
+    """Return ry-verify's own fixes and notes as command comments, in log order: the first MAX_LISTED, the rest counted.
+
+    A record or hint that names its fix keeps its end, where the fix stands. A hint is cited with the record ry-verify
+    logged it under, unless a comment above quotes that record already: the stop, or a record that names a fix. A note
+    under the stop repeats it and is left out.
+    """
+    under = vj.hint_records
+    tips = sorted({i.no: i for i in (*vj.hints, *vj.fixes)}.values(), key=lambda i: i.no)
+    if stop:
+        tips = [t for t in tips if t.status != "INFO" or RUN_HINT.search(t.text) or under.get(t.no) is not stop]
+    cited = {stop.no} if stop else set()
+    out: list[str] = []
+    for tip in tips[:MAX_LISTED]:
+        hint = tip.text.removeprefix("↳").lstrip()  # the arrow ties a hint to its record, which the comment names
+        named = tip.status != "INFO" or RUN_HINT.search(tip.text)
+        text = clip_start(sanitize(hint), QUOTE_CLIP) if named else clip(quote(hint), QUOTE_CLIP)
+        lines, record = f"{tip.no}", under.get(tip.no)
+        if record is not None and record.no not in cited:
+            about = clip(quote(record.text), max(HINT_RECORD, QUOTE_CLIP - len(text)))
+            lines, text = ranges([record.no, tip.no]), f"{about} ↳ {text}"
+        cited.add(tip.no)
+        line = f"ry-verify {'suggests' if named else 'notes'} (VJ {lines}): {text}"
+        out += comment(line, fix_start(line))
+    if rest := tips[MAX_LISTED:]:
+        out += comment(f"{len(rest):,} more from ry-verify: VJ {ranges([h.no for h in rest], COMMENT_RUNS)}")
+    return out
+
+
 def verify_action(m: Model) -> Action | None:
     """Return the action for ry-verify's failures and warnings: its own fixes and notes as comments, then a rerun.
 
     The rerun caches sudo first when a gate stopped ry-verify for want of sudo or its sudo cache lapsed mid-run:
     with sudo -v, or with sudo true where the gate found that sudo -v caches nothing (verifypw), as ry-verify 7.269.0
-    does on a terminal.
+    does on a terminal. A run that did not finish is answered by the same rerun, under a title of its own when no
+    check failed.
     """
     if m.foreign:  # another boot's or machine's failures: pairing_action() has the run that shows this boot's
         return None
-    fails = [f for f in m.findings if f.key.startswith("verify-")]
+    found = [f for f in m.findings if f.key.startswith("verify-")]
+    fails, ended_early = [f for f in found if f.key != UNFINISHED], [f for f in found if f.key == UNFINISHED]
     shown, more = generator_failures(m.vj)
-    if not fails and not more:
+    if not found and not more:
         return None
     sections = {(i.phase, i.section) for i in actionable(m.vj)}
     stop = m.vj.stopped
     cmds = comment(f"ry-verify stopped (VJ {stop.no}): {clip(quote(stop.text), QUOTE_CLIP)}") if stop else []
-    tips = sorted({i.no: i for i in (*m.vj.hints, *m.vj.fixes)}.values(), key=lambda i: i.no)  # in log order
-    for tip in tips[:MAX_LISTED]:  # a record or hint that names its fix keeps its end, where the fix stands
-        hint = tip.text.removeprefix("↳").lstrip()  # the arrow ties a hint to its record in ry-verify's own output
-        named = tip.status != "INFO" or RUN_HINT.search(tip.text)
-        text = clip_start(sanitize(hint), QUOTE_CLIP) if named else clip(quote(hint), QUOTE_CLIP)
-        line = f"ry-verify {'suggests' if named else 'notes'} (VJ {tip.no}): {text}"
-        cmds += comment(line, fix_start(line))
-    if rest := tips[MAX_LISTED:]:
-        cmds += comment(f"{len(rest):,} more from ry-verify: VJ {ranges([h.no for h in rest], COMMENT_RUNS)}")
+    cmds += tip_comments(m.vj, stop)
     if lapses := m.vj.lapses:
         lines = ranges([i.no for i in lapses], COMMENT_RUNS)
         cmds += comment(f"{plural(len(lapses), 'check')} skipped as ry-verify's sudo cache lapsed: VJ {lines}")
@@ -2557,14 +2638,17 @@ def verify_action(m: Model) -> Action | None:
         cmds.append("sudo -v")
     cmds.append(f"{verify_script(m.vj)} --verify")
     kinds = "FAIL, GEN_FAIL, or WARN" if shown else "FAIL or WARN"
-    why = f"{plural(len(fails), 'finding')} in {plural(len(sections), 'ry-verify section')} with {kinds}"
+    reasons = [f"{plural(len(fails), 'finding')} in {plural(len(sections), 'ry-verify section')} with {kinds}"]
     if more:  # generator failures ry-verify counted without a record that shows them
         failed = f"{plural(more, 'more generator failure' if shown else 'generator failure')} (GEN_FAIL)"
-        why = f"{why}; ry-verify counted {failed}" if fails else f"ry-verify counted {failed}"
+        reasons = [*(reasons if fails else []), f"ry-verify counted {failed}"]
+    if ended_early:
+        reasons = [*(reasons if fails or more else []), f"{ended_early[0].fid}, {unfinished(m.vj)}"]
     done = f"ry-verify exits 0 and logs no {'FAIL, GEN_FAIL, or WARN' if shown or more else 'FAIL or WARN'}"
     if hardware_mismatch(m.vj):
         done += ", the hardware-mismatch warning aside"
-    return Action("", "Fix the failing ry-verify checks", why, cmds, done, fids(fails))
+    title = "Fix the failing ry-verify checks" if fails or more else "Run ry-verify to its end"
+    return Action("", title, "; ".join(reasons), cmds, done, fids(found))
 
 
 def pairing_action(m: Model) -> Action | None:
@@ -2737,6 +2821,8 @@ def analyze(br: BugReport, vj: VerifyLog) -> Model:
         cite_records(found, vj)
     findings = [f for f in found.values() if f.severity in FINDING_LEVELS]
     findings += [pairing_finding(vj, foreign)] if foreign else verify_findings(vj)
+    if not foreign and (ended_early := unfinished_finding(vj)):  # a foreign log's rerun answers this too
+        findings.append(ended_early)
     findings.sort(key=register_order)
     counters: dict[str, int] = {}
     for f in findings:
@@ -5143,6 +5229,10 @@ METHOD = (
         "makes one LOW finding in place of its records' own: none of them is a finding, lowers one, or is cited."
     ),
     (
+        "A ry-verify run of this boot that was interrupted, or whose log has no footer or exit code, makes one LOW "
+        "finding beside its records' own: the checks past its last record did not run."
+    ),
+    (
         f"The previous boot's last {SHUTDOWN_WINDOW} s of journal entries also meet the shutdown-noise patterns when "
         "they hold a line only a stop sequence logs."
     ),
@@ -5480,8 +5570,9 @@ def _story_findings(m: Model) -> list[Flowable]:
     where = ""
     if m.foreign:
         where = f"; the finding on the ry-verify log is in {section_ref('sec-8')}"
-    elif any(f.key.startswith("verify-") for f in m.findings):
-        where = f"; the ry-verify findings are in {section_ref('sub-8.2')}"
+    elif verify := [f for f in m.findings if f.key.startswith("verify-")]:  # an unfinished run's opens Section 8
+        ref = LOG_ANCHOR if any(f.key == UNFINISHED for f in verify) else "sub-8.2"
+        where = f"; the ry-verify findings are in {section_ref(ref)}"
     if logged:
         out += [para(f"Bug-report findings, by severity and first line{where}.", sty_lead), *map(card, logged)]
     else:
@@ -5507,18 +5598,26 @@ def _story_explained(m: Model) -> list[Flowable]:
     return out + table(head, rows, INFO_WIDTHS, title="INFO findings and what they mean", right=(3, 4))
 
 
-def failure_rows(m: Model) -> tuple[list[list[object]], dict[int, str]]:
+def failure_rows(m: Model) -> tuple[list[list[object]], dict[int, str], set[int]]:
     """Return the records counted as FAIL, GEN_FAIL, or WARN, under a heading row per phase and section, in log order.
 
     A section lists its first VERIFY_RECORDS rows, where a template row holds several records, and a row that counts the
-    records past them. The second value maps each heading row to its markup; each heading anchors its section's finding.
+    records past them. A row of one record ends with the hints ry-verify logged under it. The second value maps each
+    heading row to its markup, and each heading anchors its section's finding; the third holds the lines of the hints
+    the rows show, which the notes table leaves out.
     """
     groups: dict[tuple[str, str], list[VerifyItem]] = {}
     for i in m.vj.items:
         if i.counted in ("FAIL", "GEN_FAIL", "WARN"):
             groups.setdefault((i.phase, i.section), []).append(i)
+    records = m.vj.hint_records
+    under: dict[int, list[VerifyItem]] = {}  # the hints logged under each record, by the record's line
+    for i in m.vj.items:
+        if i.no in records:
+            under.setdefault(records[i.no].no, []).append(i)
     rows: list[list[object]] = []
     heads: dict[int, str] = {}
+    joined: set[int] = set()
     kinds = (("FAIL", "FAIL"), ("FAIL", "GEN_FAIL"), ("ERR", "FAIL"), ("WARN", "WARN"))  # (as logged, as counted)
     for (phase, section), items in groups.items():
         logged = Counter((i.status, i.counted) for i in items)
@@ -5529,10 +5628,25 @@ def failure_rows(m: Model) -> tuple[list[list[object]], dict[int, str]]:
         heads[len(rows)] = heading
         rows.append([[Anchor(verify_anchor(phase, section)), Paragraph(heading, sty_td)], "", ""])
         shown = record_rows(items)
-        rows += [[f"VJ {ranges([i.no for i in g], LINE_RUNS)}", g[0].status, t] for g, t in shown[:VERIFY_RECORDS]]
+        for g, t in shown[:VERIFY_RECORDS]:
+            hints = under.get(g[0].no, []) if len(g) == 1 else []  # a template row's hints stay in the notes
+            joined |= {h.no for h in hints}
+            text = " ".join([t, *(quote(h.text) for h in hints)])  # each hint opens with its arrow
+            rows.append([f"VJ {ranges([i.no for i in (*g, *hints)], LINE_RUNS)}", g[0].status, text])
         if rest := [i for g, _ in shown[VERIFY_RECORDS:] for i in g]:
             rows.append(["…", "", f"{plural(len(rest), 'more record')}: VJ {ranges([i.no for i in rest], LINE_RUNS)}"])
-    return rows, heads
+    return rows, heads, joined
+
+
+def note_rows(infos: Sequence[VerifyItem]) -> list[tuple[list[VerifyItem], str]]:
+    """Return INFO records as the notes table's rows, (records, text), section by section in log order.
+
+    A section's records make template rows as its failures do (record_rows()): 3 strays are one row.
+    """
+    sections: dict[tuple[str, str], list[VerifyItem]] = {}
+    for i in infos:
+        sections.setdefault((i.phase, i.section), []).append(i)
+    return [row for items in sections.values() for row in record_rows(items)]
 
 
 TEMPLATE_MIN = 3  # records of one section that share a status and one side of "subject: state" make one row
@@ -5573,8 +5687,11 @@ def verify_caption(m: Model) -> str:
     if not (phases := verify_phases(m)):
         return ""  # no figure to caption
     where = "static phase above, runtime below, on one scale" if len(phases) > 1 else f"{phases[0]} phase only"
-    before = Counter(i.counted for i in m.vj.items if i.phase == "preamble")
-    listed = {"FAIL": "sub-8.2", "GEN_FAIL": "sub-8.2", "WARN": "sub-8.2", "INFO": "sub-8.3"}  # OK records: no list
+    preamble = [i for i in m.vj.items if i.phase == "preamble"]
+    before = Counter(i.counted for i in preamble)
+    hints = sum(1 for i in preamble if i.no in failure_rows(m)[2])  # INFO records Section 8.2 shows with their record
+    notes = "sub-8.2" if hints and hints == before["INFO"] else "sub-8.3"
+    listed = {"FAIL": "sub-8.2", "GEN_FAIL": "sub-8.2", "WARN": "sub-8.2", "INFO": notes}  # OK records: no list
     refs = {s: f" ({section_ref(listed[s])})" if s in listed else "" for s in before}
     parts = [f"{before[s]:,} {s}{refs[s]}" for s in STATUS_ORDER if before[s]]
     left_out = f" Not drawn: {series(parts)} from the preamble." if parts else ""
@@ -5593,14 +5710,23 @@ def pairing_lead(m: Model) -> list[Flowable]:
     return [para(text, sty_lead)]
 
 
+def unfinished_lead(m: Model) -> list[Flowable]:
+    """Return the sentence that opens Section 8 for a ry-verify run that did not finish, which the register links."""
+    if not (found := [f for f in m.findings if f.key == UNFINISHED]):
+        return []
+    text = f"{found[0].fid}: {unfinished(m.vj)}; the checks past its last record did not run."
+    return [para(text, sty_lead)]
+
+
 def _story_verify(m: Model) -> list[Flowable]:
-    """Return Section 8: ry-verify results by section, its failures and warnings, and its notes."""
-    out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-8"), *pairing_lead(m), HPara("sub-8.1")]
+    """Return Section 8: ry-verify results by section, its failures and warnings with their hints, and its notes."""
+    out: list[Flowable] = [CondPageBreak(SECTION_ROOM), HPara("sec-8"), *pairing_lead(m), *unfinished_lead(m)]
+    out.append(HPara("sub-8.1"))
     out += svgfig(STATE.charts.get("verify"), "ry-verify results by section", verify_caption(m)) or [
         para("The log holds no result records from a verification phase.")
     ]
     out.append(HPara("sub-8.2"))
-    rows, heads = failure_rows(m)
+    rows, heads, joined = failure_rows(m)
     if rows:
         if any(row[0] == "…" for row in rows):  # a section cut after VERIFY_RECORDS rows
             lead = f"A section lists its first {VERIFY_RECORDS} rows; a last row counts the records past them by line."
@@ -5610,15 +5736,19 @@ def _story_verify(m: Model) -> list[Flowable]:
     else:
         out.append(para("No ry-verify check reported FAIL or WARN."))
     out.append(HPara("sub-8.3"))
-    if not (infos := [i for i in m.vj.items if i.status == "INFO"]):
-        return [*out, para("ry-verify logged no INFO record.")]
+    if not (infos := [i for i in m.vj.items if i.status == "INFO" and i.no not in joined]):
+        hints = "Every INFO record is a hint, shown with its record in {s:sub-8.2}."
+        return [*out, para(hints if joined else "ry-verify logged no INFO record.")]
+    found = note_rows(infos)
     notes: list[list[object]] = [
-        [f"VJ {i.no}", lit(section_title(i.section)), quote(i.text)] for i in infos[:NOTE_ROWS]
+        [f"VJ {ranges([i.no for i in g], LINE_RUNS)}", lit(section_title(g[0].section)), t]
+        for g, t in found[:NOTE_ROWS]
     ]
-    if rest := infos[NOTE_ROWS:]:
+    if rest := [i for g, _ in found[NOTE_ROWS:] for i in g]:
         notes += [["…", "", f"{plural(len(rest), 'more INFO record')}: VJ {ranges([i.no for i in rest], LINE_RUNS)}"]]
-        lead = f"ry-verify logged {plural(len(infos), 'INFO record')}; the table lists the first {NOTE_ROWS}."
-        out.append(para(lead, sty_lead))
+        beside = " beside the hints above" if joined else ""
+        lead = f"ry-verify logged {plural(len(infos), 'INFO record')}{beside}; the table lists the first "
+        out.append(para(f"{lead}{NOTE_ROWS} rows.", sty_lead))
     return out + table(["Record", "Section", "Text"], notes, [50, 110, 352], title="ry-verify notes", mono=(2,))
 
 

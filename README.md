@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.31.0** · [Changelog](CHANGELOG.md)
+**Version 7.32.0** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` turns a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log into a PDF report. The report leads with the findings, their evidence, and the commands they call for, then covers system health, the boot, dmesg, the journal, and the ry-verify results. The script holds analysis rules, never results.
 
@@ -31,7 +31,7 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 | Python | 3.12 or newer; 3.12, 3.13, and 3.14 as tested, which build the same PDF — byte for byte where they link the same zlib |
 | Libraries | at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12; ReportLab 5.1.0, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested |
 | Fonts | the 9 IBM Plex TTF files named at the top of the script — `ttf-ibm-plex` on CachyOS and Arch, `fonts-ibm-plex` on Debian |
-| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.5; ry-verify 7.265.0 to 7.300.0 as tested |
+| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.5; ry-verify 7.265.0 to 7.302.0 as tested |
 | Section 3 commands | fish, `sudo`, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
 | Lint | ruff 0.17.5 to 0.17.6 and ty 0.0.101 to 0.0.107 as tested |
 
@@ -85,7 +85,7 @@ The report has a cover, a contents page, 8 sections, and 2 appendices.
 | 5 Boot | the boot chart and boot activity by subsystem, the milestones and captures with the step between them, and the longest pauses in dmesg during the boot's burst |
 | 6 dmesg | each subsystem's lines per boot phase and after the boot, its lines with failure keywords, and the rules they match; the chart and the messages after the boot; the sources with failure keywords; repeated warnings |
 | 7 Journal | an overview per boot, the timeline, entries by process, repeated warnings, the messages new in the current boot, and the unit failures systemd logged |
-| 8 ry-verify | results by section, failures and warnings grouped by section, and notes |
+| 8 ry-verify | results by section, failures and warnings grouped by section with ry-verify's hints, and notes |
 | Appendix A | the `INFO` findings, each with what it means |
 | Appendix B | both inputs with their full SHA256, the parser cross-checks, and the method |
 
@@ -103,7 +103,7 @@ The report has a cover, a contents page, 8 sections, and 2 appendices.
 - `machine` and `kernel`
 - `inputs` — each input's file name, bytes, and SHA256
 - `ry_verify` — version, profile, mode, the result in the report's words, the exit as text, `exit_code` as a number or null, and the totals
-- `findings` — ID, rule key, severity, title, first line, and the evidence lines counted per log and journal boot; a ry-verify log from another machine, installation, or boot is the one finding under the key `verify-pairing`
+- `findings` — ID, rule key, severity, title, first line, and the evidence lines counted per log and journal boot; a ry-verify log from another machine, installation, or boot is the one finding under the key `verify-pairing`, and a paired run that did not finish adds one under `verify-unfinished`
 - `watch` — the watch items and settings
 - `actions` — IDs, titles, the findings each answers, and the completion tests
 
@@ -129,7 +129,7 @@ The report has a cover, a contents page, 8 sections, and 2 appendices.
 
 **Totals** — the run's totals come from a footer that counts every record (a finished run's, or an interrupted one's from ry-verify 7.257.0), else from the combined record, else from the phase records plus the records of a phase without one.
 
-**Result** — the ry-verify result reads in the words of ry-install's verdict: `PREFLIGHT` for exit `3`; `FAIL` for a counted `FAIL` or `GEN_FAIL`, and for a failing exit the counts do not explain; else `PASS-WITH-WARNINGS` or `PASS`. An interrupted run reads interrupted, and a log without a footer or an exit code reads unknown.
+**Result** — the ry-verify result reads in the words of ry-install's verdict: `PREFLIGHT` for exit `3`; `FAIL` for a counted `FAIL` or `GEN_FAIL`, and for a failing exit the counts do not explain; else `PASS-WITH-WARNINGS` or `PASS`. An interrupted run reads interrupted, and a log without a footer or an exit code reads unknown; in a paired log either is a `LOW` finding, as the checks past the log's last record did not run, and the rerun answers it.
 
 ### Pairing
 
@@ -201,7 +201,7 @@ The pairing checks apply where both logs state the fact:
 
 **Actions** — every `HIGH`, `MED`, and `LOW` finding is answered by an action. A failed unit is looked up in its own boot and manager (`journalctl -b -1`, `--user-unit`) by its name as logged, with a masked identifier as `*`; kernel errors are looked up in the warning-level kernel journal.
 
-**ry-verify rerun** — the rerun calls the script by the absolute path its log's header records, else `~/ry-verify/ry-verify.fish`. The rerun follows `sudo -v` when sudo stopped the run or its cache lapsed, or `sudo true` when the stop says `sudo -v` cached nothing. Above a paired log's rerun stand up to 6 of ry-verify's own suggestions and notes, and the checks a lapsed sudo cache skipped. A record or hint that names a command, after `Run:`, `Install missing:`, a dash, or a parenthesis, is a suggestion; any other hint is a note.
+**ry-verify rerun** — the rerun calls the script by the absolute path its log's header records, else `~/ry-verify/ry-verify.fish`. The rerun follows `sudo -v` when sudo stopped the run or its cache lapsed, or `sudo true` when the stop says `sudo -v` cached nothing. Above a paired log's rerun stand up to 6 of ry-verify's own suggestions and notes, and the checks a lapsed sudo cache skipped; a hint is cited with the record ry-verify logged it under. A record or hint that names a command, after `Run:`, `Install missing:`, a dash, a parenthesis, or a semicolon, is a suggestion; any other hint is a note.
 
 **Tasks** — a finding no failure action answers gets its rule's task: for a unit that failed under a redacted name, the Wi-Fi P2P device, a HID joystick, or jack2. An action without commands points at its finding's card.
 
@@ -222,7 +222,7 @@ The pairing checks apply where both logs state the fact:
 - The rules read the first 4,096 characters of a dmesg line, a journal entry, or an inxi line; the boot milestones and the dmesg, inxi, and scheduler facts keep to the same limit.
 - A quote stops at 400 characters, as does a fact the cover or the health table states; a ry-verify version, profile, or mode stops at 40, and a section name at 60.
 - A card quotes up to 8 lines, and a Lines cell lists up to 40 line ranges per log and counts the rest.
-- The ry-verify failures table lists 20 rows per section, and the notes and unit-failure tables 40 rows; a last row counts the rest. In the failures table, 3 or more records of one section that share a status and the text after or before their first colon and space are one row.
+- The ry-verify failures table lists 20 rows per section, and the notes and unit-failure tables 40 rows; a last row counts the rest. In both ry-verify tables, 3 or more records of one section that share a status and the text after or before their first colon and space are one row. A failure's row ends with the hints ry-verify logged under it, which the notes leave out.
 - A chart row draws at most 2,000 ticks, and a figure 6,000.
 
 **Outputs** — the PDF and the JSON summary are written to scratch files beside their targets, then renamed over them; each gets the permissions a new file gets there.
