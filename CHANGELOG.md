@@ -3,6 +3,29 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.31.0
+------
+
+  - docs: the README names a DRM function tag, not a DRM error, as wording
+    that sets a dmesg line's source and subsystem, and drops two repeats
+
+
+7.30.0
+------
+
+  - actions: a ry-verify hint that names its fix keeps its end when cut, as a
+    record does, so a long hint no longer loses its command
+  - ry-verify: follows 7.300.0, whose boot-entry hints drop Run: before
+    their fix: a sudo command after a dash reads as a suggestion, not a note
+  - ry-verify: the README names 7.265.0 to 7.300.0 as tested; it named the
+    records of 7.272.0 to 7.274.0 as read from its source
+  - consistency: the stop-gate docstring quotes the sudo hint as 7.274.0 and
+    later log it, Verification requires sudo
+  - build: build_report.py is 2 lines longer (6,986)
+  - docs: the README names cachyos-settings 1.4.5 among the layouts read, and
+    how Section 3 tells a ry-verify suggestion from a note
+
+
 7.25.0
 ------
 
@@ -10,21 +33,17 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     Appendix B, two captions, and the missing-data lines are recast
   - report: temperatures read CPU, board, and GPU in place of inxi's cpu,
     mobo, and gpu
-  - report: the PDF names gtr9-postboot-log-analysis as its author, not
-    build_report.py
+  - report: the PDF author is gtr9-postboot-log-analysis, not build_report.py
   - actions: a ry-verify hint that names no fix, such as a sudo-lapse note,
     reads as a note in Section 3, not as a suggestion
-  - layout: five named stroke weights replace ten
-  - layout: the cover's band names the edition, full report or brief
-    report, in place of the capture date
-  - figures: log-scale count axes read 1, 10, and 100 in place of 10^0,
-    10^1, and 10^2
-  - ry-verify: the iw-regdomain FAIL of 7.274.0 no longer reads as a fix;
-    iw counts as a command only in iw reg
+  - layout: five named stroke weights replace ten; the cover's band names the
+    edition, full report or brief report, in place of the capture date
+  - figures: log-scale count axes read 1, 10, and 100, not 10^0, 10^1, 10^2
+  - ry-verify: iw counts as a fix command only in iw reg; after a dash, a
+    parenthesis, or a semicolon, iw alone no longer reads as a fix
   - cli: a failed import also names the other missing modules, so one pacman
     line installs them all
-  - build: build_report.py is 16 lines longer (6,984); the JSON summary and
-    the exit codes are unchanged
+  - build: build_report.py is 16 lines longer (6,984)
   - docs: the README reads in shorter paragraphs, How It Works in
     subsections, and The Report before the JSON Summary
   - docs: the README names the dmesg lines whose wording sets their source:
@@ -38,8 +57,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.23.1
 ------
 
-  - report: B.3's kernel-start note states the suspend cut the estimate
-    applies, as the code does
+  - report: B.3's kernel-start note names the suspend cut its estimate applies
   - ry-verify: the README names the records of 7.272.0 to 7.274.0 as its
     source writes them
   - consistency: the module docstring carries the version and date; a comment
@@ -55,8 +73,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
   - ry-verify: the README names 7.265.0 to 7.271.0 as tested; it named the
     records of 7.266.0 to 7.268.0 as read from its source
   - cli: --help lists the charts among what --verbose reports
-  - build: build_report.py is 3 lines shorter (6,968); the PDF, the JSON
-    summary, the messages, and the exit codes change only as above
+  - build: build_report.py is 3 lines shorter (6,968)
   - docs: the README names sudo among the Section 3 commands
   - lint: ty 0.0.105 to 0.0.107 as tested
 
@@ -64,8 +81,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.22.0
 ------
 
-  - build: build_report.py is 2 lines shorter (6,971); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
+  - build: build_report.py is 2 lines shorter (6,971)
   - docs: the README trims repeats, examples, and finer detail
 
 
@@ -74,22 +90,19 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 
   - rules: the requires field, a limit to hardware the bug report names, is
     gone; no rule set it
-  - build: build_report.py is 12 lines shorter (6,973); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
+  - build: build_report.py is 12 lines shorter (6,973)
 
 
 7.20.1
 ------
 
-  - build: build_report.py is 2 lines shorter (6,985); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
+  - build: build_report.py is 2 lines shorter (6,985)
 
 
 7.20.0
 ------
 
-  - build: build_report.py is 125 lines shorter (6,987); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
+  - build: build_report.py is 125 lines shorter (6,987)
 
 
 7.19.1
@@ -121,8 +134,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.18.0
 ------
 
-  - build: build_report.py is 14 lines shorter (7,077); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
+  - build: build_report.py is 14 lines shorter (7,077)
 
 
 7.17.1
@@ -147,17 +159,14 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.17.0
 ------
 
-  - build: build_report.py is 8 lines shorter (7,087); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
+  - build: build_report.py is 8 lines shorter (7,087)
 
 
 7.16.1
 ------
 
-  - build: build_report.py is 215 lines shorter (7,095); the PDF, the JSON
-    summary, the messages, and the exit codes are unchanged
-  - lint: ruff.toml drops the ISC001 ignore, which ruff 0.17.5 raises nowhere
-    in the script
+  - build: build_report.py is 215 lines shorter (7,095)
+  - lint: ruff.toml drops the ISC001 ignore, unused under ruff 0.17.5
 
 
 7.16.0
@@ -193,8 +202,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 ------
 
   - report: an unread date line stops at 400 characters on the cover and in
-    --json
-  - report: a card shows the ry-verify record its rule cites
+    --json; a card shows the ry-verify record its rule cites
   - figures: a figure draws at most 6,000 ticks, the journal timeline too;
     svglib from 2.3.1 drops an SVG's `<use>` elements past 10,000
   - figures: an error svglib logs over a figure fails the build, and its
@@ -305,8 +313,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
 7.10.3
 ------
 
-  - layout: U+FFFD in monospace fills one character cell, so a full line no
-    longer wraps
+  - layout: U+FFFD in monospace fills one cell, so a full line no longer wraps
   - ry-verify: 7.260.0 logs parse as 7.258.0 logs do; its sharper lapse
     wording keeps read errors out of the count
   - cli: the PDF and the summary go to scratch files made exclusively under
@@ -742,8 +749,7 @@ Newest first. Versioning is MAJOR.MINOR.PATCH.
     minute either side; captions name only what is drawn
   - layout: a section or appendix, Section 7 included, starts on the current
     page when 160 pt remain, so fewer pages end half empty
-  - layout: monospace text keeps its spacing and wraps long paths after a
-    slash
+  - layout: monospace text keeps its spacing; long paths wrap after a slash
   - rules: an abnormal previous reset (thermal trip, watchdog, sync flood) is
     a MED finding; a reboot or power-off stays boilerplate
   - rules: kernel splats add the new WARN format, UBSAN, hung tasks, lockups,

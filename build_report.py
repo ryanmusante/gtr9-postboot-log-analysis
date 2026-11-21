@@ -5,7 +5,7 @@
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Ryan Musante
-"""build_report.py 7.25.0 (2026-11-19): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
+"""build_report.py 7.31.0 (2026-11-21): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
 
 Every finding, quote, line reference, and figure comes from the two inputs on each run;
 the script carries analysis rules (message patterns and what they mean), never results.
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.25.0"
+__version__ = "7.31.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -478,7 +478,8 @@ class VerifyLog:
         """Return the INFO records in which ry-verify suggests a fix or adds a note to a record, in log order.
 
         A ↳ line logged right after a FAIL, WARN, or ERR record of the same section and sub-heading is that record's
-        hint; an INFO record that names its fix (Run: …, Install missing: …) is one too, as older logs word them.
+        hint; so is an INFO record that names its fix: after Install missing:, after Run: in older logs, or as a sudo
+        command after a dash (— sudo sdboot-manage gen), as ry-verify 7.300.0 words its boot-entry hints.
         """
         out = []
         for n, item in enumerate(self.items):
@@ -802,13 +803,13 @@ FIX_VERB = r"(?:systemctl|chown|chmod|iw reg|mount)"  # as a bare word after oth
 FIX_COMMAND = re.compile(
     rf"(?:—|\(|;)\s*+(?:(?:sudo )?{FIX_VERB}\s|restart \S|[^—(;]*?\s(?:sudo {FIX_VERB}|systemctl)\s)"
 )
-RUN_HINT = re.compile(r"\b(?:Run|Install missing): (?=\S)")  # an INFO record that names its fix: Run: sudo …
+RUN_HINT = re.compile(r"\b(?:Run|Install missing): (?=\S)|— (?=sudo (?!cache\b)\S)")  # a hint's fix: Run: or — sudo …
 
 
 def fix_start(text: str) -> int:
     """Return where in text the command a ry-verify record suggests starts, or -1 when it names none.
 
-    A command in parentheses starts at its parenthesis; one after a dash, a semicolon, or Run:, after that.
+    A command in parentheses starts at its parenthesis; one after a dash, a semicolon, or a label (Run:), after that.
     """
     if hit := FIX_COMMAND.search(text):
         return hit.start() if hit[0].startswith("(") else hit.end() - len(hit[0][1:].lstrip())
@@ -819,7 +820,8 @@ def fix_start(text: str) -> int:
 def stop_record(items: Sequence[VerifyItem]) -> VerifyItem | None:
     """Return the first ERR of records that hold nothing else but INFO, as a run or phase stopped by a gate; else None.
 
-    ry-verify logs the gate's ERR, and since 7.257.0 an INFO hint under it (↳ sudo required for verification).
+    ry-verify logs the gate's ERR, and since 7.257.0 an INFO hint under it (↳ Verification requires sudo; before
+    7.274.0, ↳ sudo required for verification).
     """
     results = [i for i in items if i.status != "INFO"]
     return results[0] if results and all(i.status == "ERR" for i in results) else None
@@ -2535,11 +2537,11 @@ def verify_action(m: Model) -> Action | None:
     stop = m.vj.stopped
     cmds = comment(f"ry-verify stopped (VJ {stop.no}): {clip(quote(stop.text), QUOTE_CLIP)}") if stop else []
     tips = sorted({i.no: i for i in (*m.vj.hints, *m.vj.fixes)}.values(), key=lambda i: i.no)  # in log order
-    for tip in tips[:MAX_LISTED]:  # a record that names its fix keeps its end, where the fix stands
+    for tip in tips[:MAX_LISTED]:  # a record or hint that names its fix keeps its end, where the fix stands
         hint = tip.text.removeprefix("↳").lstrip()  # the arrow ties a hint to its record in ry-verify's own output
-        text = clip(quote(hint), QUOTE_CLIP) if tip.status == "INFO" else clip_start(sanitize(tip.text), QUOTE_CLIP)
-        verb = "notes" if tip.status == "INFO" and not RUN_HINT.search(tip.text) else "suggests"
-        line = f"ry-verify {verb} (VJ {tip.no}): {text}"
+        named = tip.status != "INFO" or RUN_HINT.search(tip.text)
+        text = clip_start(sanitize(hint), QUOTE_CLIP) if named else clip(quote(hint), QUOTE_CLIP)
+        line = f"ry-verify {'suggests' if named else 'notes'} (VJ {tip.no}): {text}"
         cmds += comment(line, fix_start(line))
     if rest := tips[MAX_LISTED:]:
         cmds += comment(f"{len(rest):,} more from ry-verify: VJ {ranges([h.no for h in rest], COMMENT_RUNS)}")

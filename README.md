@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.25.0** · [Changelog](CHANGELOG.md)
+**Version 7.31.0** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` turns a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log into a PDF report. The report leads with the findings, their evidence, and the commands they call for, then covers system health, the boot, dmesg, the journal, and the ry-verify results. The script holds analysis rules, never results.
 
@@ -31,7 +31,7 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 | Python | 3.12 or newer; 3.12, 3.13, and 3.14 as tested, which build the same PDF — byte for byte where they link the same zlib |
 | Libraries | at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12; ReportLab 5.1.0, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested |
 | Fonts | the 9 IBM Plex TTF files named at the top of the script — `ttf-ibm-plex` on CachyOS and Arch, `fonts-ibm-plex` on Debian |
-| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.4 and in the CachyOS-Settings tree after them; ry-verify 7.265.0 to 7.271.0 as tested, and the records of 7.272.0 to 7.274.0 as its source writes them |
+| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.5; ry-verify 7.265.0 to 7.300.0 as tested |
 | Section 3 commands | fish, `sudo`, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
 | Lint | ruff 0.17.5 to 0.17.6 and ty 0.0.101 to 0.0.107 as tested |
 
@@ -58,7 +58,7 @@ The PDF's path, `--help` (`-h`), and `--version` are the only output on stdout; 
 | `0` | built, or the inputs parsed under `--check` — a differing cross-check is reported, not an error |
 | `1` | build or check failed — an input in the wrong format (a ry-verify log of another mode among them), a `--compare` file that is no summary, an unsettled layout, an unresolved page reference, a figure svglib cannot convert whole, or an output that cannot be written |
 | `2` | usage error — a missing `--bugreport` or `--verify`; an unknown option; `--out` or `--json` naming a directory, anything else that is not a regular file, or one of the inputs; `--check` with `--brief`, `--json`, or `--compare`; an invalid `SOURCE_DATE_EPOCH` (see [Environment Overrides](#environment-overrides)) |
-| `3` | preflight failed — a Python module, a font file, or an input file is missing or unreadable, an input is no regular file, or a font file is no TrueType font; the message names why |
+| `3` | preflight failed — a Python module, a font file, or an input file is missing or unreadable, an input is no regular file, or a font file is no TrueType font |
 | `130` | interrupted by Ctrl-C, `SIGTERM`, or `SIGHUP` — nothing is written, unless the PDF had already replaced its target, which the message names |
 
 When the JSON summary fails after the PDF has replaced its target, the exit `1` message names the PDF. A signal that arrives while Python itself starts, before the script runs, is Python's to handle.
@@ -147,9 +147,9 @@ Each rule names a message class: where it appears, the patterns that recognize i
 
 ### Counting
 
-**Subsystems** — a dmesg line belongs to the subsystem its wording names (a DRM error, an I/O error, an OOM kill, a kernel splat), else to the one its prefix names, else to Other; an indented line belongs to the message above it. A journal entry belongs to the process that logged it.
+**Subsystems** — a dmesg line belongs to the subsystem its wording names (a DRM function tag, an I/O error, an OOM kill, a kernel splat), else to the one its prefix names, else to Other; an indented line belongs to the message above it. A journal entry belongs to the process that logged it.
 
-**Sources** — kernel splats, OOM kills, machine checks, block-layer errors, file-system messages that name their device, and DRM errors have sources of their own. Any other line's source is the text before its first colon and space when that is at most 40 characters and 3 words (such as `usb 1-4`), else its first word. The source table lists 10 sources: those of findings that call for action first, then those no rule explains, then explained ones.
+**Sources** — kernel splats, OOM kills, machine checks, block-layer errors, file-system messages that name their device, and lines with a DRM function tag (`[drm:…]`) have sources of their own. Any other line's source is the text before its first colon and space when that is at most 40 characters and 3 words (such as `usb 1-4`), else its first word. The source table lists 10 sources: those of findings that call for action first, then those no rule explains, then explained ones.
 
 **Failure keywords** — 53, matched case-insensitively as whole words:
 
@@ -201,7 +201,7 @@ The pairing checks apply where both logs state the fact:
 
 **Actions** — every `HIGH`, `MED`, and `LOW` finding is answered by an action. A failed unit is looked up in its own boot and manager (`journalctl -b -1`, `--user-unit`) by its name as logged, with a masked identifier as `*`; kernel errors are looked up in the warning-level kernel journal.
 
-**ry-verify rerun** — the rerun calls the script by the absolute path its log's header records, else `~/ry-verify/ry-verify.fish`. The rerun follows `sudo -v` when sudo stopped the run or its cache lapsed, or `sudo true` when the stop says `sudo -v` cached nothing. Above a paired log's rerun stand up to 6 of ry-verify's own suggestions and notes, and the checks a lapsed sudo cache skipped.
+**ry-verify rerun** — the rerun calls the script by the absolute path its log's header records, else `~/ry-verify/ry-verify.fish`. The rerun follows `sudo -v` when sudo stopped the run or its cache lapsed, or `sudo true` when the stop says `sudo -v` cached nothing. Above a paired log's rerun stand up to 6 of ry-verify's own suggestions and notes, and the checks a lapsed sudo cache skipped. A record or hint that names a command, after `Run:`, `Install missing:`, a dash, or a parenthesis, is a suggestion; any other hint is a note.
 
 **Tasks** — a finding no failure action answers gets its rule's task: for a unit that failed under a redacted name, the Wi-Fi P2P device, a HID joystick, or jack2. An action without commands points at its finding's card.
 
@@ -241,7 +241,7 @@ Add an entry to `RULES`: key, title, area, severity (`HIGH`, `MED`, `LOW`, `INFO
 - `cites` — quote ry-verify's record about the same setting
 - `task`, `done` — the checklist action and its completion test, for a `HIGH`, `MED`, or `LOW` rule that no failure action covers
 
-A function under the rule's key in `RULE_COMMANDS` builds a task's commands from the finding's evidence. A finding whose rule names no task still gets an action, which points at its card.
+A function under the rule's key in `RULE_COMMANDS` builds a task's commands from the finding's evidence.
 
 ## Verify
 
