@@ -3,6 +3,20 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.33.0
+------
+
+  - actions: a command ry-verify suggests starts its own comment line; the
+    comment's (VJ n), or the record it cites, could read as its start
+  - figures: svglib converts each figure once per build, not on every
+    layout pass; the conversions took half of a build's time
+  - figures: the ry-verify chart's caption reads Section 8.2's hints once;
+    a log of 3,500 preamble records took 43 s to build
+  - build: build_report.py is 10 lines longer (7,126)
+  - docs: the README names ReportLab 5.1.2 as tested
+  - lint: ty 0.0.110 to 0.0.111 as tested
+
+
 7.32.0
 ------
 

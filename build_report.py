@@ -5,7 +5,7 @@
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Ryan Musante
-"""build_report.py 7.32.0 (2026-11-21): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
+"""build_report.py 7.33.0 (2026-11-25): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
 
 Every finding, quote, line reference, and figure comes from the two inputs on each run;
 the script carries analysis rules (message patterns and what they mean), never results.
@@ -33,6 +33,7 @@ if __name__ == "__main__":
             signal.signal(getattr(signal, _name), _quit)
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import importlib.util
@@ -66,7 +67,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.32.0"
+__version__ = "7.33.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
@@ -257,6 +258,7 @@ class BuildState:
     total: int = 0
     chart_dir: Path = field(default_factory=Path)
     charts: dict[str, str | None] = field(default_factory=dict)  # rendered chart per key; None when not drawn
+    drawings: dict[str, Drawing] = field(default_factory=dict)  # each chart as svglib converted it, once per build
     figure_notes: set[str] = field(default_factory=set)  # what svglib warned of while converting the charts
     font_dir: Path = field(default_factory=Path)
     root_uuid: str = ""  # the root UUID from the kernel command line, else ry-verify's ROOT_UUID_OK; mask() names it
@@ -2595,13 +2597,15 @@ def tip_comments(vj: VerifyLog, stop: VerifyItem | None) -> list[str]:
         hint = tip.text.removeprefix("↳").lstrip()  # the arrow ties a hint to its record, which the comment names
         named = tip.status != "INFO" or RUN_HINT.search(tip.text)
         text = clip_start(sanitize(hint), QUOTE_CLIP) if named else clip(quote(hint), QUOTE_CLIP)
+        fix = fix_start(text)  # found in the tip's own words: the comment's (VJ n) would read as a fix's parenthesis
         lines, record = f"{tip.no}", under.get(tip.no)
         if record is not None and record.no not in cited:
             about = clip(quote(record.text), max(HINT_RECORD, QUOTE_CLIP - len(text)))
             lines, text = ranges([record.no, tip.no]), f"{about} ↳ {text}"
+            fix += len(about) + 3 if fix >= 0 else 0  # past the record and the arrow
         cited.add(tip.no)
-        line = f"ry-verify {'suggests' if named else 'notes'} (VJ {lines}): {text}"
-        out += comment(line, fix_start(line))
+        head = f"ry-verify {'suggests' if named else 'notes'} (VJ {lines}): "
+        out += comment(head + text, len(head) + fix if fix >= 0 else -1)
     if rest := tips[MAX_LISTED:]:
         out += comment(f"{len(rest):,} more from ry-verify: VJ {ranges([h.no for h in rest], COMMENT_RUNS)}")
     return out
@@ -4599,11 +4603,15 @@ class ConverterLog(logging.Handler):
 def svg_drawing(name: str) -> Drawing:
     """Return a rendered SVG as a drawing scaled to the frame width.
 
-    Raise RuntimeError, with svglib's reason, when svglib cannot read the figure, reads one of no size (a file cut
-    short), or logs an error over it: a figure is drawn whole or not at all. Its warnings go to the verbose log.
-    svglib's limits on <use> elements (2.3.1), past which it drops the rest, guard against hostile SVGs; they are
-    lifted, as matplotlib wrote these, a <use> per tick and glyph.
+    svglib converts each figure once per build; every layout pass gets a shallow copy, which shares the shapes and
+    keeps ReportLab's flags of one pass's layout (a postponed flowable) out of the next. Raise RuntimeError, with
+    svglib's reason, when svglib cannot read the figure, reads one of no size (a file cut short), or logs an error
+    over it: a figure is drawn whole or not at all. Its warnings go to the verbose log. svglib's limits on <use>
+    elements (2.3.1), past which it drops the rest, guard against hostile SVGs; they are lifted, as matplotlib wrote
+    these, a <use> per tick and glyph.
     """
+    if (converted := STATE.drawings.get(name)) is not None:
+        return copy.copy(converted)
     from svglib import svglib
 
     vars(svglib).update(MAX_USE_EXPANSIONS=sys.maxsize, MAX_USE_CLONED_ELEMENTS=sys.maxsize)
@@ -4623,7 +4631,8 @@ def svg_drawing(name: str) -> Drawing:
     scale = FW / drawing.width
     drawing.width, drawing.height = drawing.width * scale, drawing.height * scale
     drawing.scale(scale, scale)
-    return drawing
+    STATE.drawings[name] = drawing
+    return copy.copy(drawing)
 
 
 def cover_strip(m: Model) -> list[Flowable]:
@@ -5689,7 +5698,8 @@ def verify_caption(m: Model) -> str:
     where = "static phase above, runtime below, on one scale" if len(phases) > 1 else f"{phases[0]} phase only"
     preamble = [i for i in m.vj.items if i.phase == "preamble"]
     before = Counter(i.counted for i in preamble)
-    hints = sum(1 for i in preamble if i.no in failure_rows(m)[2])  # INFO records Section 8.2 shows with their record
+    joined = failure_rows(m)[2]  # the INFO records Section 8.2 shows with their record, read once
+    hints = sum(1 for i in preamble if i.no in joined)
     notes = "sub-8.2" if hints and hints == before["INFO"] else "sub-8.3"
     listed = {"FAIL": "sub-8.2", "GEN_FAIL": "sub-8.2", "WARN": "sub-8.2", "INFO": notes}  # OK records: no list
     refs = {s: f" ({section_ref(listed[s])})" if s in listed else "" for s in before}

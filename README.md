@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.32.0** · [Changelog](CHANGELOG.md)
+**Version 7.33.0** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` turns a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log into a PDF report. The report leads with the findings, their evidence, and the commands they call for, then covers system health, the boot, dmesg, the journal, and the ry-verify results. The script holds analysis rules, never results.
 
@@ -20,7 +20,7 @@ sudo cachyos-bugreport.sh
 Run the steps in the directory that holds `build_report.py`. The PDF lands in the current directory as `post-boot-log-analysis-<capture date>.pdf`; a later run on a capture from the same day overwrites it. If no PDF lands, the exit code and its message say why; see [Exit Codes](#exit-codes).
 
 - `cachyos-bugreport.sh` writes `cachyos-bugreport.log` to the current directory.
-- `~/ry-verify/ry-verify.fish` is where the clone command in ry-verify's README puts the script when run from the home directory. ry-verify logs to `~/ry-install/logs/<date>/`.
+- `~/ry-verify/ry-verify.fish` is where ry-verify's README clones the script when run from the home directory, and ry-verify logs to `~/ry-install/logs/<date>/`.
 - `uv run build_report.py …` (pacman: `uv`) installs the Python dependencies in place of the pacman packages and needs no executable bit. The fonts still come from `ttf-ibm-plex`.
 
 ## Requirements
@@ -29,11 +29,11 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 |---|---|
 | OS | CachyOS or Arch Linux with its own packages (Python 3.14, fish 4.9) runs Quick Start and [Verify](#verify) as written; Arch lacks `cachyos-bugreport.sh`, which only CachyOS's `cachyos-settings` ships |
 | Python | 3.12 or newer; 3.12, 3.13, and 3.14 as tested, which build the same PDF — byte for byte where they link the same zlib |
-| Libraries | at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12; ReportLab 5.1.0, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested |
+| Libraries | at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12; ReportLab 5.1.0 and 5.1.2, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested |
 | Fonts | the 9 IBM Plex TTF files named at the top of the script — `ttf-ibm-plex` on CachyOS and Arch, `fonts-ibm-plex` on Debian |
 | Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.5; ry-verify 7.265.0 to 7.302.0 as tested |
 | Section 3 commands | fish, `sudo`, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
-| Lint | ruff 0.17.5 to 0.17.6 and ty 0.0.101 to 0.0.107 as tested |
+| Lint | ruff 0.17.5 to 0.17.6 and ty 0.0.101 to 0.0.111 as tested |
 
 ## Usage
 
