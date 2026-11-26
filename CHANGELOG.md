@@ -3,6 +3,14 @@ Changes for gtr9-postboot-log-analysis
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+7.34.0
+------
+
+  - ry-verify: follows 7.303.0 and 7.304.0, whose records need no parser
+    change; the README names 7.265.0 to 7.304.0 as tested
+  - lint: ty 0.0.112 as tested
+
+
 7.33.0
 ------
 

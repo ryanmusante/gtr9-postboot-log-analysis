@@ -1,6 +1,6 @@
 # gtr9-postboot-log-analysis
 
-**Version 7.33.0** · [Changelog](CHANGELOG.md)
+**Version 7.34.0** · [Changelog](CHANGELOG.md)
 
 GTR9 Pro post-boot log analysis for CachyOS. `build_report.py` turns a `cachyos-bugreport.log` and a [ry-verify](https://github.com/ryanmusante/ry-verify) JSONL log into a PDF report. The report leads with the findings, their evidence, and the commands they call for, then covers system health, the boot, dmesg, the journal, and the ry-verify results. The script holds analysis rules, never results.
 
@@ -31,9 +31,9 @@ Run the steps in the directory that holds `build_report.py`. The PDF lands in th
 | Python | 3.12 or newer; 3.12, 3.13, and 3.14 as tested, which build the same PDF — byte for byte where they link the same zlib |
 | Libraries | at least ReportLab 5.0, matplotlib 3.11, svglib 2.2, and Pillow 12; ReportLab 5.1.0 and 5.1.2, matplotlib 3.11.2, svglib 2.3.2 and 2.4.0, and Pillow 13.0.0 as tested |
 | Fonts | the 9 IBM Plex TTF files named at the top of the script — `ttf-ibm-plex` on CachyOS and Arch, `fonts-ibm-plex` on Debian |
-| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.5; ry-verify 7.265.0 to 7.302.0 as tested |
+| Inputs | `cachyos-bugreport.sh` from cachyos-settings 1:1.4.1-1 as tested, and the layout and redactions it writes in 1.4.2 to 1.4.5; ry-verify 7.265.0 to 7.304.0 as tested |
 | Section 3 commands | fish, `sudo`, and systemd's `systemctl`, `journalctl`, and `coredumpctl`; the Wi-Fi P2P task also runs NetworkManager's `nmcli`, and the jack2 task `pacman` |
-| Lint | ruff 0.17.5 to 0.17.6 and ty 0.0.101 to 0.0.111 as tested |
+| Lint | ruff 0.17.5 to 0.17.6 and ty 0.0.101 to 0.0.112 as tested |
 
 ## Usage
 

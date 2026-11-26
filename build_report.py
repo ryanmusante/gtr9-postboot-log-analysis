@@ -5,7 +5,7 @@
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Ryan Musante
-"""build_report.py 7.33.0 (2026-11-25): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
+"""build_report.py 7.34.0 (2026-11-26): analyze a cachyos-bugreport.log and a ry-verify JSONL log into a PDF report.
 
 Every finding, quote, line reference, and figure comes from the two inputs on each run;
 the script carries analysis rules (message patterns and what they mean), never results.
@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
 # ── SETUP ─────────────────────────────────────────────────────────────
 # Version, exit codes, fonts, command line, preflight, and the shared build state.
-__version__ = "7.33.0"
+__version__ = "7.34.0"
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_PREFLIGHT, EXIT_INTERRUPT = 0, 1, 2, 3, 130  # 130 = 128 + SIGINT, as shells report
 
 
